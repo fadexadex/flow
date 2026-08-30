@@ -1,0 +1,89 @@
+functionsDirectory = "/Users/fadex/Documents/ChatGPT/OpenAI MCP Challenge/godot-web-mcp/netlify/functions"
+functionsDirectoryOrigin = "config-v1"
+headersOrigin = "config"
+redirectsOrigin = "config"
+plugins = []
+
+[build]
+publish = "/Users/fadex/Documents/ChatGPT/OpenAI MCP Challenge/godot-web-mcp/public"
+publishOrigin = "config"
+base = "/Users/fadex/Documents/ChatGPT/OpenAI MCP Challenge/godot-web-mcp"
+functions = "/Users/fadex/Documents/ChatGPT/OpenAI MCP Challenge/godot-web-mcp/netlify/functions"
+
+[build.environment]
+
+[build.processing]
+
+[build.processing.css]
+
+[build.processing.html]
+
+[build.processing.images]
+
+[build.processing.js]
+
+[build.services]
+
+[functions]
+
+[functions."*"]
+
+[[headers]]
+for = "/*"
+
+[headers.values]
+Cross-Origin-Opener-Policy = "same-origin"
+Cross-Origin-Embedder-Policy = "require-corp"
+Access-Control-Allow-Origin = "*"
+Access-Control-Allow-Methods = "GET, POST, OPTIONS"
+Access-Control-Allow-Headers = "*"
+
+[[headers]]
+for = "*.wasm"
+
+[headers.values]
+Content-Type = "application/wasm"
+Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+for = "*.pck"
+
+[headers.values]
+Content-Type = "application/octet-stream"
+Cache-Control = "public, max-age=31536000, immutable"
+
+[[redirects]]
+from = "/api/health"
+to = "/.netlify/functions/health"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/api/mcp/tools"
+to = "/.netlify/functions/tools"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/api/mcp/rpc"
+to = "/.netlify/functions/rpc"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
