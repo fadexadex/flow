@@ -65,8 +65,13 @@ const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_semantic_playtest_step',
-    description: 'Executes a semantic playtest action (steer_left, steer_right, jump, boost, observe_state) and returns structured telemetry',
+    description: 'Executes a Neon Skyrail-only semantic playtest action and rejects custom projects instead of returning simulated runner state',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_get_game_telemetry',
+    description: 'Reads project-owned runtime telemetry emitted as godot-game-telemetry events; never substitutes simulated state for custom games',
+    annotations: { readOnlyHint: true, untrustedContentHint: true }
   },
   {
     name: 'godot_create_project',
@@ -155,7 +160,7 @@ const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_send_input',
-    description: 'Dispatches synthetic hardware keypress to the game canvas',
+    description: 'Dispatches a keyboard event and reports subsequent project telemetry without claiming unverified gameplay acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {

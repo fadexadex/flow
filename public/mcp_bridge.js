@@ -32,11 +32,25 @@
   const idempotentMutations = new Map();
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
+  const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
   let activeMainScene = 'res://main_3d.tscn';
   let activeManagedMutationId = null;
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('godot-game-telemetry', (event) => {
+      const entry = {
+        sequence: ++GameTelemetryState.sequence,
+        received_at: Date.now(),
+        state: event?.detail ?? null
+      };
+      GameTelemetryState.latest = entry;
+      GameTelemetryState.recent.push(entry);
+      if (GameTelemetryState.recent.length > 100) GameTelemetryState.recent.shift();
+    });
+  }
 
   function publicOperation(operation) {
     return {
@@ -1420,9 +1434,34 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
+        const runnerProject = 'player_runner.gd' in activeFilesDict && 'main_3d.gd' in activeFilesDict;
+        if (!runnerProject) {
+          throw new Error(`Neon Skyrail semantic simulation is unavailable for active project '${DiagnosticState.activeProject}'. Use godot_get_game_telemetry for a custom project's emitted runtime state.`);
+        }
         const action = args.action || 'observe_state';
         const duration = args.step_duration_ms || 200;
         return PlaytestSimulation.step(action, duration);
+      }
+    },
+    {
+      definition: {
+        name: 'godot_get_game_telemetry',
+        description: 'Reads project-owned runtime telemetry emitted as godot-game-telemetry events; never substitutes simulated state for custom games',
+        input_schema: {
+          type: 'object',
+          properties: { limit: { type: 'integer', minimum: 1, maximum: 100, default: 10 } },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const limit = Math.max(1, Math.min(Number(args.limit) || 10, 100));
+        return {
+          supported: Boolean(GameTelemetryState.latest),
+          project_name: DiagnosticState.activeProject,
+          latest: GameTelemetryState.latest,
+          recent: GameTelemetryState.recent.slice(-limit)
+        };
       }
     },
     {
@@ -1885,6 +1924,8 @@ func _physics_process(delta):
       },
       handler: async () => {
         PlaytestSimulation.reset();
+        GameTelemetryState.latest = null;
+        GameTelemetryState.recent = [];
         try {
           await startGameRuntime({ visible: true, timeoutMs: 15000 });
         } catch (error) {
@@ -1917,19 +1958,37 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_send_input',
-        description: 'Dispatches synthetic hardware keypress to the game canvas',
-        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' } }, additionalProperties: false },
+        description: 'Dispatches a keyboard event to the game canvas and reports any subsequent project-owned telemetry without claiming unverified gameplay acknowledgement',
+        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, await_telemetry: { type: 'boolean', default: true } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
         const key = args.key || 'Space';
         const pressed = args.pressed !== false;
+        const before = GameTelemetryState.latest;
+        const inputId = `input_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
         if (!canvas) throw new Error('No Godot canvas is available to receive input.');
+        window.__godotWebMcpInput = { input_id: inputId, key, pressed, dispatched_at: Date.now() };
         const event = new KeyboardEvent(pressed ? 'keydown' : 'keyup', { key, code: key, bubbles: true });
         canvas.dispatchEvent(event);
         document.dispatchEvent(event);
-        return { success: true, dispatched_key: key, pressed, target: canvas.id };
+        if (args.await_telemetry !== false) {
+          await waitFor(() => GameTelemetryState.latest?.sequence > (before?.sequence || 0), 900, 50);
+        }
+        const after = GameTelemetryState.latest;
+        const inputAcknowledged = after?.state?.input_id === inputId;
+        return {
+          success: true,
+          input_id: inputId,
+          dispatched_key: key,
+          pressed,
+          target: canvas.id,
+          input_acknowledged: inputAcknowledged,
+          telemetry_observed_after_dispatch: Boolean(after && after.sequence > (before?.sequence || 0)),
+          telemetry_before: before,
+          telemetry_after: after
+        };
       }
     },
     {
@@ -2024,6 +2083,7 @@ func _physics_process(delta):
         godot_export_zip: 'Packaging project ZIP',
         godot_get_session_status: 'Inspecting engine session',
         godot_get_operation_status: `Inspecting operation: ${input.operation_id || 'active/recent'}`,
+        godot_get_game_telemetry: 'Reading project-owned game telemetry',
         godot_get_logs: 'Reading engine logs'
       };
       return labels[toolName] || toolName.replace(/^godot_/, '').replaceAll('_', ' ');
