@@ -110,11 +110,13 @@
         if (idempotency?.key && inflightIdempotency.get(idempotency.key)?.operationId === operation.id) {
           inflightIdempotency.delete(idempotency.key);
         }
-        if (operation.observationId && typeof AgentObservationHUD !== 'undefined') {
+        if (operation.observationIds?.size && typeof AgentObservationHUD !== 'undefined') {
           const detail = operation.status === 'succeeded'
             ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
             : operation.error;
-          AgentObservationHUD.update(operation.status, operation.tool, {}, detail, operation.observationId);
+          for (const observationId of operation.observationIds) {
+            AgentObservationHUD.update(operation.status, operation.tool, {}, detail, observationId);
+          }
         }
       }
     })();
@@ -1341,6 +1343,7 @@ func _physics_process(delta):
         }
 
         DiagnosticState.sceneRevision++;
+        DiagnosticHUD.render();
         undoStack.push({
           undo_id: undoId,
           revision: DiagnosticState.sceneRevision,
@@ -1536,6 +1539,7 @@ func _physics_process(delta):
         }
 
         DiagnosticState.sceneRevision++;
+        DiagnosticHUD.render();
         undoStack.push({
           undo_id: undoId,
           revision: DiagnosticState.sceneRevision,
@@ -1673,6 +1677,7 @@ func _physics_process(delta):
         activeFilesDict = stagedFiles;
         activeMainScene = stagedMainScene;
         DiagnosticState.sceneRevision++;
+        DiagnosticHUD.render();
         const undoId = `undo_files_${Date.now()}`;
         undoStack.push({
           undo_id: undoId,
@@ -2095,7 +2100,8 @@ func _physics_process(delta):
       if (result?.status === 'pending' && result.operation_id) {
         const operation = managedOperations.get(result.operation_id);
         if (operation) {
-          operation.observationId = observation.id;
+          if (!operation.observationIds) operation.observationIds = new Set();
+          operation.observationIds.add(observation.id);
           if (operation.status !== 'running') {
             const detail = operation.status === 'succeeded'
               ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
