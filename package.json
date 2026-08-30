@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node verify_catalog_parity.mjs",
+    "verify:catalog": "node verify_catalog_parity.mjs"
   },
   "keywords": [],
   "author": "",

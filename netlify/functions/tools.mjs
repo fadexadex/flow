@@ -129,61 +129,73 @@ export const MCP_TOOL_CATALOG = [
   {
     name: 'godot_select_node_live',
     description: 'Requests native Godot Editor node selection and fails explicitly when no acknowledged editor command channel is installed',
+    input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_transform_node_live',
     description: 'Requests a native Godot node transform and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { node_path: { type: 'string' }, translation: { type: 'array' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_connect_signal_live',
     description: 'Requests a native Godot signal connection and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { from_node: { type: 'string' }, signal: { type: 'string' }, to_node: { type: 'string' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_resize_gizmo_live',
     description: 'Requests a native collision-gizmo resize and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { node_path: { type: 'string' }, radius: { type: 'number' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_live_code_diff',
     description: 'Legacy diff request that fails explicitly; use revision-checked file transactions',
+    input_schema: { type: 'object', properties: { script_path: { type: 'string' }, diff: { type: 'string' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_inspect_property_live',
     description: 'Requests a native Inspector property read and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { property: { type: 'string' }, value: {} }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_generate_audio_fx',
     description: 'Synthesizes procedural 16-bit WAV sound effects (laser, explosion, pickup) and writes them to res://<filename>.wav',
+    input_schema: { type: 'object', properties: { type: { type: 'string' }, duration: { type: 'number' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
     name: 'godot_switch_mode',
     description: 'Requests a native Godot workspace switch and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game'] } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_open_scene',
     description: 'Requests a native scene-open operation and fails explicitly without editor acknowledgement',
+    input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_hot_reload_property',
     description: 'Legacy property hot reload that fails explicitly; use revision-checked file transactions',
+    input_schema: { type: 'object', properties: { property_name: { type: 'string' }, value: {} }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
     name: 'godot_run_game',
     description: 'Runs the project in the WebGL Game viewport',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_stop_game',
     description: 'Stops the running game and returns to the editor',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -199,6 +211,7 @@ export const MCP_TOOL_CATALOG = [
   {
     name: 'godot_capture_viewport',
     description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
@@ -237,6 +250,7 @@ export const MCP_TOOL_CATALOG = [
   {
     name: 'godot_get_logs',
     description: 'Retrieves engine logs and stdout telemetry',
+    input_schema: { type: 'object', properties: { limit: { type: 'number', default: 50 } }, additionalProperties: false },
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   }
 ];
