@@ -2207,7 +2207,9 @@ func _physics_process(delta):
           audioMaster.connect(audioDestination);
           stream = new MediaStream([...videoStream.getVideoTracks(), ...audioDestination.stream.getAudioTracks()]);
         }
-        const mimeCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+        const mimeCandidates = stream.getAudioTracks().length > 0
+          ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+          : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
         const mimeType = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
         const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 5_000_000 } : undefined);
         RecordingState.recorder = recorder;
@@ -2242,6 +2244,8 @@ func _physics_process(delta):
         const recorder = RecordingState.recorder;
         if (!recorder || recorder.state !== 'recording') throw new Error('No viewport recording is active.');
         const stoppedAt = Date.now();
+        recorder.requestData();
+        await new Promise(resolve => setTimeout(resolve, 180));
         await new Promise((resolve, reject) => {
           recorder.addEventListener('stop', resolve, { once: true });
           recorder.addEventListener('error', event => reject(event.error || new Error('Recording failed.')), { once: true });
@@ -2252,7 +2256,11 @@ func _physics_process(delta):
           try { RecordingState.audioMaster.disconnect(RecordingState.audioDestination); } catch (_) {}
         }
         const blob = new Blob(RecordingState.chunks, { type: recorder.mimeType || 'video/webm' });
-        if (!blob.size) throw new Error('The browser produced an empty recording.');
+        RecordingState.recorder = null;
+        RecordingState.chunks = [];
+        RecordingState.audioDestination = null;
+        RecordingState.audioMaster = null;
+        if (!blob.size) throw new Error('The browser produced an empty recording. Recorder state was cleaned up; retry with a longer run or a different codec.');
         const record = {
           id: RecordingState.id,
           filename: `${DiagnosticState.activeProject}-${RecordingState.startedAt}.webm`,
@@ -2266,10 +2274,6 @@ func _physics_process(delta):
         };
         await storeRecording(record);
         const downloadUrl = exposeRecordingDownload(record);
-        RecordingState.recorder = null;
-        RecordingState.chunks = [];
-        RecordingState.audioDestination = null;
-        RecordingState.audioMaster = null;
         return {
           success: true,
           status: 'persisted',
