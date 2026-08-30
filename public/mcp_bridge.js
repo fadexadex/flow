@@ -33,7 +33,7 @@
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
-  const RecordingState = { recorder: null, chunks: [], startedAt: 0, id: null, canvas: null };
+  const RecordingState = { recorder: null, chunks: [], startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null };
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
@@ -2196,7 +2196,17 @@ func _physics_process(delta):
         const canvas = document.getElementById('game-canvas');
         if (!canvas || typeof canvas.captureStream !== 'function') throw new Error('The visible game canvas does not support stream capture. Run the game first.');
         const fps = Math.max(10, Math.min(Number(args.fps) || 30, 60));
-        const stream = canvas.captureStream(fps);
+        const videoStream = canvas.captureStream(fps);
+        let audioDestination = null;
+        let audioMaster = null;
+        let stream = videoStream;
+        const godotAudioContext = window.__godotAudioContext;
+        if (godotAudioContext?.state !== 'closed' && window.__godotAudioMasterNode && typeof MediaStream !== 'undefined') {
+          audioDestination = godotAudioContext.createMediaStreamDestination();
+          audioMaster = window.__godotAudioMasterNode;
+          audioMaster.connect(audioDestination);
+          stream = new MediaStream([...videoStream.getVideoTracks(), ...audioDestination.stream.getAudioTracks()]);
+        }
         const mimeCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
         const mimeType = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
         const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 5_000_000 } : undefined);
@@ -2205,6 +2215,8 @@ func _physics_process(delta):
         RecordingState.startedAt = Date.now();
         RecordingState.id = `recording_${RecordingState.startedAt}_${Math.random().toString(36).slice(2, 7)}`;
         RecordingState.canvas = canvas;
+        RecordingState.audioDestination = audioDestination;
+        RecordingState.audioMaster = audioMaster;
         recorder.ondataavailable = event => { if (event.data?.size) RecordingState.chunks.push(event.data); };
         recorder.start(500);
         return {
@@ -2236,6 +2248,9 @@ func _physics_process(delta):
           recorder.stop();
         });
         for (const track of recorder.stream.getTracks()) track.stop();
+        if (RecordingState.audioDestination && RecordingState.audioMaster) {
+          try { RecordingState.audioMaster.disconnect(RecordingState.audioDestination); } catch (_) {}
+        }
         const blob = new Blob(RecordingState.chunks, { type: recorder.mimeType || 'video/webm' });
         if (!blob.size) throw new Error('The browser produced an empty recording.');
         const record = {
@@ -2253,6 +2268,8 @@ func _physics_process(delta):
         const downloadUrl = exposeRecordingDownload(record);
         RecordingState.recorder = null;
         RecordingState.chunks = [];
+        RecordingState.audioDestination = null;
+        RecordingState.audioMaster = null;
         return {
           success: true,
           status: 'persisted',
