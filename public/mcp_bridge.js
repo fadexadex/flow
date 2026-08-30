@@ -177,27 +177,55 @@
     DiagnosticState.session = 'authoring';
     DiagnosticHUD.render();
 
-    const ready = new Promise((resolve, reject) => {
-      let timeout;
-      const cleanup = () => {
-        clearTimeout(timeout);
-        window.removeEventListener('godot-engine-ready', onReady);
-        window.removeEventListener('godot-engine-failed', onFailed);
-      };
-      const onReady = () => { cleanup(); resolve(true); };
-      const onFailed = (event) => { cleanup(); reject(new Error(event?.detail?.message || 'Godot editor failed to initialize.')); };
-      window.addEventListener('godot-engine-ready', onReady, { once: true });
-      window.addEventListener('godot-engine-failed', onFailed, { once: true });
-      timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error(`Godot editor did not confirm project readiness within ${Math.round(timeoutMs / 1000)} seconds.`));
-      }, timeoutMs);
-    });
-
+    const bootStartedAt = Date.now();
+    let readyEventObserved = false;
+    let failureMessage = null;
+    const onReady = () => { readyEventObserved = true; };
+    const onFailed = (event) => { failureMessage = event?.detail?.message || 'Godot editor failed to initialize.'; };
+    window.addEventListener('godot-engine-ready', onReady, { once: true });
+    window.addEventListener('godot-engine-failed', onFailed, { once: true });
     window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor']);
-    await ready;
+    const ready = await waitFor(() => {
+      if (failureMessage || readyEventObserved) return true;
+      const editorTab = document.getElementById('btn-tab-editor');
+      const editorCanvas = document.getElementById('editor-canvas');
+      const bootTelemetry = activeLogs.some(entry => entry.time >= bootStartedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
+      return Boolean(editorTab && !editorTab.disabled && editorCanvas && bootTelemetry);
+    }, timeoutMs);
+    window.removeEventListener('godot-engine-ready', onReady);
+    window.removeEventListener('godot-engine-failed', onFailed);
+    if (failureMessage) throw new Error(failureMessage);
+    if (!ready) throw new Error(`Godot editor did not confirm project readiness within ${Math.round(timeoutMs / 1000)} seconds.`);
     DiagnosticState.engine = 'ready';
     DiagnosticState.session = 'editor-ready';
+    DiagnosticHUD.render();
+    return true;
+  }
+
+  async function restoreProjectSnapshot(previous) {
+    DiagnosticState.activeProject = previous.projectName;
+    activeMainScene = previous.mainScene;
+    activeFilesDict = cloneProjectFiles(previous.files);
+    if (Object.keys(previous.files).length > 0) {
+      try {
+        await restartEditorWithProject(previous.files, previous.projectName);
+        return true;
+      } catch (_) {
+        DiagnosticState.session = 'failed';
+        DiagnosticState.engine = 'failed';
+        DiagnosticHUD.render();
+        return false;
+      }
+    }
+
+    const closeEditorButton = document.getElementById('btn-close-editor');
+    if (closeEditorButton && !closeEditorButton.disabled && typeof window.closeEditor === 'function') {
+      window.closeEditor();
+      await waitFor(() => closeEditorButton.disabled, 12000);
+    }
+    if (typeof window.showTab === 'function') window.showTab('loader');
+    DiagnosticState.session = previous.session;
+    DiagnosticState.engine = previous.engine;
     DiagnosticHUD.render();
     return true;
   }
@@ -1153,7 +1181,8 @@ func _physics_process(delta):
           projectName: DiagnosticState.activeProject,
           mainScene: activeMainScene,
           files: cloneProjectFiles(activeFilesDict),
-          session: DiagnosticState.session
+          session: DiagnosticState.session,
+          engine: DiagnosticState.engine
         };
         DiagnosticState.activeProject = projName;
         activeMainScene = 'res://main_3d.tscn';
@@ -1180,13 +1209,7 @@ func _physics_process(delta):
           await restartEditorWithProject(activeFilesDict, projName);
           await validateProjectRuntimeBoot();
         } catch (error) {
-          DiagnosticState.activeProject = previous.projectName;
-          activeMainScene = previous.mainScene;
-          activeFilesDict = previous.files;
-          DiagnosticState.session = 'failed';
-          if (Object.keys(previous.files).length > 0) {
-            try { await restartEditorWithProject(previous.files, previous.projectName); } catch (_) {}
-          }
+          await restoreProjectSnapshot(previous);
           throw error;
         }
 
@@ -1328,29 +1351,30 @@ func _physics_process(delta):
         const replay = getIdempotentReplay(idempotencyKey, fingerprint);
         if (replay) return replay;
 
-        const previous = {
-          projectName: DiagnosticState.activeProject,
-          mainScene: activeMainScene,
-          files: cloneProjectFiles(activeFilesDict),
-          session: DiagnosticState.session
-        };
-        DiagnosticState.activeProject = projName;
-        const undoId = `undo_proj_${Date.now()}`;
-
-        let mainScene = 'res://main_3d.tscn';
-        let projectType = args.template || 'custom';
-
         if (args.template === 'custom' && (!args.files || Object.keys(args.files).length === 0)) {
           throw new Error('The custom template requires a non-empty files dictionary. No fallback template was created.');
         }
 
+        const previous = {
+          projectName: DiagnosticState.activeProject,
+          mainScene: activeMainScene,
+          files: cloneProjectFiles(activeFilesDict),
+          session: DiagnosticState.session,
+          engine: DiagnosticState.engine
+        };
+        const undoId = `undo_proj_${Date.now()}`;
+
+        let mainScene = 'res://main_3d.tscn';
+        let projectType = args.template || 'custom';
+        let stagedFiles;
+
         // Check if custom files are provided
         if (args.files && Object.keys(args.files).length > 0) {
-          activeFilesDict = Object.fromEntries(Object.entries(args.files).map(([filePath, content]) => [cleanProjectPath(filePath), content]));
+          stagedFiles = Object.fromEntries(Object.entries(args.files).map(([filePath, content]) => [cleanProjectPath(filePath), content]));
           projectType = 'custom_injected';
-          mainScene = inferMainScene(activeFilesDict);
+          mainScene = inferMainScene(stagedFiles);
         } else if (args.template === 'neon_skyrail_3d' || projName.includes('skyrail') || projName.includes('runner')) {
-          activeFilesDict = {
+          stagedFiles = {
             'project.godot': NeonSkyrail.generateProjectGodot(),
             'main_3d.tscn': NeonSkyrail.generateMain3dScene(),
             'main_3d.gd': NeonSkyrail.generateMain3dGd(),
@@ -1361,7 +1385,7 @@ func _physics_process(delta):
           projectType = 'neon_skyrail_3d';
         } else {
           // Default to Echoes of the Orbital Garden 3D Botanical Sanctuary
-          activeFilesDict = {
+          stagedFiles = {
             'project.godot': OrbitalGarden.generateProjectGodot(projName),
             'orbital_sanctuary.tscn': OrbitalGarden.generateSanctuaryScene(),
             'orbital_sanctuary.gd': OrbitalGarden.generateSanctuaryGd(),
@@ -1371,19 +1395,16 @@ func _physics_process(delta):
           mainScene = 'res://orbital_sanctuary.tscn';
           projectType = 'orbital_garden';
         }
+        validateProjectFiles(stagedFiles);
+        DiagnosticState.activeProject = projName;
+        activeFilesDict = stagedFiles;
         activeMainScene = mainScene;
 
         try {
           await restartEditorWithProject(activeFilesDict, projName);
           await validateProjectRuntimeBoot();
         } catch (error) {
-          DiagnosticState.activeProject = previous.projectName;
-          activeMainScene = previous.mainScene;
-          activeFilesDict = previous.files;
-          DiagnosticState.session = 'failed';
-          if (Object.keys(previous.files).length > 0) {
-            try { await restartEditorWithProject(previous.files, previous.projectName); } catch (_) {}
-          }
+          await restoreProjectSnapshot(previous);
           throw error;
         }
 
