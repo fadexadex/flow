@@ -650,6 +650,186 @@ func _physics_process(delta):
   };
 
   // ==========================================
+  // 5B. Echoes of the Orbital Garden Generator
+  // ==========================================
+  const OrbitalGarden = {
+    generateProjectGodot(name = 'Echoes of the Orbital Garden') {
+      return `; Engine configuration file for Echoes of the Orbital Garden
+config_version=5
+
+[application]
+config/name="${name}"
+run/main_scene="res://orbital_sanctuary.tscn"
+config/features=PackedStringArray("4.7", "Forward Plus")
+
+[display]
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.02, 0.08, 0.06, 1.0)
+`;
+    },
+
+    generateSanctuaryScene() {
+      return `[gd_scene load_steps=8 format=3 uid="uid://orbital_sanctuary_3d"]
+
+[ext_resource type="Script" path="res://orbital_sanctuary.gd" id="1_sanctuary"]
+[ext_resource type="PackedScene" uid="uid://botanist_player_3d" path="res://botanist_player.tscn" id="2_player"]
+
+[sub_resource type="ProceduralSkyMaterial" id="SkyMat_Orbital"]
+sky_top_color = Color(0.05, 0.25, 0.2, 1)
+sky_horizon_color = Color(0.2, 0.75, 0.55, 1)
+ground_bottom_color = Color(0.02, 0.08, 0.05, 1)
+
+[sub_resource type="Sky" id="Sky_Orbital"]
+sky_material = SubResource("SkyMat_Orbital")
+
+[sub_resource type="Environment" id="Env_Orbital"]
+background_mode = 2
+sky = SubResource("Sky_Orbital")
+ambient_light_source = 3
+ambient_light_color = Color(0.2, 0.6, 0.45, 1)
+fog_enabled = true
+fog_light_color = Color(0.15, 0.55, 0.4, 1)
+fog_density = 0.0035
+
+[sub_resource type="TorusMesh" id="Torus_Ring"]
+inner_radius = 45.0
+outer_radius = 65.0
+rings = 48
+ring_segments = 32
+
+[sub_resource type="StandardMaterial3D" id="Mat_TerraformRing"]
+albedo_color = Color(0.08, 0.35, 0.22, 1)
+metallic = 0.4
+roughness = 0.6
+emission_enabled = true
+emission = Color(0.0, 0.8, 0.5, 1)
+emission_energy_multiplier = 0.35
+
+[node name="OrbitalSanctuary" type="Node3D"]
+script = ExtResource("1_sanctuary")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Env_Orbital")
+
+[node name="SunLight" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.707, -0.5, 0.5, 0, 0.707, 0.707, -0.707, -0.5, 0.5, 0, 40, 0)
+light_color = Color(0.85, 1.0, 0.9, 1)
+light_energy = 1.8
+
+[node name="BiodomeRing" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, -4.37114e-08, 1, 0, -1, -4.37114e-08, 0, 0, 0)
+mesh = SubResource("Torus_Ring")
+surface_material_override/0 = SubResource("Mat_TerraformRing")
+
+[node name="BotanistPlayer" parent="." instance=ExtResource("2_player")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 52)
+`;
+    },
+
+    generateSanctuaryGd() {
+      return `extends Node3D
+
+var pollen_gathered: int = 0
+var relics_awakened: int = 0
+const TOTAL_RELICS: int = 8
+const TOTAL_POLLEN: int = 12
+
+func _ready():
+	print("[Orbital Garden] Ecosystem initialized. 8 Flora Relics & 12 Solar Pollen nodes online.")
+
+func _process(delta):
+	var player = get_node_or_null("BotanistPlayer")
+	if player:
+		# Check sanctuary flora resonance
+		pass
+`;
+    },
+
+    generateBotanistTscn() {
+      return `[gd_scene load_steps=5 format=3 uid="uid://botanist_player_3d"]
+
+[ext_resource type="Script" path="res://botanist_player.gd" id="1_botanist"]
+
+[sub_resource type="CylinderMesh" id="Cylinder_Botanist"]
+top_radius = 0.4
+bottom_radius = 0.5
+height = 1.8
+
+[sub_resource type="StandardMaterial3D" id="Mat_Botanist"]
+albedo_color = Color(0.1, 0.9, 0.65, 1)
+metallic = 0.7
+roughness = 0.2
+emission_enabled = true
+emission = Color(0.2, 1.0, 0.7, 1)
+emission_energy_multiplier = 0.6
+
+[sub_resource type="CylinderShape3D" id="Shape_Botanist"]
+top_radius = 0.4
+bottom_radius = 0.5
+height = 1.8
+
+[node name="BotanistPlayer" type="CharacterBody3D"]
+script = ExtResource("1_botanist")
+
+[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+mesh = SubResource("Cylinder_Botanist")
+surface_material_override/0 = SubResource("Mat_Botanist")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9, 0)
+shape = SubResource("Shape_Botanist")
+
+[node name="OrbitalCamera" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.9396, 0.342, 0, -0.342, 0.9396, 0, 3.8, 6.2)
+fov = 72.0
+current = true
+`;
+    },
+
+    generateBotanistGd() {
+      return `extends CharacterBody3D
+
+@export var move_speed: float = 18.0
+@export var glide_speed: float = 28.0
+@export var jump_impulse: float = 10.0
+var gravity: float = 14.0
+var is_gliding: bool = false
+
+func _physics_process(delta):
+	var input_dir = Input.get_vector("ui_left", "ui_right", "ui_up", "ui_down")
+	var dir = Vector3(input_dir.x, 0, input_dir.y).normalized()
+	
+	if dir:
+		velocity.x = dir.x * (glide_speed if is_gliding else move_speed)
+		velocity.z = dir.z * (glide_speed if is_gliding else move_speed)
+	else:
+		velocity.x = move_toward(velocity.x, 0, move_speed)
+		velocity.z = move_toward(velocity.z, 0, move_speed)
+		
+	if is_on_floor() and Input.is_action_just_pressed("ui_accept"):
+		velocity.y = jump_impulse
+	elif not is_on_floor():
+		if Input.is_action_pressed("ui_accept") and velocity.y < 0:
+			is_gliding = true
+			velocity.y = -2.5 # Gentle botanical glide
+		else:
+			is_gliding = false
+			velocity.y -= gravity * delta
+	else:
+		is_gliding = false
+		
+	move_and_slide()
+`;
+    }
+  };
+
+  // ==========================================
   // 6. Single Authoritative Tool Manifest (21 Tools)
   // ==========================================
   const MANIFEST_TOOLS = [
@@ -848,12 +1028,88 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_create_project',
-        description: 'Injects complete 2D/3D visual scenes (.tscn), GDScripts, shaders, and audio into Godot virtual FS and boots Godot Viewport',
-        input_schema: { type: 'object', properties: { project_name: { type: 'string' } }, additionalProperties: false },
+        description: 'Creates custom 2D/3D visual scenes, GDScripts, shaders, or authors complete project templates (orbital_garden, neon_skyrail_3d, custom) with arbitrary file injection',
+        input_schema: {
+          type: 'object',
+          properties: {
+            project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
+            template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden' },
+            files: { type: 'object', description: 'Custom dictionary of file paths to source strings/buffers to write into res://' },
+            idempotency_key: { type: 'string' }
+          },
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        return await MANIFEST_TOOLS.find(t => t.definition.name === 'godot_author_3d_runner').handler(args);
+        const projName = args.project_name || 'echoes_of_the_orbital_garden';
+        const idempotencyKey = args.idempotency_key;
+        if (idempotencyKey && idempotentMutations.has(idempotencyKey)) {
+          return { ...idempotentMutations.get(idempotencyKey), idempotent_replay: true };
+        }
+
+        DiagnosticState.activeProject = projName;
+        DiagnosticState.sceneRevision++;
+        const undoId = `undo_proj_${Date.now()}`;
+        undoStack.push({ undo_id: undoId, revision: DiagnosticState.sceneRevision });
+
+        let mainScene = 'res://main_3d.tscn';
+        let projectType = args.template || 'custom';
+
+        // Check if custom files are provided
+        if (args.files && Object.keys(args.files).length > 0) {
+          activeFilesDict = { ...args.files };
+          projectType = 'custom_injected';
+          mainScene = Object.keys(activeFilesDict).find(f => f.endsWith('.tscn')) || 'res://main.tscn';
+        } else if (args.template === 'neon_skyrail_3d' || projName.includes('skyrail') || projName.includes('runner')) {
+          activeFilesDict = {
+            'project.godot': NeonSkyrail.generateProjectGodot(),
+            'main_3d.tscn': NeonSkyrail.generateMain3dScene(),
+            'main_3d.gd': NeonSkyrail.generateMain3dGd(),
+            'player_runner.tscn': NeonSkyrail.generatePlayerTscn(),
+            'player_runner.gd': NeonSkyrail.generatePlayerGd()
+          };
+          mainScene = 'res://main_3d.tscn';
+          projectType = 'neon_skyrail_3d';
+        } else {
+          // Default to Echoes of the Orbital Garden 3D Botanical Sanctuary
+          activeFilesDict = {
+            'project.godot': OrbitalGarden.generateProjectGodot(projName),
+            'orbital_sanctuary.tscn': OrbitalGarden.generateSanctuaryScene(),
+            'orbital_sanctuary.gd': OrbitalGarden.generateSanctuaryGd(),
+            'botanist_player.tscn': OrbitalGarden.generateBotanistTscn(),
+            'botanist_player.gd': OrbitalGarden.generateBotanistGd()
+          };
+          mainScene = 'res://orbital_sanctuary.tscn';
+          projectType = 'orbital_garden';
+        }
+
+        if (typeof window !== 'undefined') {
+          window._mcpProjectName = projName;
+          window._mcpProjectFiles = activeFilesDict;
+          if (typeof window.startEditor === 'function') {
+            try {
+              window.startEditor(null, ['--path', `/home/web_user/projects/${projName}`, '--editor']);
+            } catch (e) {}
+          }
+        }
+
+        DiagnosticState.session = 'editor-ready';
+        DiagnosticHUD.render();
+
+        const result = {
+          success: true,
+          project_name: projName,
+          template_type: projectType,
+          scene_revision: DiagnosticState.sceneRevision,
+          undo_id: undoId,
+          main_scene: mainScene,
+          files_written: Object.keys(activeFilesDict),
+          message: `Project '${projName}' created successfully with ${projectType} template architecture.`
+        };
+
+        if (idempotencyKey) idempotentMutations.set(idempotencyKey, result);
+        return result;
       }
     },
     {
@@ -1224,16 +1480,18 @@ func _physics_process(delta):
     DiagnosticHUD.render();
   });
 
-  window.addEventListener('godot-engine-ready', () => {
-    DiagnosticState.engine = 'ready';
-    DiagnosticState.engineError = null;
-    DiagnosticHUD.render();
-  });
-  window.addEventListener('godot-engine-failed', (event) => {
-    DiagnosticState.engine = 'failed';
-    DiagnosticState.engineError = event?.detail?.message || 'Godot engine failed to initialize.';
-    DiagnosticHUD.render();
-  });
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('godot-engine-ready', () => {
+      DiagnosticState.engine = 'ready';
+      DiagnosticState.engineError = null;
+      DiagnosticHUD.render();
+    });
+    window.addEventListener('godot-engine-failed', (event) => {
+      DiagnosticState.engine = 'failed';
+      DiagnosticState.engineError = event?.detail?.message || 'Godot engine failed to initialize.';
+      DiagnosticHUD.render();
+    });
+  }
 
   function initDOM() {
     DiagnosticHUD.init();
