@@ -673,6 +673,7 @@ function startEditor(zip, customArgs) {
 			setGameTabEnabled(false);
 			showTab('editor');
 			game = null;
+			window.dispatchEvent(new Event('godot-game-stopped'));
 		},
 	};
 
@@ -699,10 +700,22 @@ function startEditor(zip, customArgs) {
 			showTab('game');
 			game.init().then(function () {
 				requestAnimationFrame(function () {
-					game.start({ 'args': args, 'canvas': gameCanvas }).then(function () {
-						gameCanvas.focus();
+					const gameRun = game.start({ 'args': args, 'canvas': gameCanvas });
+					gameCanvas.focus();
+					window.dispatchEvent(new Event('godot-game-launched'));
+					gameRun.then(function () {
+					}).catch(function (error) {
+						console.error('Game start failed:', error);
+						window.dispatchEvent(new CustomEvent('godot-game-failed', {
+							detail: { message: error instanceof Error ? error.message : String(error) }
+						}));
 					});
 				});
+			}).catch(function (error) {
+				console.error('Game initialization failed:', error);
+				window.dispatchEvent(new CustomEvent('godot-game-failed', {
+					detail: { message: error instanceof Error ? error.message : String(error) }
+				}));
 			});
 		} else { // New editor instances will be run in the same canvas. We want to wait for it to exit.
 			OnEditorExit = function (code) {

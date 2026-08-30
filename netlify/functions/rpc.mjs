@@ -35,14 +35,12 @@ export default async (req, context) => {
     return new Response(JSON.stringify({
       jsonrpc: '2.0',
       id: body.id,
-      result: {
-        status: 'received',
-        message: 'Dispatched to WebMCP Engine',
-        method: body.method,
-        params: body.params
+      error: {
+        code: -32601,
+        message: 'This stateless HTTP endpoint supports tools/list only. Execute tools through native in-page WebMCP so they can reach the active Godot runtime.'
       }
     }), {
-      status: 200,
+      status: 400,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
     });
   } catch (err) {

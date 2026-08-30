@@ -1,7 +1,7 @@
 /**
  * Godot WebMCP Bridge (v9.1 - Authoritative Native WebMCP & 3D Runner Engine)
  * Fully compliant with W3C / Chrome / OpenAI WebMCP standards:
- * - Single Authoritative Tool Manifest (21 Tools with strict JSON Schemas)
+ * - Authoritative native tool manifest with strict JSON Schemas
  * - Safe Native ModelContext Registration (Never overwrites read-only document.modelContext)
  * - Measurable Diagnostic Readiness State Machine (Engine, WebMCP, Session)
  * - Fixed Binary PKZIP Packager (setUint16) with standard CRC32
@@ -64,6 +64,234 @@
       await new Promise(resolve => setTimeout(resolve, intervalMs));
     }
     return false;
+  }
+
+  function cloneProjectFiles(files) {
+    return Object.fromEntries(Object.entries(files).map(([filePath, content]) => [
+      filePath,
+      content instanceof Uint8Array ? new Uint8Array(content) : content
+    ]));
+  }
+
+  function cleanProjectPath(rawPath) {
+    if (typeof rawPath !== 'string' || !rawPath.trim()) throw new Error('Project file path must be a non-empty string.');
+    const cleaned = rawPath.trim().replace(/^res:\/\//, '').replace(/^\/+/, '');
+    if (!cleaned || cleaned.includes('..') || cleaned.includes('\\') || cleaned.startsWith('.godot/')) {
+      throw new Error(`Unsafe project file path: ${rawPath}`);
+    }
+    return cleaned;
+  }
+
+  function cleanProjectName(rawName) {
+    if (typeof rawName !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(rawName)) {
+      throw new Error('Project name must be 1–64 characters using letters, numbers, underscores, or hyphens, and must start with a letter or number.');
+    }
+    return rawName;
+  }
+
+  function stableSerialize(value) {
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+      let byteHash = 2166136261;
+      for (const byte of bytes) {
+        byteHash ^= byte;
+        byteHash = Math.imul(byteHash, 16777619);
+      }
+      return `bytes:${bytes.byteLength}:${(byteHash >>> 0).toString(16)}`;
+    }
+    if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().filter(key => key !== 'idempotency_key').map(key => `${JSON.stringify(key)}:${stableSerialize(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  function mutationFingerprint(toolName, input) {
+    const serialized = `${toolName}:${stableSerialize(input)}`;
+    let hash = 2166136261;
+    for (let i = 0; i < serialized.length; i++) {
+      hash ^= serialized.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
+
+  function getIdempotentReplay(key, fingerprint) {
+    if (!key || !idempotentMutations.has(key)) return null;
+    const stored = idempotentMutations.get(key);
+    if (stored.fingerprint !== fingerprint) {
+      throw new Error(`Idempotency key conflict: ${key} was already used for a different mutation payload.`);
+    }
+    return { ...stored.result, idempotent_replay: true };
+  }
+
+  function storeIdempotentResult(key, fingerprint, result) {
+    if (key) idempotentMutations.set(key, { fingerprint, result });
+  }
+
+  function validateProjectFiles(files) {
+    const entries = Object.entries(files);
+    if (entries.length === 0) throw new Error('A project must contain at least one file.');
+    if (entries.length > 256) throw new Error('A project may contain at most 256 files.');
+    let totalBytes = 0;
+    for (const [rawPath, content] of entries) {
+      const filePath = cleanProjectPath(rawPath);
+      if (filePath !== rawPath) throw new Error(`Project paths must be normalized before commit: ${rawPath}`);
+      if (!(typeof content === 'string' || content instanceof Uint8Array || content instanceof ArrayBuffer)) {
+        throw new Error(`Unsupported content type for ${filePath}. Use text or binary bytes.`);
+      }
+      const size = typeof content === 'string' ? new TextEncoder().encode(content).byteLength : content.byteLength;
+      if (size > 5 * 1024 * 1024) throw new Error(`File exceeds the 5 MB limit: ${filePath}`);
+      totalBytes += size;
+    }
+    if (totalBytes > 25 * 1024 * 1024) throw new Error('Project exceeds the 25 MB in-memory authoring limit.');
+    if (typeof files['project.godot'] !== 'string') throw new Error('project.godot is required and must be text.');
+    const sceneFiles = entries.filter(([filePath]) => filePath.endsWith('.tscn'));
+    if (sceneFiles.length === 0) throw new Error('At least one .tscn scene is required.');
+    return { fileCount: entries.length, totalBytes };
+  }
+
+  function inferMainScene(files) {
+    const projectConfig = typeof files['project.godot'] === 'string' ? files['project.godot'] : '';
+    const configuredScene = projectConfig.match(/run\/main_scene\s*=\s*"([^"]+)"/)?.[1];
+    const firstScene = Object.keys(files).find(filePath => filePath.endsWith('.tscn'));
+    return normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
+  }
+
+  async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 20000) {
+    if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
+      throw new Error('Godot editor bootstrap is unavailable.');
+    }
+    validateProjectFiles(files);
+    const closeEditorButton = document.getElementById('btn-close-editor');
+    if (closeEditorButton && !closeEditorButton.disabled) {
+      if (typeof window.closeEditor !== 'function') throw new Error('The existing editor cannot be closed safely.');
+      window.closeEditor();
+      const closed = await waitFor(() => closeEditorButton.disabled, 12000);
+      if (!closed) throw new Error('Existing Godot editor did not stop within 12 seconds.');
+    }
+
+    window._mcpProjectName = projectName;
+    window._mcpProjectFiles = files;
+    DiagnosticState.engine = 'loading';
+    DiagnosticState.session = 'authoring';
+    DiagnosticHUD.render();
+
+    const ready = new Promise((resolve, reject) => {
+      let timeout;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        window.removeEventListener('godot-engine-ready', onReady);
+        window.removeEventListener('godot-engine-failed', onFailed);
+      };
+      const onReady = () => { cleanup(); resolve(true); };
+      const onFailed = (event) => { cleanup(); reject(new Error(event?.detail?.message || 'Godot editor failed to initialize.')); };
+      window.addEventListener('godot-engine-ready', onReady, { once: true });
+      window.addEventListener('godot-engine-failed', onFailed, { once: true });
+      timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error(`Godot editor did not confirm project readiness within ${Math.round(timeoutMs / 1000)} seconds.`));
+      }, timeoutMs);
+    });
+
+    window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor']);
+    await ready;
+    DiagnosticState.engine = 'ready';
+    DiagnosticState.session = 'editor-ready';
+    DiagnosticHUD.render();
+    return true;
+  }
+
+  function unsupportedEditorOperation(operation, requirement) {
+    const error = new Error(`${operation} is not connected to an acknowledged Godot Editor command channel. ${requirement}`);
+    error.code = 'EDITOR_COMMAND_UNSUPPORTED';
+    throw error;
+  }
+
+  function recentGodotErrors(sinceTime) {
+    // The web editor emits platform-level `ERROR:` diagnostics for unsupported
+    // debugger sockets and Emscripten blocking warnings even when a project is
+    // healthy. Treat only project-load/runtime failures as transaction blockers.
+    const patterns = /SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)|Game (?:start|initialization) failed|Invalid get index|Invalid call|Nonexistent function/i;
+    return activeLogs.filter(entry => entry.time >= sinceTime && entry.level === 'error' && patterns.test(entry.msg));
+  }
+
+  function waitForRuntimeEvent(successEvent, failureEvent, timeoutMs, timeoutMessage) {
+    return new Promise((resolve, reject) => {
+      let timeout;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        window.removeEventListener(successEvent, onSuccess);
+        if (failureEvent) window.removeEventListener(failureEvent, onFailure);
+      };
+      const onSuccess = () => { cleanup(); resolve(true); };
+      const onFailure = (event) => { cleanup(); reject(new Error(event?.detail?.message || `${failureEvent} reported failure.`)); };
+      window.addEventListener(successEvent, onSuccess, { once: true });
+      if (failureEvent) window.addEventListener(failureEvent, onFailure, { once: true });
+      timeout = setTimeout(() => { cleanup(); reject(new Error(timeoutMessage)); }, timeoutMs);
+    });
+  }
+
+  async function stopGameRuntime(timeoutMs = 10000) {
+    const closeGameButton = document.getElementById('btn-close-game');
+    const wasRunning = Boolean(closeGameButton && !closeGameButton.disabled);
+    if (!wasRunning) return false;
+    if (typeof window.closeGame !== 'function') throw new Error('Game is running, but the runtime quit control is unavailable.');
+    const stoppedEvent = waitForRuntimeEvent('godot-game-stopped', null, timeoutMs, `Godot did not emit a stopped event within ${Math.round(timeoutMs / 1000)} seconds.`);
+    window.closeGame();
+    await stoppedEvent;
+    const controlsStopped = await waitFor(() => closeGameButton.disabled, 2000);
+    if (!controlsStopped) throw new Error('Godot emitted a stopped event, but the game controls still report a running runtime.');
+    return true;
+  }
+
+  async function startGameRuntime({ visible = true, timeoutMs = 15000 } = {}) {
+    if (typeof window.Execute !== 'function') throw new Error('Godot editor is not initialized; author or open a project before running it.');
+    await stopGameRuntime(10000);
+    const startedAt = Date.now();
+    const launchedEvent = waitForRuntimeEvent(
+      'godot-game-launched',
+      'godot-game-failed',
+      timeoutMs,
+      `Godot did not confirm game launch within ${Math.round(timeoutMs / 1000)} seconds.`
+    );
+    window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
+    await launchedEvent;
+    const bootObserved = await waitFor(() => {
+      if (recentGodotErrors(startedAt).length > 0) return true;
+      return activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
+    }, Math.min(timeoutMs, 10000));
+    if (!bootObserved) {
+      try { await stopGameRuntime(6000); } catch (_) {}
+      throw new Error('Godot launched the runtime but emitted no boot telemetry.');
+    }
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const errors = recentGodotErrors(startedAt);
+    if (errors.length > 0) {
+      try { await stopGameRuntime(6000); } catch (_) {}
+      throw new Error(`Godot rejected the project during runtime boot: ${errors[0].msg}`);
+    }
+    const gameTab = document.getElementById('btn-tab-game');
+    const gameReady = Boolean(gameTab && !gameTab.disabled);
+    if (!gameReady) throw new Error('Godot emitted game-ready, but the Game tab is not enabled.');
+    if (visible) {
+      if (typeof window.showTab === 'function') window.showTab('game');
+      else gameTab.click();
+    }
+    const gamePanel = document.getElementById('tab-game');
+    const gameVisible = Boolean(gamePanel && gamePanel.style.display !== 'none');
+    if (visible && !gameVisible) throw new Error('Game runtime started, but the Game viewport could not be made visible.');
+    return { gameReady: true, gameVisible: visible ? gameVisible : false, startedAt };
+  }
+
+  async function validateProjectRuntimeBoot() {
+    try {
+      await startGameRuntime({ visible: false, timeoutMs: 15000 });
+    } finally {
+      try { await stopGameRuntime(10000); } catch (_) {}
+      if (typeof window.showTab === 'function') window.showTab('editor');
+    }
+    return true;
   }
 
   // Intercept logs for diagnostics
@@ -862,7 +1090,7 @@ func _physics_process(delta):
   };
 
   // ==========================================
-  // 6. Single Authoritative Tool Manifest (21 Tools)
+  // 6. Authoritative Native Tool Manifest
   // ==========================================
   const MANIFEST_TOOLS = [
     {
@@ -916,16 +1144,20 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const projName = args.project_name || 'neon_skyrail_3d';
+        const projName = cleanProjectName(args.project_name || 'neon_skyrail_3d');
         const idempotencyKey = args.idempotency_key;
-        if (idempotencyKey && idempotentMutations.has(idempotencyKey)) {
-          return { ...idempotentMutations.get(idempotencyKey), idempotent_replay: true };
-        }
+        const fingerprint = mutationFingerprint('godot_author_3d_runner', args);
+        const replay = getIdempotentReplay(idempotencyKey, fingerprint);
+        if (replay) return replay;
+        const previous = {
+          projectName: DiagnosticState.activeProject,
+          mainScene: activeMainScene,
+          files: cloneProjectFiles(activeFilesDict),
+          session: DiagnosticState.session
+        };
         DiagnosticState.activeProject = projName;
         activeMainScene = 'res://main_3d.tscn';
-        DiagnosticState.sceneRevision++;
         const undoId = `undo_runner_${Date.now()}`;
-        undoStack.push({ undo_id: undoId, revision: DiagnosticState.sceneRevision });
 
         activeFilesDict = {
           'project.godot': NeonSkyrail.generateProjectGodot(),
@@ -944,18 +1176,31 @@ func _physics_process(delta):
           generatedAudio.push({ name: aud.name, filename: aud.filename, duration: aud.duration_seconds, license: aud.license });
         }
 
-        if (typeof window !== 'undefined') {
-          window._mcpProjectName = projName;
-          window._mcpProjectFiles = activeFilesDict;
-          if (typeof window.startEditor === 'function') {
-            try {
-              window.startEditor(null, ['--path', `/home/web_user/projects/${projName}`, '--editor']);
-            } catch (e) {}
+        try {
+          await restartEditorWithProject(activeFilesDict, projName);
+          await validateProjectRuntimeBoot();
+        } catch (error) {
+          DiagnosticState.activeProject = previous.projectName;
+          activeMainScene = previous.mainScene;
+          activeFilesDict = previous.files;
+          DiagnosticState.session = 'failed';
+          if (Object.keys(previous.files).length > 0) {
+            try { await restartEditorWithProject(previous.files, previous.projectName); } catch (_) {}
           }
+          throw error;
         }
 
-        DiagnosticState.session = 'editor-ready';
-        DiagnosticHUD.render();
+        DiagnosticState.sceneRevision++;
+        undoStack.push({
+          undo_id: undoId,
+          revision: DiagnosticState.sceneRevision,
+          project_before: previous.projectName,
+          main_scene_before: previous.mainScene,
+          files_before: previous.files,
+          project_after: projName,
+          main_scene_after: activeMainScene,
+          files_after: cloneProjectFiles(activeFilesDict)
+        });
 
         const result = {
           success: true,
@@ -974,7 +1219,7 @@ func _physics_process(delta):
           audio_assets_generated: generatedAudio,
           files_written: Object.keys(activeFilesDict)
         };
-        if (idempotencyKey) idempotentMutations.set(idempotencyKey, result);
+        storeIdempotentResult(idempotencyKey, fingerprint, result);
         return result;
       }
     },
@@ -1077,28 +1322,33 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const projName = args.project_name || 'echoes_of_the_orbital_garden';
+        const projName = cleanProjectName(args.project_name || 'echoes_of_the_orbital_garden');
         const idempotencyKey = args.idempotency_key;
-        if (idempotencyKey && idempotentMutations.has(idempotencyKey)) {
-          return { ...idempotentMutations.get(idempotencyKey), idempotent_replay: true };
-        }
+        const fingerprint = mutationFingerprint('godot_create_project', args);
+        const replay = getIdempotentReplay(idempotencyKey, fingerprint);
+        if (replay) return replay;
 
+        const previous = {
+          projectName: DiagnosticState.activeProject,
+          mainScene: activeMainScene,
+          files: cloneProjectFiles(activeFilesDict),
+          session: DiagnosticState.session
+        };
         DiagnosticState.activeProject = projName;
-        DiagnosticState.sceneRevision++;
         const undoId = `undo_proj_${Date.now()}`;
-        undoStack.push({ undo_id: undoId, revision: DiagnosticState.sceneRevision });
 
         let mainScene = 'res://main_3d.tscn';
         let projectType = args.template || 'custom';
 
+        if (args.template === 'custom' && (!args.files || Object.keys(args.files).length === 0)) {
+          throw new Error('The custom template requires a non-empty files dictionary. No fallback template was created.');
+        }
+
         // Check if custom files are provided
         if (args.files && Object.keys(args.files).length > 0) {
-          activeFilesDict = { ...args.files };
+          activeFilesDict = Object.fromEntries(Object.entries(args.files).map(([filePath, content]) => [cleanProjectPath(filePath), content]));
           projectType = 'custom_injected';
-          const projectConfig = typeof activeFilesDict['project.godot'] === 'string' ? activeFilesDict['project.godot'] : '';
-          const configuredScene = projectConfig.match(/run\/main_scene\s*=\s*"([^"]+)"/)?.[1];
-          const firstScene = Object.keys(activeFilesDict).find(f => f.endsWith('.tscn'));
-          mainScene = normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
+          mainScene = inferMainScene(activeFilesDict);
         } else if (args.template === 'neon_skyrail_3d' || projName.includes('skyrail') || projName.includes('runner')) {
           activeFilesDict = {
             'project.godot': NeonSkyrail.generateProjectGodot(),
@@ -1123,18 +1373,31 @@ func _physics_process(delta):
         }
         activeMainScene = mainScene;
 
-        if (typeof window !== 'undefined') {
-          window._mcpProjectName = projName;
-          window._mcpProjectFiles = activeFilesDict;
-          if (typeof window.startEditor === 'function') {
-            try {
-              window.startEditor(null, ['--path', `/home/web_user/projects/${projName}`, '--editor']);
-            } catch (e) {}
+        try {
+          await restartEditorWithProject(activeFilesDict, projName);
+          await validateProjectRuntimeBoot();
+        } catch (error) {
+          DiagnosticState.activeProject = previous.projectName;
+          activeMainScene = previous.mainScene;
+          activeFilesDict = previous.files;
+          DiagnosticState.session = 'failed';
+          if (Object.keys(previous.files).length > 0) {
+            try { await restartEditorWithProject(previous.files, previous.projectName); } catch (_) {}
           }
+          throw error;
         }
 
-        DiagnosticState.session = 'editor-ready';
-        DiagnosticHUD.render();
+        DiagnosticState.sceneRevision++;
+        undoStack.push({
+          undo_id: undoId,
+          revision: DiagnosticState.sceneRevision,
+          project_before: previous.projectName,
+          main_scene_before: previous.mainScene,
+          files_before: previous.files,
+          project_after: projName,
+          main_scene_after: activeMainScene,
+          files_after: cloneProjectFiles(activeFilesDict)
+        });
 
         const result = {
           success: true,
@@ -1147,74 +1410,261 @@ func _physics_process(delta):
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`
         };
 
-        if (idempotencyKey) idempotentMutations.set(idempotencyKey, result);
+        storeIdempotentResult(idempotencyKey, fingerprint, result);
         return result;
       }
     },
     {
       definition: {
+        name: 'godot_inspect_project_files',
+        description: 'Inspects the authoritative in-memory project manifest and optionally returns selected text source files for revision-safe editing',
+        input_schema: {
+          type: 'object',
+          properties: {
+            paths: { type: 'array', items: { type: 'string' }, maxItems: 64 },
+            include_content: { type: 'boolean', default: false }
+          },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const requested = Array.isArray(args.paths) && args.paths.length > 0
+          ? new Set(args.paths.map(cleanProjectPath))
+          : null;
+        const files = Object.entries(activeFilesDict)
+          .filter(([filePath]) => !requested || requested.has(filePath))
+          .map(([filePath, content]) => {
+            const isText = typeof content === 'string';
+            const sizeBytes = isText ? new TextEncoder().encode(content).byteLength : content.byteLength;
+            return {
+              path: `res://${filePath}`,
+              kind: isText ? 'text' : 'binary',
+              size_bytes: sizeBytes,
+              ...(args.include_content && isText ? { content } : {})
+            };
+          });
+        return {
+          success: true,
+          project_name: DiagnosticState.activeProject,
+          main_scene: activeMainScene,
+          scene_revision: DiagnosticState.sceneRevision,
+          file_count: files.length,
+          files
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_apply_file_transaction',
+        description: 'Revision-checked atomic project edit. Writes or deletes text files, restarts the real Godot Editor, commits only after readiness acknowledgement, and records an undo snapshot',
+        input_schema: {
+          type: 'object',
+          properties: {
+            expected_revision: { type: 'integer', minimum: 1 },
+            label: { type: 'string' },
+            operations: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 64,
+              items: {
+                type: 'object',
+                properties: {
+                  kind: { type: 'string', enum: ['write', 'delete'] },
+                  path: { type: 'string' },
+                  content: { type: 'string' }
+                },
+                required: ['kind', 'path'],
+                additionalProperties: false
+              }
+            },
+            idempotency_key: { type: 'string' }
+          },
+          required: ['expected_revision', 'operations'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const fingerprint = mutationFingerprint('godot_apply_file_transaction', args);
+        const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
+        if (replay) return replay;
+        if (args.expected_revision !== DiagnosticState.sceneRevision) {
+          throw new Error(`Revision conflict: expected ${args.expected_revision}, current ${DiagnosticState.sceneRevision}. Inspect before editing.`);
+        }
+        if (!Array.isArray(args.operations) || args.operations.length === 0) throw new Error('At least one file operation is required.');
+
+        const previousFiles = cloneProjectFiles(activeFilesDict);
+        const previousMainScene = activeMainScene;
+        const stagedFiles = cloneProjectFiles(activeFilesDict);
+        const changedPaths = [];
+        for (const operation of args.operations) {
+          const filePath = cleanProjectPath(operation.path);
+          if (operation.kind === 'write') {
+            if (typeof operation.content !== 'string') throw new Error(`Write operation requires text content: ${filePath}`);
+            stagedFiles[filePath] = operation.content;
+          } else if (operation.kind === 'delete') {
+            if (!(filePath in stagedFiles)) throw new Error(`Cannot delete missing project file: ${filePath}`);
+            delete stagedFiles[filePath];
+          } else {
+            throw new Error(`Unsupported file operation: ${operation.kind}`);
+          }
+          changedPaths.push(`res://${filePath}`);
+        }
+        const validation = validateProjectFiles(stagedFiles);
+        const stagedMainScene = inferMainScene(stagedFiles);
+
+        try {
+          await restartEditorWithProject(stagedFiles, DiagnosticState.activeProject);
+          await validateProjectRuntimeBoot();
+        } catch (error) {
+          try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject); } catch (_) {}
+          throw error;
+        }
+
+        activeFilesDict = stagedFiles;
+        activeMainScene = stagedMainScene;
+        DiagnosticState.sceneRevision++;
+        const undoId = `undo_files_${Date.now()}`;
+        undoStack.push({
+          undo_id: undoId,
+          revision: DiagnosticState.sceneRevision,
+          label: args.label || 'Project file transaction',
+          project_before: DiagnosticState.activeProject,
+          main_scene_before: previousMainScene,
+          files_before: previousFiles,
+          project_after: DiagnosticState.activeProject,
+          main_scene_after: stagedMainScene,
+          files_after: cloneProjectFiles(stagedFiles)
+        });
+        const result = {
+          success: true,
+          label: args.label || 'Project file transaction',
+          scene_revision: DiagnosticState.sceneRevision,
+          undo_id: undoId,
+          changed_paths: changedPaths,
+          main_scene: activeMainScene,
+          file_count: validation.fileCount,
+          total_bytes: validation.totalBytes,
+          editor_acknowledged: true
+        };
+        storeIdempotentResult(args.idempotency_key, fingerprint, result);
+        return result;
+      }
+    },
+    {
+      definition: {
+        name: 'godot_undo_transaction',
+        description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction and restarts the Godot Editor',
+        input_schema: {
+          type: 'object',
+          properties: { undo_id: { type: 'string' } },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const transaction = args.undo_id
+          ? [...undoStack].reverse().find(entry => entry.undo_id === args.undo_id)
+          : undoStack.at(-1);
+        if (!transaction) throw new Error('No matching undo transaction is available.');
+        if (!transaction.files_before) throw new Error(`Undo transaction ${transaction.undo_id} has no restorable project snapshot.`);
+
+        if (Object.keys(transaction.files_before).length === 0) {
+          if (typeof window.closeEditor === 'function') window.closeEditor();
+          await waitFor(() => document.getElementById('btn-close-editor')?.disabled, 12000);
+          if (typeof window.showTab === 'function') window.showTab('loader');
+          activeFilesDict = {};
+          DiagnosticState.activeProject = transaction.project_before;
+          activeMainScene = transaction.main_scene_before;
+          DiagnosticState.session = 'empty';
+          DiagnosticState.engine = 'loading';
+        } else {
+          await restartEditorWithProject(transaction.files_before, transaction.project_before);
+          await validateProjectRuntimeBoot();
+          activeFilesDict = cloneProjectFiles(transaction.files_before);
+          DiagnosticState.activeProject = transaction.project_before;
+          activeMainScene = transaction.main_scene_before;
+        }
+        const index = undoStack.indexOf(transaction);
+        undoStack.splice(index, 1);
+        DiagnosticState.sceneRevision++;
+        DiagnosticHUD.render();
+        return {
+          success: true,
+          undone_id: transaction.undo_id,
+          scene_revision: DiagnosticState.sceneRevision,
+          active_project: DiagnosticState.activeProject,
+          main_scene: activeMainScene,
+          files_restored: Object.keys(activeFilesDict),
+          editor_acknowledged: Object.keys(activeFilesDict).length > 0
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_select_node_live',
-        description: 'Pixel-perfect snaps an illuminated selection bounding box over a node in the live 2D/3D canvas using scene-space coordinates',
+        description: 'Requests native Godot Editor node selection. Fails explicitly when the editor command channel is unavailable; never fabricates selection success.',
         input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, selected_node: args.node_path || 'PlayerRunner', bounding_box: { x: 0, y: 1.2, z: 0, width: 1.2, height: 2.0 } };
+        unsupportedEditorOperation('Node selection', 'Use godot_inspect_project_files to inspect source until a native editor plugin exposes selection acknowledgements.');
       }
     },
     {
       definition: {
         name: 'godot_transform_node_live',
-        description: 'Smoothly translates a node across the canvas with real-time coordinate updates and vector trajectory',
+        description: 'Requests a native Godot node transform. Fails explicitly without editor acknowledgement; use the file transaction tool for source-backed transforms.',
         input_schema: { type: 'object', properties: { node_path: { type: 'string' }, translation: { type: 'array' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, node: args.node_path || 'PlayerRunner', new_transform: args.translation || [0, 1.5, -10] };
+        unsupportedEditorOperation('Live node transform', 'Use godot_apply_file_transaction to update the owning .tscn scene transactionally.');
       }
     },
     {
       definition: {
         name: 'godot_connect_signal_live',
-        description: 'Renders an animated neon energy cable connecting emitting node to receiver node on the canvas',
+        description: 'Requests a native Godot signal connection. Fails explicitly without editor acknowledgement; source-backed scene edits remain available.',
         input_schema: { type: 'object', properties: { from_node: { type: 'string' }, signal: { type: 'string' }, to_node: { type: 'string' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, connection: `${args.from_node || 'Hazard'} -> ${args.signal || 'body_entered'} -> ${args.to_node || 'Main3D'}` };
+        unsupportedEditorOperation('Live signal connection', 'Use godot_apply_file_transaction to add an acknowledged [connection] entry to the .tscn source.');
       }
     },
     {
       definition: {
         name: 'godot_resize_gizmo_live',
-        description: 'Smoothly expands/contracts a collision radius or bounding box with live dimension telemetry',
+        description: 'Requests a native collision-gizmo resize. Fails explicitly without editor acknowledgement; source-backed shape edits remain available.',
         input_schema: { type: 'object', properties: { node_path: { type: 'string' }, radius: { type: 'number' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, node: args.node_path || 'CollisionShape3D', updated_radius: args.radius || 0.6 };
+        unsupportedEditorOperation('Live gizmo resize', 'Use godot_apply_file_transaction to edit the shape resource in scene source.');
       }
     },
     {
       definition: {
         name: 'godot_live_code_diff',
-        description: 'Displays a live floating IDE Code Diff card over the viewport showing GDScript modifications',
+        description: 'Legacy code-diff request. Fails explicitly because free-form diffs are not safely acknowledged; use revision-checked file transactions.',
         input_schema: { type: 'object', properties: { script_path: { type: 'string' }, diff: { type: 'string' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, file: args.script_path || 'res://player_runner.gd', status: 'diff_applied' };
+        unsupportedEditorOperation('Legacy code diff', 'Use godot_apply_file_transaction with expected_revision and complete replacement content.');
       }
     },
     {
       definition: {
         name: 'godot_inspect_property_live',
-        description: 'Highlights a property modification live over Godot Inspector dock with old vs new value callouts',
+        description: 'Requests a native Inspector property read. Fails explicitly without editor acknowledgement; project source inspection remains available.',
         input_schema: { type: 'object', properties: { property: { type: 'string' }, value: {} }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, inspected_property: args.property || 'forward_speed', current_value: args.value || 48.0 };
+        unsupportedEditorOperation('Live Inspector property read', 'Use godot_inspect_project_files for authoritative source values.');
       }
     },
     {
@@ -1240,34 +1690,34 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_switch_mode',
-        description: 'Directly switches the Godot Editor workspace between 2D, 3D, Script, and Game viewports',
+        description: 'Requests a native Godot workspace switch. Fails explicitly when no acknowledged editor command channel is installed.',
         input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game'] } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, current_mode: args.mode || '3D' };
+        unsupportedEditorOperation('Godot workspace switch', 'Game viewport switching is supported by godot_run_game and godot_stop_game.');
       }
     },
     {
       definition: {
         name: 'godot_open_scene',
-        description: 'Switches the active scene in the editor viewport with visual focus',
+        description: 'Requests a native scene-open operation. Fails explicitly without editor acknowledgement; main-scene changes can be made transactionally.',
         input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, active_scene: args.scene_path || 'res://main_3d.tscn' };
+        unsupportedEditorOperation('Open scene', 'Use godot_apply_file_transaction to change project.godot run/main_scene, then restart the acknowledged editor session.');
       }
     },
     {
       definition: {
         name: 'godot_hot_reload_property',
-        description: 'Hot-patches a variable or parameter in the active script in the virtual filesystem with live telemetry',
+        description: 'Legacy hot-reload request. Fails explicitly because property-only patches cannot be applied safely without file and revision context.',
         input_schema: { type: 'object', properties: { property_name: { type: 'string' }, value: {} }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        return { success: true, property_name: args.property_name || 'forward_speed', new_value: args.value || 52.0 };
+        unsupportedEditorOperation('Legacy property hot reload', 'Use godot_inspect_project_files followed by godot_apply_file_transaction.');
       }
     },
     {
@@ -1279,27 +1729,13 @@ func _physics_process(delta):
       },
       handler: async () => {
         PlaytestSimulation.reset();
-        if (typeof window.Execute !== 'function') {
-          throw new Error('Godot editor is not initialized; author or open a project before running it.');
-        }
-        const gameTab = document.getElementById('btn-tab-game');
-        const closeGameButton = document.getElementById('btn-close-game');
-        if (closeGameButton && !closeGameButton.disabled && typeof window.closeGame === 'function') {
-          window.closeGame();
-          await waitFor(() => closeGameButton.disabled, 5000);
-        }
-        window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
-        const gameReady = await waitFor(() => gameTab && !gameTab.disabled, 10000);
-        if (!gameReady) {
+        try {
+          await startGameRuntime({ visible: true, timeoutMs: 15000 });
+        } catch (error) {
           DiagnosticState.session = 'failed';
           DiagnosticHUD.render();
-          throw new Error('Godot did not enable the Game viewport within 10 seconds. The run request was not confirmed.');
+          throw error;
         }
-        if (typeof window.showTab === 'function') window.showTab('game');
-        else gameTab.click();
-        const gamePanel = document.getElementById('tab-game');
-        const gameVisible = Boolean(gamePanel && gamePanel.style.display !== 'none');
-        if (!gameVisible) throw new Error('Game runtime started, but the Game viewport could not be made visible.');
         DiagnosticState.engine = 'ready';
         DiagnosticState.session = 'playtesting';
         DiagnosticHUD.render();
@@ -1314,16 +1750,7 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async () => {
-        const closeGameButton = document.getElementById('btn-close-game');
-        const wasRunning = Boolean(closeGameButton && !closeGameButton.disabled);
-        if (wasRunning) {
-          if (typeof window.closeGame !== 'function') {
-            throw new Error('Game is running, but the runtime quit control is unavailable.');
-          }
-          window.closeGame();
-          const stopped = await waitFor(() => closeGameButton.disabled, 8000);
-          if (!stopped) throw new Error('Godot did not confirm that the game runtime stopped within 8 seconds.');
-        }
+        const wasRunning = await stopGameRuntime(10000);
         if (typeof window.showTab === 'function') window.showTab('editor');
         else document.getElementById('btn-tab-editor')?.click();
         DiagnosticState.session = 'editor-ready';
@@ -1423,6 +1850,9 @@ func _physics_process(delta):
       const labels = {
         godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
         godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
+        godot_inspect_project_files: 'Inspecting authoritative project files',
+        godot_apply_file_transaction: `Applying file transaction: ${input.label || 'Project update'}`,
+        godot_undo_transaction: `Undoing transaction: ${input.undo_id || 'latest'}`,
         godot_run_game: 'Launching game viewport',
         godot_stop_game: 'Stopping game session',
         godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
@@ -1559,7 +1989,7 @@ func _physics_process(delta):
 
     if (native) {
       DiagnosticState.webmcpSurface = native.surface;
-      console.log(`[WebMCP] Found native surface: ${native.surface}. Registering 21 tools...`);
+      console.log(`[WebMCP] Found native surface: ${native.surface}. Registering ${MANIFEST_TOOLS.length} tools...`);
       const controller = new AbortController();
       for (const tool of MANIFEST_TOOLS) {
         try {

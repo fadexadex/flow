@@ -74,33 +74,48 @@ const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_inspect_project_files',
+    description: 'Inspects the authoritative in-memory project manifest and optionally returns selected text source files for revision-safe editing',
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_apply_file_transaction',
+    description: 'Revision-checked atomic project edit that restarts the real Godot Editor and records an undo snapshot',
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_undo_transaction',
+    description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction',
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_select_node_live',
-    description: 'Pixel-perfect snaps an illuminated selection bounding box over a node in the live 2D/3D canvas using scene-space coordinates',
+    description: 'Requests native Godot Editor node selection and fails explicitly when no acknowledged editor command channel is installed',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_transform_node_live',
-    description: 'Smoothly translates a node across the canvas with real-time coordinate updates and vector trajectory',
+    description: 'Requests a native Godot node transform and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_connect_signal_live',
-    description: 'Renders an animated neon energy cable connecting emitting node to receiver node on the canvas',
+    description: 'Requests a native Godot signal connection and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_resize_gizmo_live',
-    description: 'Smoothly expands/contracts a collision radius or bounding box with live dimension telemetry',
+    description: 'Requests a native collision-gizmo resize and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_live_code_diff',
-    description: 'Displays a live floating IDE Code Diff card over the viewport showing GDScript modifications',
+    description: 'Legacy diff request that fails explicitly; use revision-checked file transactions',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_inspect_property_live',
-    description: 'Highlights a property modification live over Godot Inspector dock with old vs new value callouts',
+    description: 'Requests a native Inspector property read and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -110,17 +125,17 @@ const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_switch_mode',
-    description: 'Directly switches the Godot Editor workspace between 2D, 3D, Script, and Game viewports',
+    description: 'Requests a native Godot workspace switch and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_open_scene',
-    description: 'Switches the active scene in the editor viewport with visual focus',
+    description: 'Requests a native scene-open operation and fails explicitly without editor acknowledgement',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_hot_reload_property',
-    description: 'Hot-patches a variable or parameter in the active script in the virtual filesystem with live telemetry',
+    description: 'Legacy property hot reload that fails explicitly; use revision-checked file transactions',
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
@@ -166,10 +181,13 @@ app.post('/api/mcp/rpc', (req, res) => {
       result: { tools: MCP_TOOL_CATALOG }
     });
   }
-  return res.json({
+  return res.status(400).json({
     jsonrpc: '2.0',
     id: body.id,
-    result: { status: 'received', method: body.method, params: body.params }
+    error: {
+      code: -32601,
+      message: 'This stateless HTTP endpoint supports tools/list only. Execute tools through native in-page WebMCP so they can reach the active Godot runtime.'
+    }
   });
 });
 
