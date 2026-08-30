@@ -1524,34 +1524,67 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_export_zip',
-        description: 'Packages all active project scenes, scripts, shaders, and audio into a standard downloadable ZIP archive buffer',
-        input_schema: { type: 'object', properties: { project_name: { type: 'string' } }, additionalProperties: false },
+        description: 'Packages the active project and an explicit per-file provenance manifest into a standard downloadable ZIP archive',
+        input_schema: {
+          type: 'object',
+          properties: {
+            project_name: { type: 'string' },
+            provenance: {
+              type: 'object',
+              description: 'Optional map of project paths to source/license/author/url metadata',
+              additionalProperties: {
+                type: 'object',
+                properties: { source: { type: 'string' }, license: { type: 'string' }, author: { type: 'string' }, url: { type: 'string' } },
+                additionalProperties: false
+              }
+            }
+          },
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: true, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
         const projName = args.project_name || DiagnosticState.activeProject || 'neon_skyrail_3d';
         if (Object.keys(activeFilesDict).length === 0) {
-          activeFilesDict = {
-            'project.godot': NeonSkyrail.generateProjectGodot(),
-            'main_3d.tscn': NeonSkyrail.generateMain3dScene(),
-            'main_3d.gd': NeonSkyrail.generateMain3dGd(),
-            'player_runner.tscn': NeonSkyrail.generatePlayerTscn(),
-            'player_runner.gd': NeonSkyrail.generatePlayerGd()
-          };
+          throw new Error('No authored project files are available to export. Create or restore a project before requesting a ZIP.');
         }
 
-        const zipBytes = ZipBuilder.createZip(activeFilesDict);
+        const generatedProject = ('player_runner.gd' in activeFilesDict && 'main_3d.gd' in activeFilesDict)
+          || ('botanist_player.gd' in activeFilesDict && 'orbital_sanctuary.gd' in activeFilesDict);
+        const suppliedProvenance = args.provenance && typeof args.provenance === 'object' ? args.provenance : {};
+        const fileProvenance = {};
+        for (const filePath of Object.keys(activeFilesDict)) {
+          const supplied = suppliedProvenance[filePath] || suppliedProvenance[`res://${filePath}`];
+          fileProvenance[filePath] = supplied || {
+            source: generatedProject ? 'generated_by_godot_webmcp' : 'user_supplied_via_webmcp',
+            license: generatedProject ? 'MIT' : 'unspecified'
+          };
+        }
+        for (const rawPath of Object.keys(suppliedProvenance)) {
+          const filePath = cleanProjectPath(rawPath);
+          if (!(filePath in activeFilesDict)) throw new Error(`Provenance references a file outside the active project: ${rawPath}`);
+        }
+        const provenanceManifest = {
+          schema_version: 1,
+          project_name: DiagnosticState.activeProject,
+          exported_at: new Date().toISOString(),
+          files: fileProvenance
+        };
+        const exportFiles = cloneProjectFiles(activeFilesDict);
+        exportFiles['WEBMCP_PROVENANCE.json'] = JSON.stringify(provenanceManifest, null, 2);
+        const zipBytes = ZipBuilder.createZip(exportFiles);
         let binary = '';
         for (let i = 0; i < zipBytes.byteLength; i++) binary += String.fromCharCode(zipBytes[i]);
         const base64 = typeof btoa !== 'undefined' ? btoa(binary) : '';
 
         return {
           filename: `${projName}.zip`,
-          total_files: Object.keys(activeFilesDict).length,
+          total_files: Object.keys(exportFiles).length,
           zip_size_bytes: zipBytes.length,
           data_url: `data:application/zip;base64,${base64}`,
-          manifest: Object.keys(activeFilesDict),
-          license: 'MIT License'
+          manifest: Object.keys(exportFiles),
+          provenance_manifest: 'WEBMCP_PROVENANCE.json',
+          license_summary: [...new Set(Object.values(fileProvenance).map(record => record.license || 'unspecified'))]
         };
       }
     },

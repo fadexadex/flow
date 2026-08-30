@@ -80,7 +80,7 @@ const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_export_zip',
-    description: 'Packages all active project scenes, scripts, shaders, and audio into a standard downloadable ZIP archive buffer',
+    description: 'Packages the active project and an explicit per-file provenance manifest into a standard downloadable ZIP archive',
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
