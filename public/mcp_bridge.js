@@ -33,6 +33,38 @@
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
+  let activeMainScene = 'res://main_3d.tscn';
+
+  function normalizeResourcePath(filePath, fallback = 'res://main.tscn') {
+    if (!filePath || typeof filePath !== 'string') return fallback;
+    return filePath.startsWith('res://') ? filePath : `res://${filePath.replace(/^\/+/, '')}`;
+  }
+
+  function refreshMeasuredEngineState() {
+    if (typeof document === 'undefined') return DiagnosticState.engine;
+    const editorTab = document.getElementById('btn-tab-editor');
+    const gameTab = document.getElementById('btn-tab-game');
+    const editorCanvas = document.getElementById('editor-canvas');
+    const gameCanvas = document.getElementById('game-canvas');
+    const hasUsableRuntime = Boolean(
+      (editorTab && !editorTab.disabled && editorCanvas) ||
+      (gameTab && !gameTab.disabled && gameCanvas)
+    );
+    if (hasUsableRuntime && DiagnosticState.engine !== 'failed') {
+      DiagnosticState.engine = 'ready';
+      DiagnosticState.engineError = null;
+    }
+    return DiagnosticState.engine;
+  }
+
+  async function waitFor(predicate, timeoutMs = 8000, intervalMs = 80) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (predicate()) return true;
+      await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    return false;
+  }
 
   // Intercept logs for diagnostics
   const origLog = console.log;
@@ -841,6 +873,7 @@ func _physics_process(delta):
         annotations: { readOnlyHint: true, untrustedContentHint: false }
       },
       handler: async () => {
+        refreshMeasuredEngineState();
         const isWebGL = typeof WebGLRenderingContext !== 'undefined';
         return {
           status: 'healthy',
@@ -851,6 +884,7 @@ func _physics_process(delta):
           session: {
             state: DiagnosticState.session,
             active_project: DiagnosticState.activeProject,
+            active_main_scene: activeMainScene,
             scene_revision: DiagnosticState.sceneRevision,
             undo_stack_depth: undoStack.length
           },
@@ -888,6 +922,7 @@ func _physics_process(delta):
           return { ...idempotentMutations.get(idempotencyKey), idempotent_replay: true };
         }
         DiagnosticState.activeProject = projName;
+        activeMainScene = 'res://main_3d.tscn';
         DiagnosticState.sceneRevision++;
         const undoId = `undo_runner_${Date.now()}`;
         undoStack.push({ undo_id: undoId, revision: DiagnosticState.sceneRevision });
@@ -1060,7 +1095,10 @@ func _physics_process(delta):
         if (args.files && Object.keys(args.files).length > 0) {
           activeFilesDict = { ...args.files };
           projectType = 'custom_injected';
-          mainScene = Object.keys(activeFilesDict).find(f => f.endsWith('.tscn')) || 'res://main.tscn';
+          const projectConfig = typeof activeFilesDict['project.godot'] === 'string' ? activeFilesDict['project.godot'] : '';
+          const configuredScene = projectConfig.match(/run\/main_scene\s*=\s*"([^"]+)"/)?.[1];
+          const firstScene = Object.keys(activeFilesDict).find(f => f.endsWith('.tscn'));
+          mainScene = normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
         } else if (args.template === 'neon_skyrail_3d' || projName.includes('skyrail') || projName.includes('runner')) {
           activeFilesDict = {
             'project.godot': NeonSkyrail.generateProjectGodot(),
@@ -1083,6 +1121,7 @@ func _physics_process(delta):
           mainScene = 'res://orbital_sanctuary.tscn';
           projectType = 'orbital_garden';
         }
+        activeMainScene = mainScene;
 
         if (typeof window !== 'undefined') {
           window._mcpProjectName = projName;
@@ -1243,8 +1282,28 @@ func _physics_process(delta):
         if (typeof window.Execute !== 'function') {
           throw new Error('Godot editor is not initialized; author or open a project before running it.');
         }
+        const gameTab = document.getElementById('btn-tab-game');
+        const closeGameButton = document.getElementById('btn-close-game');
+        if (closeGameButton && !closeGameButton.disabled && typeof window.closeGame === 'function') {
+          window.closeGame();
+          await waitFor(() => closeGameButton.disabled, 5000);
+        }
         window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
-        return { success: true, status: 'running', main_scene: 'res://main_3d.tscn' };
+        const gameReady = await waitFor(() => gameTab && !gameTab.disabled, 10000);
+        if (!gameReady) {
+          DiagnosticState.session = 'failed';
+          DiagnosticHUD.render();
+          throw new Error('Godot did not enable the Game viewport within 10 seconds. The run request was not confirmed.');
+        }
+        if (typeof window.showTab === 'function') window.showTab('game');
+        else gameTab.click();
+        const gamePanel = document.getElementById('tab-game');
+        const gameVisible = Boolean(gamePanel && gamePanel.style.display !== 'none');
+        if (!gameVisible) throw new Error('Game runtime started, but the Game viewport could not be made visible.');
+        DiagnosticState.engine = 'ready';
+        DiagnosticState.session = 'playtesting';
+        DiagnosticHUD.render();
+        return { success: true, status: 'running', main_scene: activeMainScene, viewport: 'game', viewport_visible: true };
       }
     },
     {
@@ -1255,9 +1314,21 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async () => {
+        const closeGameButton = document.getElementById('btn-close-game');
+        const wasRunning = Boolean(closeGameButton && !closeGameButton.disabled);
+        if (wasRunning) {
+          if (typeof window.closeGame !== 'function') {
+            throw new Error('Game is running, but the runtime quit control is unavailable.');
+          }
+          window.closeGame();
+          const stopped = await waitFor(() => closeGameButton.disabled, 8000);
+          if (!stopped) throw new Error('Godot did not confirm that the game runtime stopped within 8 seconds.');
+        }
+        if (typeof window.showTab === 'function') window.showTab('editor');
+        else document.getElementById('btn-tab-editor')?.click();
         DiagnosticState.session = 'editor-ready';
         DiagnosticHUD.render();
-        return { success: true, status: 'stopped' };
+        return { success: true, status: 'stopped', runtime_was_running: wasRunning, viewport: 'editor' };
       }
     },
     {
@@ -1339,6 +1410,115 @@ func _physics_process(delta):
     return null;
   }
 
+  // ==========================================
+  // 8B. Editor-Level Agent Observation Layer
+  // ==========================================
+  const AgentObservationHUD = {
+    sequence: 0,
+    banner: null,
+    feed: null,
+    entries: [],
+
+    describe(toolName, input = {}) {
+      const labels = {
+        godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
+        godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
+        godot_run_game: 'Launching game viewport',
+        godot_stop_game: 'Stopping game session',
+        godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
+        godot_capture_viewport: 'Capturing live viewport',
+        godot_select_node_live: `Selecting node: ${input.node_path || 'Player'}`,
+        godot_transform_node_live: `Transforming node: ${input.node_path || 'Player'}`,
+        godot_connect_signal_live: `Wiring signal: ${input.signal || 'signal'}`,
+        godot_live_code_diff: `Editing script: ${input.script_path || 'script'}`,
+        godot_hot_reload_property: `Hot reload: ${input.property_name || 'property'}`,
+        godot_open_scene: `Opening scene: ${input.scene_path || 'main scene'}`,
+        godot_synthesize_audio_suite: 'Synthesizing flight audio suite',
+        godot_generate_audio_fx: `Generating audio: ${input.type || 'effect'}`,
+        godot_export_zip: 'Packaging project ZIP',
+        godot_get_session_status: 'Inspecting engine session',
+        godot_get_logs: 'Reading engine logs'
+      };
+      return labels[toolName] || toolName.replace(/^godot_/, '').replaceAll('_', ' ');
+    },
+
+    ensure() {
+      if (typeof document === 'undefined' || !document.body) return false;
+      if (!this.banner) {
+        this.banner = document.createElement('div');
+        this.banner.id = 'webmcp-agent-action-banner';
+        this.banner.style.cssText = 'position:fixed;top:38px;left:50%;transform:translateX(-50%);z-index:1000000;min-width:420px;max-width:min(760px,80vw);padding:8px 18px;border:1px solid #00e5ff;border-radius:999px;background:rgba(3,18,28,.94);box-shadow:0 0 22px rgba(0,229,255,.34),inset 0 0 12px rgba(0,229,255,.08);color:#dffbff;font:600 12px/1.2 Inter,system-ui,sans-serif;letter-spacing:.02em;text-align:center;pointer-events:none;opacity:0;transition:opacity .16s ease,transform .16s ease;';
+        document.body.appendChild(this.banner);
+      }
+      if (!this.feed) {
+        this.feed = document.createElement('div');
+        this.feed.id = 'webmcp-agent-action-feed';
+        this.feed.style.cssText = 'position:fixed;top:84px;right:14px;z-index:999999;width:330px;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:none;';
+        this.feed.innerHTML = `<div style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div><div style="margin-top:5px;color:#789099">Waiting for a WebMCP action…</div>`;
+        document.body.appendChild(this.feed);
+      }
+      return true;
+    },
+
+    renderFeed() {
+      if (!this.ensure()) return;
+      const rows = this.entries.slice(-5).reverse().map((entry) => {
+        const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : '#4de8ff';
+        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}</span></div>`;
+      }).join('');
+      this.feed.innerHTML = `<div style="margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div>${rows}`;
+    },
+
+    escape(value) {
+      return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    },
+
+    update(status, toolName, input, detail = '', entryId = null) {
+      const label = this.describe(toolName, input);
+      const now = Date.now();
+      let entry = entryId ? this.entries.find(item => item.id === entryId) : null;
+      if (entry) {
+        entry.status = status;
+        entry.detail = detail;
+        entry.completedAt = now;
+        entry.durationMs = now - entry.startedAt;
+        entry.revision = DiagnosticState.sceneRevision;
+      } else {
+        entry = { id: ++this.sequence, status, toolName, label, detail, at: now, startedAt: now, revision: DiagnosticState.sceneRevision };
+        this.entries.push(entry);
+      }
+      activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
+      if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+      if (this.ensure()) {
+        const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : '✦';
+        this.banner.textContent = `${icon} AI Agent · ${label}${detail ? ` · ${detail}` : ''}`;
+        this.banner.style.borderColor = status === 'failed' ? '#ff667f' : status === 'succeeded' ? '#45e7a4' : '#00e5ff';
+        this.banner.style.opacity = '1';
+        this.banner.style.transform = 'translateX(-50%) translateY(0)';
+        clearTimeout(this._hideTimer);
+        this._hideTimer = setTimeout(() => { if (this.banner) this.banner.style.opacity = '0'; }, status === 'running' ? 2200 : 3200);
+        this.renderFeed();
+      }
+      if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+        window.dispatchEvent(new CustomEvent('godot:webmcp-observation', { detail: entry }));
+      }
+      return entry;
+    }
+  };
+
+  async function executeObservedTool(tool, input = {}) {
+    const observation = AgentObservationHUD.update('running', tool.definition.name, input);
+    try {
+      const result = await tool.handler(input);
+      const detail = result?.scene_revision ? `Rev #${result.scene_revision}` : result?.success === true ? 'Complete' : '';
+      AgentObservationHUD.update('succeeded', tool.definition.name, input, detail, observation.id);
+      return result;
+    } catch (error) {
+      AgentObservationHUD.update('failed', tool.definition.name, input, error instanceof Error ? error.message : String(error), observation.id);
+      throw error;
+    }
+  }
+
   function nativeToolDefinition(tool) {
     const definition = tool.definition;
     return {
@@ -1348,7 +1528,7 @@ func _physics_process(delta):
       // Native WebMCP uses camelCase and expects the executable handler on the
       // tool object. `input_schema` remains the MCP HTTP catalog shape.
       inputSchema: definition.input_schema,
-      execute: async (input) => tool.handler(input || {})
+      execute: async (input) => executeObservedTool(tool, input || {})
     };
   }
 
@@ -1362,7 +1542,7 @@ func _physics_process(delta):
       callTool: async (name, args) => {
         const tool = MANIFEST_TOOLS.find(t => t.definition.name === name);
         if (!tool) throw new Error(`Tool '${name}' not found`);
-        return await tool.handler(args);
+        return await executeObservedTool(tool, args || {});
       }
     };
 
@@ -1495,6 +1675,18 @@ func _physics_process(delta):
 
   function initDOM() {
     DiagnosticHUD.init();
+    AgentObservationHUD.ensure();
+
+    const readinessObserver = new MutationObserver(() => {
+      const previousState = DiagnosticState.engine;
+      refreshMeasuredEngineState();
+      if (DiagnosticState.engine !== previousState) DiagnosticHUD.render();
+    });
+    ['btn-tab-editor', 'btn-tab-game'].forEach((id) => {
+      const element = document.getElementById(id);
+      if (element) readinessObserver.observe(element, { attributes: true, attributeFilter: ['disabled', 'class'] });
+    });
+    refreshMeasuredEngineState();
 
     setTimeout(() => {
       if (typeof document !== 'undefined' && typeof document.getElementById === 'function') {
