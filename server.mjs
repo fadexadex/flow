@@ -49,6 +49,11 @@ const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_get_operation_status',
+    description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_author_3d_runner',
     description: 'Transactionally authors the complete Neon Skyrail 3D runner with chase camera, elevated skyrail, 8 coral hazards, 11 energy pulses, and Dawn Gate',
     annotations: { readOnlyHint: false, untrustedContentHint: true }

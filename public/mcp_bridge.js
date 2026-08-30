@@ -30,10 +30,110 @@
 
   const undoStack = [];
   const idempotentMutations = new Map();
+  const inflightIdempotency = new Map();
+  const managedOperations = new Map();
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
   let activeMainScene = 'res://main_3d.tscn';
+  let activeManagedMutationId = null;
+
+  function publicOperation(operation) {
+    return {
+      operation_id: operation.id,
+      tool: operation.tool,
+      label: operation.label,
+      status: operation.status,
+      started_at: operation.startedAt,
+      completed_at: operation.completedAt || null,
+      elapsed_ms: (operation.completedAt || Date.now()) - operation.startedAt,
+      ...(operation.result ? { result: operation.result } : {}),
+      ...(operation.error ? { error: operation.error } : {})
+    };
+  }
+
+  async function runManagedMutation(tool, label, mutation, inlineWaitMs = 10000, idempotency = null) {
+    if (idempotency?.key) {
+      const replay = getIdempotentReplay(idempotency.key, idempotency.fingerprint);
+      if (replay) return replay;
+      const inflight = inflightIdempotency.get(idempotency.key);
+      if (inflight) {
+        if (inflight.fingerprint !== idempotency.fingerprint) {
+          throw new Error(`Idempotency key conflict: ${idempotency.key} is already running with a different mutation payload.`);
+        }
+        const operation = managedOperations.get(inflight.operationId);
+        if (operation) {
+          const replay = publicOperation(operation);
+          if (replay.status === 'running') replay.status = 'pending';
+          return { ...replay, idempotent_replay: true };
+        }
+        inflightIdempotency.delete(idempotency.key);
+      }
+    }
+    if (activeManagedMutationId) {
+      const active = managedOperations.get(activeManagedMutationId);
+      if (active?.status === 'running') {
+        throw new Error(`Another authoring operation is still running: ${active.id} (${active.label}). Inspect it before starting a new mutation.`);
+      }
+    }
+    const operation = {
+      id: `op_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      tool,
+      label,
+      status: 'running',
+      startedAt: Date.now(),
+      completedAt: null,
+      result: null,
+      error: null,
+      promise: null
+    };
+    managedOperations.set(operation.id, operation);
+    activeManagedMutationId = operation.id;
+    if (idempotency?.key) {
+      inflightIdempotency.set(idempotency.key, {
+        fingerprint: idempotency.fingerprint,
+        operationId: operation.id
+      });
+    }
+    while (managedOperations.size > 50) managedOperations.delete(managedOperations.keys().next().value);
+
+    operation.promise = (async () => {
+      try {
+        operation.result = await mutation();
+        operation.status = 'succeeded';
+      } catch (error) {
+        operation.error = error instanceof Error ? error.message : String(error);
+        operation.status = 'failed';
+      } finally {
+        operation.completedAt = Date.now();
+        if (activeManagedMutationId === operation.id) activeManagedMutationId = null;
+        if (idempotency?.key && inflightIdempotency.get(idempotency.key)?.operationId === operation.id) {
+          inflightIdempotency.delete(idempotency.key);
+        }
+        if (operation.observationId && typeof AgentObservationHUD !== 'undefined') {
+          const detail = operation.status === 'succeeded'
+            ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
+            : operation.error;
+          AgentObservationHUD.update(operation.status, operation.tool, {}, detail, operation.observationId);
+        }
+      }
+    })();
+
+    await Promise.race([
+      operation.promise,
+      new Promise(resolve => setTimeout(resolve, inlineWaitMs))
+    ]);
+    if (operation.status === 'failed') throw new Error(operation.error);
+    if (operation.status === 'succeeded') return operation.result;
+    return {
+      accepted: true,
+      success: false,
+      status: 'pending',
+      operation_id: operation.id,
+      label,
+      poll_with: 'godot_get_operation_status'
+    };
+  }
 
   function normalizeResourcePath(filePath, fallback = 'res://main.tscn') {
     if (!filePath || typeof filePath !== 'string') return fallback;
@@ -1142,7 +1242,8 @@ func _physics_process(delta):
             active_project: DiagnosticState.activeProject,
             active_main_scene: activeMainScene,
             scene_revision: DiagnosticState.sceneRevision,
-            undo_stack_depth: undoStack.length
+            undo_stack_depth: undoStack.length,
+            active_operation_id: activeManagedMutationId
           },
           transport: {
             type: 'NativeInPageWebMCP + OptionalWSS',
@@ -1154,6 +1255,33 @@ func _physics_process(delta):
             renderer: 'gl_compatibility',
             screen_resolution: typeof window !== 'undefined' ? `${window.innerWidth}x${window.innerHeight}` : '1280x720'
           }
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_get_operation_status',
+        description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
+        input_schema: {
+          type: 'object',
+          properties: {
+            operation_id: { type: 'string', description: 'Specific operation ID; omit to inspect the active and recent operations' }
+          },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        if (args.operation_id) {
+          const operation = managedOperations.get(args.operation_id);
+          if (!operation) throw new Error(`Unknown managed operation: ${args.operation_id}`);
+          return publicOperation(operation);
+        }
+        const recent = [...managedOperations.values()].slice(-10).reverse().map(publicOperation);
+        const active = activeManagedMutationId ? managedOperations.get(activeManagedMutationId) : null;
+        return {
+          active_operation: active ? publicOperation(active) : null,
+          recent_operations: recent
         };
       }
     },
@@ -1175,9 +1303,8 @@ func _physics_process(delta):
         const projName = cleanProjectName(args.project_name || 'neon_skyrail_3d');
         const idempotencyKey = args.idempotency_key;
         const fingerprint = mutationFingerprint('godot_author_3d_runner', args);
-        const replay = getIdempotentReplay(idempotencyKey, fingerprint);
-        if (replay) return replay;
-        const previous = {
+        return runManagedMutation('godot_author_3d_runner', `Authoring 3D runner: ${projName}`, async () => {
+          const previous = {
           projectName: DiagnosticState.activeProject,
           mainScene: activeMainScene,
           files: cloneProjectFiles(activeFilesDict),
@@ -1242,8 +1369,9 @@ func _physics_process(delta):
           audio_assets_generated: generatedAudio,
           files_written: Object.keys(activeFilesDict)
         };
-        storeIdempotentResult(idempotencyKey, fingerprint, result);
-        return result;
+          storeIdempotentResult(idempotencyKey, fingerprint, result);
+          return result;
+        }, 10000, { key: idempotencyKey, fingerprint });
       }
     },
     {
@@ -1348,14 +1476,13 @@ func _physics_process(delta):
         const projName = cleanProjectName(args.project_name || 'echoes_of_the_orbital_garden');
         const idempotencyKey = args.idempotency_key;
         const fingerprint = mutationFingerprint('godot_create_project', args);
-        const replay = getIdempotentReplay(idempotencyKey, fingerprint);
-        if (replay) return replay;
 
         if (args.template === 'custom' && (!args.files || Object.keys(args.files).length === 0)) {
           throw new Error('The custom template requires a non-empty files dictionary. No fallback template was created.');
         }
 
-        const previous = {
+        return runManagedMutation('godot_create_project', `Creating project: ${projName}`, async () => {
+          const previous = {
           projectName: DiagnosticState.activeProject,
           mainScene: activeMainScene,
           files: cloneProjectFiles(activeFilesDict),
@@ -1431,8 +1558,9 @@ func _physics_process(delta):
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`
         };
 
-        storeIdempotentResult(idempotencyKey, fingerprint, result);
-        return result;
+          storeIdempotentResult(idempotencyKey, fingerprint, result);
+          return result;
+        }, 10000, { key: idempotencyKey, fingerprint });
       }
     },
     {
@@ -1508,14 +1636,13 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const fingerprint = mutationFingerprint('godot_apply_file_transaction', args);
-        const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
-        if (replay) return replay;
         if (args.expected_revision !== DiagnosticState.sceneRevision) {
           throw new Error(`Revision conflict: expected ${args.expected_revision}, current ${DiagnosticState.sceneRevision}. Inspect before editing.`);
         }
         if (!Array.isArray(args.operations) || args.operations.length === 0) throw new Error('At least one file operation is required.');
 
-        const previousFiles = cloneProjectFiles(activeFilesDict);
+        return runManagedMutation('godot_apply_file_transaction', `Applying file transaction: ${args.label || 'Project update'}`, async () => {
+          const previousFiles = cloneProjectFiles(activeFilesDict);
         const previousMainScene = activeMainScene;
         const stagedFiles = cloneProjectFiles(activeFilesDict);
         const changedPaths = [];
@@ -1569,8 +1696,9 @@ func _physics_process(delta):
           total_bytes: validation.totalBytes,
           editor_acknowledged: true
         };
-        storeIdempotentResult(args.idempotency_key, fingerprint, result);
-        return result;
+          storeIdempotentResult(args.idempotency_key, fingerprint, result);
+          return result;
+        }, 10000, { key: args.idempotency_key, fingerprint });
       }
     },
     {
@@ -1585,7 +1713,8 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        const transaction = args.undo_id
+        return runManagedMutation('godot_undo_transaction', `Undoing transaction: ${args.undo_id || 'latest'}`, async () => {
+          const transaction = args.undo_id
           ? [...undoStack].reverse().find(entry => entry.undo_id === args.undo_id)
           : undoStack.at(-1);
         if (!transaction) throw new Error('No matching undo transaction is available.');
@@ -1611,7 +1740,7 @@ func _physics_process(delta):
         undoStack.splice(index, 1);
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
-        return {
+          return {
           success: true,
           undone_id: transaction.undo_id,
           scene_revision: DiagnosticState.sceneRevision,
@@ -1619,7 +1748,8 @@ func _physics_process(delta):
           main_scene: activeMainScene,
           files_restored: Object.keys(activeFilesDict),
           editor_acknowledged: Object.keys(activeFilesDict).length > 0
-        };
+          };
+        });
       }
     },
     {
@@ -1888,6 +2018,7 @@ func _physics_process(delta):
         godot_generate_audio_fx: `Generating audio: ${input.type || 'effect'}`,
         godot_export_zip: 'Packaging project ZIP',
         godot_get_session_status: 'Inspecting engine session',
+        godot_get_operation_status: `Inspecting operation: ${input.operation_id || 'active/recent'}`,
         godot_get_logs: 'Reading engine logs'
       };
       return labels[toolName] || toolName.replace(/^godot_/, '').replaceAll('_', ' ');
@@ -1914,7 +2045,7 @@ func _physics_process(delta):
     renderFeed() {
       if (!this.ensure()) return;
       const rows = this.entries.slice(-5).reverse().map((entry) => {
-        const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : '#4de8ff';
+        const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : entry.status === 'pending' ? '#ffc857' : '#4de8ff';
         return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}</span></div>`;
       }).join('');
       this.feed.innerHTML = `<div style="margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div>${rows}`;
@@ -1941,7 +2072,7 @@ func _physics_process(delta):
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
       if (this.ensure()) {
-        const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : '✦';
+        const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : status === 'pending' ? '…' : '✦';
         this.banner.textContent = `${icon} AI Agent · ${label}${detail ? ` · ${detail}` : ''}`;
         this.banner.style.borderColor = status === 'failed' ? '#ff667f' : status === 'succeeded' ? '#45e7a4' : '#00e5ff';
         this.banner.style.opacity = '1';
@@ -1961,6 +2092,21 @@ func _physics_process(delta):
     const observation = AgentObservationHUD.update('running', tool.definition.name, input);
     try {
       const result = await tool.handler(input);
+      if (result?.status === 'pending' && result.operation_id) {
+        const operation = managedOperations.get(result.operation_id);
+        if (operation) {
+          operation.observationId = observation.id;
+          if (operation.status !== 'running') {
+            const detail = operation.status === 'succeeded'
+              ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
+              : operation.error;
+            AgentObservationHUD.update(operation.status, tool.definition.name, input, detail, observation.id);
+            return result;
+          }
+        }
+        AgentObservationHUD.update('pending', tool.definition.name, input, `Operation ${result.operation_id}`, observation.id);
+        return result;
+      }
       const detail = result?.scene_revision ? `Rev #${result.scene_revision}` : result?.success === true ? 'Complete' : '';
       AgentObservationHUD.update('succeeded', tool.definition.name, input, detail, observation.id);
       return result;

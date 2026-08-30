@@ -6,6 +6,16 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_get_operation_status',
+    description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
+    input_schema: {
+      type: 'object',
+      properties: { operation_id: { type: 'string' } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_author_3d_runner',
     description: 'Transactionally authors the complete Neon Skyrail 3D runner with chase camera, elevated skyrail, 8 coral hazards, 11 energy pulses, and Dawn Gate',
     input_schema: {
@@ -47,6 +57,16 @@ export const MCP_TOOL_CATALOG = [
   {
     name: 'godot_create_project',
     description: 'Injects complete 2D/3D visual scenes (.tscn), GDScripts, shaders, and audio into Godot virtual FS and boots Godot Viewport',
+    input_schema: {
+      type: 'object',
+      properties: {
+        project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
+        template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden' },
+        files: { type: 'object', description: 'Custom dictionary of normalized file paths to source strings or binary buffers' },
+        idempotency_key: { type: 'string' }
+      },
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
