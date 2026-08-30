@@ -33,6 +33,7 @@
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
+  const RecordingState = { recorder: null, chunks: [], startedAt: 0, id: null, canvas: null };
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
@@ -50,6 +51,62 @@
       GameTelemetryState.recent.push(entry);
       if (GameTelemetryState.recent.length > 100) GameTelemetryState.recent.shift();
     });
+  }
+
+  function openRecordingDatabase() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) return reject(new Error('IndexedDB is unavailable; recordings cannot be persisted.'));
+      const request = window.indexedDB.open('godot-webmcp-artifacts', 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains('recordings')) {
+          request.result.createObjectStore('recordings', { keyPath: 'id' });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('Failed to open recording database.'));
+    });
+  }
+
+  async function storeRecording(record) {
+    const database = await openRecordingDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction('recordings', 'readwrite');
+      transaction.objectStore('recordings').put(record);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to persist recording.'));
+    });
+    database.close();
+  }
+
+  async function readRecordings() {
+    const database = await openRecordingDatabase();
+    const records = await new Promise((resolve, reject) => {
+      const request = database.transaction('recordings', 'readonly').objectStore('recordings').getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error || new Error('Failed to list recordings.'));
+    });
+    database.close();
+    return records;
+  }
+
+  function exposeRecordingDownload(record) {
+    if (record.object_url) URL.revokeObjectURL(record.object_url);
+    record.object_url = URL.createObjectURL(record.blob);
+    let shelf = document.getElementById('webmcp-recording-shelf');
+    if (!shelf) {
+      shelf = document.createElement('div');
+      shelf.id = 'webmcp-recording-shelf';
+      shelf.style.cssText = 'position:fixed;left:14px;bottom:46px;z-index:999999;padding:9px 12px;border:1px solid rgba(255,200,87,.55);border-radius:8px;background:rgba(12,15,25,.94);font:600 11px/1.35 Inter,system-ui,sans-serif;color:#ffe6a2';
+      document.body.appendChild(shelf);
+    }
+    shelf.innerHTML = '';
+    const link = document.createElement('a');
+    link.href = record.object_url;
+    link.download = record.filename;
+    link.textContent = `Download recording · ${record.filename} · ${(record.blob.size / 1024 / 1024).toFixed(2)} MB`;
+    link.style.cssText = 'color:#ffc857;text-decoration:none;pointer-events:auto';
+    shelf.appendChild(link);
+    return record.object_url;
   }
 
   function publicOperation(operation) {
@@ -2014,6 +2071,120 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_start_recording',
+        description: 'Starts a real MediaRecorder capture of the visible Godot game canvas; use godot_stop_recording to persist it in IndexedDB',
+        input_schema: {
+          type: 'object',
+          properties: { fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 } },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        if (RecordingState.recorder?.state === 'recording') throw new Error('A viewport recording is already active.');
+        if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable in this browser.');
+        const canvas = document.getElementById('game-canvas');
+        if (!canvas || typeof canvas.captureStream !== 'function') throw new Error('The visible game canvas does not support stream capture. Run the game first.');
+        const fps = Math.max(10, Math.min(Number(args.fps) || 30, 60));
+        const stream = canvas.captureStream(fps);
+        const mimeCandidates = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+        const mimeType = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+        const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 5_000_000 } : undefined);
+        RecordingState.recorder = recorder;
+        RecordingState.chunks = [];
+        RecordingState.startedAt = Date.now();
+        RecordingState.id = `recording_${RecordingState.startedAt}_${Math.random().toString(36).slice(2, 7)}`;
+        RecordingState.canvas = canvas;
+        recorder.ondataavailable = event => { if (event.data?.size) RecordingState.chunks.push(event.data); };
+        recorder.start(500);
+        return {
+          success: true,
+          status: 'recording',
+          recording_id: RecordingState.id,
+          fps,
+          mime_type: recorder.mimeType || mimeType || 'video/webm',
+          width: canvas.width,
+          height: canvas.height,
+          audio_tracks: stream.getAudioTracks().length
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_stop_recording',
+        description: 'Stops the active canvas recording, persists the WebM blob in IndexedDB, and exposes a durable download link in the viewport',
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async () => {
+        const recorder = RecordingState.recorder;
+        if (!recorder || recorder.state !== 'recording') throw new Error('No viewport recording is active.');
+        const stoppedAt = Date.now();
+        await new Promise((resolve, reject) => {
+          recorder.addEventListener('stop', resolve, { once: true });
+          recorder.addEventListener('error', event => reject(event.error || new Error('Recording failed.')), { once: true });
+          recorder.stop();
+        });
+        for (const track of recorder.stream.getTracks()) track.stop();
+        const blob = new Blob(RecordingState.chunks, { type: recorder.mimeType || 'video/webm' });
+        if (!blob.size) throw new Error('The browser produced an empty recording.');
+        const record = {
+          id: RecordingState.id,
+          filename: `${DiagnosticState.activeProject}-${RecordingState.startedAt}.webm`,
+          project_name: DiagnosticState.activeProject,
+          created_at: RecordingState.startedAt,
+          duration_ms: stoppedAt - RecordingState.startedAt,
+          mime_type: blob.type,
+          width: RecordingState.canvas?.width || null,
+          height: RecordingState.canvas?.height || null,
+          blob
+        };
+        await storeRecording(record);
+        const downloadUrl = exposeRecordingDownload(record);
+        RecordingState.recorder = null;
+        RecordingState.chunks = [];
+        return {
+          success: true,
+          status: 'persisted',
+          recording_id: record.id,
+          filename: record.filename,
+          duration_ms: record.duration_ms,
+          size_bytes: blob.size,
+          mime_type: blob.type,
+          download_url: downloadUrl,
+          persistence: 'IndexedDB + visible download link',
+          audio_tracks: recorder.stream.getAudioTracks().length
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_list_recordings',
+        description: 'Lists recordings persisted for this deployed origin and restores a visible download link for the newest artifact',
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async () => {
+        const records = (await readRecordings()).sort((a, b) => b.created_at - a.created_at);
+        if (records[0]) exposeRecordingDownload(records[0]);
+        return {
+          count: records.length,
+          recordings: records.map(record => ({
+            recording_id: record.id,
+            filename: record.filename,
+            project_name: record.project_name,
+            created_at: record.created_at,
+            duration_ms: record.duration_ms,
+            size_bytes: record.blob?.size || 0,
+            mime_type: record.mime_type,
+            width: record.width,
+            height: record.height
+          }))
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_get_logs',
         description: 'Retrieves engine logs and stdout telemetry',
         input_schema: { type: 'object', properties: { limit: { type: 'number', default: 50 } }, additionalProperties: false },
@@ -2072,6 +2243,9 @@ func _physics_process(delta):
         godot_stop_game: 'Stopping game session',
         godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
         godot_capture_viewport: 'Capturing live viewport',
+        godot_start_recording: 'Starting persistent viewport recording',
+        godot_stop_recording: 'Stopping and persisting viewport recording',
+        godot_list_recordings: 'Listing persistent viewport recordings',
         godot_select_node_live: `Selecting node: ${input.node_path || 'Player'}`,
         godot_transform_node_live: `Transforming node: ${input.node_path || 'Player'}`,
         godot_connect_signal_live: `Wiring signal: ${input.signal || 'signal'}`,

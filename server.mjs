@@ -169,6 +169,21 @@ const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_start_recording',
+    description: 'Starts a real MediaRecorder capture of the visible Godot game canvas',
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_stop_recording',
+    description: 'Stops the active canvas recording, persists it in IndexedDB, and exposes a download link',
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_list_recordings',
+    description: 'Lists recordings persisted for this deployed origin and restores the newest download link',
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_get_logs',
     description: 'Retrieves engine logs and stdout telemetry',
     annotations: { readOnlyHint: true, untrustedContentHint: false }
