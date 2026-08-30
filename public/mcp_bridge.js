@@ -2151,13 +2151,19 @@ func _physics_process(delta):
             ? new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })
             : new MouseEvent(type.replace('pointer', 'mouse'), init));
         };
-        if (args.action === 'move') dispatch('pointermove');
-        else if (args.action === 'down') dispatch('pointerdown');
-        else if (args.action === 'up') dispatch('pointerup');
+        const dispatchMouse = (type, pressed = false) => canvas.dispatchEvent(new MouseEvent(type, {
+          ...base,
+          buttons: pressed ? buttonsMask[args.button || 'left'] : 0
+        }));
+        if (args.action === 'move') { dispatch('pointermove'); dispatchMouse('mousemove'); }
+        else if (args.action === 'down') { dispatch('pointerdown'); dispatchMouse('mousedown', true); }
+        else if (args.action === 'up') { dispatch('pointerup'); dispatchMouse('mouseup'); }
         else if (args.action === 'click') {
           dispatch('pointerdown');
+          dispatchMouse('mousedown', true);
           dispatch('pointerup');
-          canvas.dispatchEvent(new MouseEvent('click', base));
+          dispatchMouse('mouseup');
+          dispatchMouse('click');
         } else if (args.action === 'wheel') {
           canvas.dispatchEvent(new WheelEvent('wheel', { ...base, deltaY: Number(args.delta_y) || 0 }));
         }
