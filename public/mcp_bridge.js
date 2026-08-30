@@ -458,14 +458,10 @@
     );
     window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
     await launchedEvent;
-    const bootObserved = await waitFor(() => {
+    await waitFor(() => {
       if (recentGodotErrors(startedAt).length > 0) return true;
       return activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
-    }, Math.min(timeoutMs, 10000));
-    if (!bootObserved) {
-      try { await stopGameRuntime(6000); } catch (_) {}
-      throw new Error('Godot launched the runtime but emitted no boot telemetry.');
-    }
+    }, Math.min(timeoutMs, 2500));
     await new Promise(resolve => setTimeout(resolve, 450));
     const errors = recentGodotErrors(startedAt);
     if (errors.length > 0) {
@@ -1852,23 +1848,39 @@ func _physics_process(delta):
           ? [...undoStack].reverse().find(entry => entry.undo_id === args.undo_id)
           : undoStack.at(-1);
         if (!transaction) throw new Error('No matching undo transaction is available.');
+        if (transaction !== undoStack.at(-1)) {
+          throw new Error(`Undo must follow stack order. Latest is ${undoStack.at(-1)?.undo_id}; refusing historical transaction ${transaction.undo_id}.`);
+        }
         if (!transaction.files_before) throw new Error(`Undo transaction ${transaction.undo_id} has no restorable project snapshot.`);
 
-        if (Object.keys(transaction.files_before).length === 0) {
-          if (typeof window.closeEditor === 'function') window.closeEditor();
-          await waitFor(() => document.getElementById('btn-close-editor')?.disabled, 12000);
-          if (typeof window.showTab === 'function') window.showTab('loader');
-          activeFilesDict = {};
-          DiagnosticState.activeProject = transaction.project_before;
-          activeMainScene = transaction.main_scene_before;
-          DiagnosticState.session = 'empty';
-          DiagnosticState.engine = 'loading';
-        } else {
-          await restartEditorWithProject(transaction.files_before, transaction.project_before);
-          await validateProjectRuntimeBoot();
-          activeFilesDict = cloneProjectFiles(transaction.files_before);
-          DiagnosticState.activeProject = transaction.project_before;
-          activeMainScene = transaction.main_scene_before;
+        const current = {
+          projectName: DiagnosticState.activeProject,
+          mainScene: activeMainScene,
+          files: cloneProjectFiles(activeFilesDict),
+          session: DiagnosticState.session,
+          engine: DiagnosticState.engine
+        };
+
+        try {
+          if (Object.keys(transaction.files_before).length === 0) {
+            if (typeof window.closeEditor === 'function') window.closeEditor();
+            await waitFor(() => document.getElementById('btn-close-editor')?.disabled, 12000);
+            if (typeof window.showTab === 'function') window.showTab('loader');
+            activeFilesDict = {};
+            DiagnosticState.activeProject = transaction.project_before;
+            activeMainScene = transaction.main_scene_before;
+            DiagnosticState.session = 'empty';
+            DiagnosticState.engine = 'loading';
+          } else {
+            await restartEditorWithProject(transaction.files_before, transaction.project_before);
+            await validateProjectRuntimeBoot();
+            activeFilesDict = cloneProjectFiles(transaction.files_before);
+            DiagnosticState.activeProject = transaction.project_before;
+            activeMainScene = transaction.main_scene_before;
+          }
+        } catch (error) {
+          await restoreProjectSnapshot(current);
+          throw error;
         }
         const index = undoStack.indexOf(transaction);
         undoStack.splice(index, 1);
