@@ -202,6 +202,21 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_send_pointer',
+    description: 'Dispatches pointer input at Godot canvas coordinates without claiming unverified gameplay acknowledgement',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['move', 'down', 'up', 'click', 'wheel'] },
+        x: { type: 'number', minimum: 0 }, y: { type: 'number', minimum: 0 },
+        button: { type: 'string', enum: ['left', 'middle', 'right'], default: 'left' },
+        delta_y: { type: 'number', default: 0 }
+      },
+      required: ['action', 'x', 'y'], additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_start_recording',
     description: 'Starts a real MediaRecorder capture of the visible Godot game canvas',
     input_schema: { type: 'object', properties: { fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 } }, additionalProperties: false },

@@ -2116,6 +2116,65 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_send_pointer',
+        description: 'Dispatches mouse/pointer input at Godot canvas coordinates and reports dispatch geometry without claiming unverified gameplay acknowledgement',
+        input_schema: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['move', 'down', 'up', 'click', 'wheel'] },
+            x: { type: 'number', minimum: 0 },
+            y: { type: 'number', minimum: 0 },
+            button: { type: 'string', enum: ['left', 'middle', 'right'], default: 'left' },
+            delta_y: { type: 'number', default: 0 }
+          },
+          required: ['action', 'x', 'y'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
+        if (!canvas) throw new Error('No Godot canvas is available to receive pointer input.');
+        if (args.x > canvas.width || args.y > canvas.height) {
+          throw new Error(`Pointer coordinates exceed the ${canvas.width}x${canvas.height} canvas.`);
+        }
+        const rect = canvas.getBoundingClientRect();
+        const clientX = rect.left + (Number(args.x) / canvas.width) * rect.width;
+        const clientY = rect.top + (Number(args.y) / canvas.height) * rect.height;
+        const buttonMap = { left: 0, middle: 1, right: 2 };
+        const buttonsMask = { left: 1, middle: 4, right: 2 };
+        const button = buttonMap[args.button || 'left'];
+        const base = { bubbles: true, cancelable: true, clientX, clientY, button };
+        const dispatch = type => {
+          const init = { ...base, buttons: type === 'pointerdown' ? buttonsMask[args.button || 'left'] : 0 };
+          return canvas.dispatchEvent(typeof PointerEvent !== 'undefined'
+            ? new PointerEvent(type, { ...init, pointerId: 1, pointerType: 'mouse', isPrimary: true })
+            : new MouseEvent(type.replace('pointer', 'mouse'), init));
+        };
+        if (args.action === 'move') dispatch('pointermove');
+        else if (args.action === 'down') dispatch('pointerdown');
+        else if (args.action === 'up') dispatch('pointerup');
+        else if (args.action === 'click') {
+          dispatch('pointerdown');
+          dispatch('pointerup');
+          canvas.dispatchEvent(new MouseEvent('click', base));
+        } else if (args.action === 'wheel') {
+          canvas.dispatchEvent(new WheelEvent('wheel', { ...base, deltaY: Number(args.delta_y) || 0 }));
+        }
+        return {
+          success: true,
+          action: args.action,
+          canvas_position: { x: Number(args.x), y: Number(args.y) },
+          client_position: { x: clientX, y: clientY },
+          button: args.button || 'left',
+          target: canvas.id,
+          gameplay_acknowledged: false,
+          verify_with: 'godot_get_game_telemetry'
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_start_recording',
         description: 'Starts a real MediaRecorder capture of the visible Godot game canvas; use godot_stop_recording to persist it in IndexedDB',
         input_schema: {
@@ -2288,6 +2347,7 @@ func _physics_process(delta):
         godot_stop_game: 'Stopping game session',
         godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
         godot_capture_viewport: 'Capturing live viewport',
+        godot_send_pointer: `Pointer ${input.action || 'action'} at ${input.x || 0},${input.y || 0}`,
         godot_start_recording: 'Starting persistent viewport recording',
         godot_stop_recording: 'Stopping and persisting viewport recording',
         godot_list_recordings: 'Listing persistent viewport recordings',

@@ -169,6 +169,11 @@ const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_send_pointer',
+    description: 'Dispatches pointer input at Godot canvas coordinates without claiming unverified gameplay acknowledgement',
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_start_recording',
     description: 'Starts a real MediaRecorder capture of the visible Godot game canvas',
     annotations: { readOnlyHint: false, untrustedContentHint: false }
