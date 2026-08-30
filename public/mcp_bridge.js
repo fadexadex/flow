@@ -258,7 +258,7 @@
     return normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
   }
 
-  async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 20000) {
+  async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
     }
@@ -414,7 +414,7 @@
 
   async function validateProjectRuntimeBoot() {
     try {
-      await startGameRuntime({ visible: false, timeoutMs: 15000 });
+      await startGameRuntime({ visible: false, timeoutMs: 30000 });
     } finally {
       try { await stopGameRuntime(10000); } catch (_) {}
       if (typeof window.showTab === 'function') window.showTab('editor');
