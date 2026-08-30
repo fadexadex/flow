@@ -16,7 +16,7 @@
   // 1. Diagnostic Readiness State Machine
   // ==========================================
   const DiagnosticState = {
-    engine: 'ready', // 'loading' | 'ready' | 'failed'
+    engine: 'loading', // 'loading' | 'ready' | 'failed'
     engineError: null,
     webmcp: 'registering', // 'unsupported' | 'registering' | 'ready' | 'failed'
     webmcpRegisteredCount: 0,
@@ -29,6 +29,7 @@
   };
 
   const undoStack = [];
+  const idempotentMutations = new Map();
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
@@ -702,6 +703,10 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const projName = args.project_name || 'neon_skyrail_3d';
+        const idempotencyKey = args.idempotency_key;
+        if (idempotencyKey && idempotentMutations.has(idempotencyKey)) {
+          return { ...idempotentMutations.get(idempotencyKey), idempotent_replay: true };
+        }
         DiagnosticState.activeProject = projName;
         DiagnosticState.sceneRevision++;
         const undoId = `undo_runner_${Date.now()}`;
@@ -737,7 +742,7 @@ func _physics_process(delta):
         DiagnosticState.session = 'editor-ready';
         DiagnosticHUD.render();
 
-        return {
+        const result = {
           success: true,
           project_name: projName,
           scene_revision: DiagnosticState.sceneRevision,
@@ -754,6 +759,8 @@ func _physics_process(delta):
           audio_assets_generated: generatedAudio,
           files_written: Object.keys(activeFilesDict)
         };
+        if (idempotencyKey) idempotentMutations.set(idempotencyKey, result);
+        return result;
       }
     },
     {
@@ -977,6 +984,10 @@ func _physics_process(delta):
       },
       handler: async () => {
         PlaytestSimulation.reset();
+        if (typeof window.Execute !== 'function') {
+          throw new Error('Godot editor is not initialized; author or open a project before running it.');
+        }
+        window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
         return { success: true, status: 'running', main_scene: 'res://main_3d.tscn' };
       }
     },
@@ -1001,7 +1012,14 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        return { success: true, dispatched_key: args.key || 'Space', pressed: args.pressed !== false };
+        const key = args.key || 'Space';
+        const pressed = args.pressed !== false;
+        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
+        if (!canvas) throw new Error('No Godot canvas is available to receive input.');
+        const event = new KeyboardEvent(pressed ? 'keydown' : 'keyup', { key, code: key, bubbles: true });
+        canvas.dispatchEvent(event);
+        document.dispatchEvent(event);
+        return { success: true, dispatched_key: key, pressed, target: canvas.id };
       }
     },
     {
@@ -1012,12 +1030,16 @@ func _physics_process(delta):
         annotations: { readOnlyHint: true, untrustedContentHint: false }
       },
       handler: async () => {
+        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
+        if (!canvas || typeof canvas.toDataURL !== 'function') {
+          throw new Error('No canvas is available for viewport capture.');
+        }
         return {
           success: true,
-          width: 1280,
-          height: 720,
+          width: canvas.width,
+          height: canvas.height,
           format: 'image/png',
-          data_url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkWPjfDwAEeQHz5j7L/AAAAABJRU5ErkJggg=='
+          data_url: canvas.toDataURL('image/png')
         };
       }
     },
@@ -1061,7 +1083,40 @@ func _physics_process(delta):
     return null;
   }
 
-  function registerAllNativeTools() {
+  function nativeToolDefinition(tool) {
+    const definition = tool.definition;
+    return {
+      name: definition.name,
+      description: definition.description,
+      annotations: definition.annotations,
+      // Native WebMCP uses camelCase and expects the executable handler on the
+      // tool object. `input_schema` remains the MCP HTTP catalog shape.
+      inputSchema: definition.input_schema,
+      execute: async (input) => tool.handler(input || {})
+    };
+  }
+
+  function installTestBridge() {
+    if (typeof window === 'undefined') return;
+    const origin = window.location.origin;
+    const pageUrl = window.location.href;
+
+    window.godotWebMcpTestBridge = {
+      getTools: () => MANIFEST_TOOLS.map(t => ({ ...t.definition, origin, pageUrl })),
+      callTool: async (name, args) => {
+        const tool = MANIFEST_TOOLS.find(t => t.definition.name === name);
+        if (!tool) throw new Error(`Tool '${name}' not found`);
+        return await tool.handler(args);
+      }
+    };
+
+    window.fetchTools = async () => ({
+      tools: MANIFEST_TOOLS.map(t => ({ ...t.definition, origin, pageUrl }))
+    });
+    window.callWebMCPTool = async (name, args) => window.godotWebMcpTestBridge.callTool(name, args);
+  }
+
+  async function registerAllNativeTools() {
     const native = resolveNativeModelContext();
     DiagnosticState.webmcp = 'registering';
     let count = 0;
@@ -1069,9 +1124,10 @@ func _physics_process(delta):
     if (native) {
       DiagnosticState.webmcpSurface = native.surface;
       console.log(`[WebMCP] Found native surface: ${native.surface}. Registering 21 tools...`);
+      const controller = new AbortController();
       for (const tool of MANIFEST_TOOLS) {
         try {
-          native.context.registerTool(tool.definition, tool.handler);
+          await native.context.registerTool(nativeToolDefinition(tool), { signal: controller.signal });
           count++;
         } catch (err) {
           console.error(`[WebMCP] Error registering tool '${tool.definition.name}' on ${native.surface}:`, err);
@@ -1087,33 +1143,9 @@ func _physics_process(delta):
     } else {
       console.warn('[WebMCP] Native ModelContext not present in browser. Enabling test discovery bridge...');
       DiagnosticState.webmcp = 'unsupported';
-      DiagnosticState.webmcpRegisteredCount = MANIFEST_TOOLS.length;
+      DiagnosticState.webmcpRegisteredCount = 0;
       DiagnosticState.webmcpSurface = 'application_test_bridge';
-    }
-
-    // Install application test bridge on window.godotWebMcpTestBridge and window.fetchTools without overwriting native modelContext
-    if (typeof window !== 'undefined') {
-      const origin = window.location.origin;
-      const pageUrl = window.location.href;
-
-      window.godotWebMcpTestBridge = {
-        getTools: () => MANIFEST_TOOLS.map(t => ({ ...t.definition, origin, pageUrl })),
-        callTool: async (name, args) => {
-          const tool = MANIFEST_TOOLS.find(t => t.definition.name === name);
-          if (!tool) throw new Error(`Tool '${name}' not found`);
-          return await tool.handler(args);
-        }
-      };
-
-      window.fetchTools = async () => ({
-        tools: MANIFEST_TOOLS.map(t => ({ ...t.definition, origin, pageUrl }))
-      });
-
-      window.callWebMCPTool = async (name, args) => {
-        const tool = MANIFEST_TOOLS.find(t => t.definition.name === name);
-        if (!tool) throw new Error(`Tool '${name}' not found`);
-        return await tool.handler(args);
-      };
+      installTestBridge();
     }
   }
 
@@ -1185,7 +1217,23 @@ func _physics_process(delta):
   // ==========================================
   // 10. Auto-Execute Synchronous Registration
   // ==========================================
-  registerAllNativeTools();
+  registerAllNativeTools().catch((error) => {
+    DiagnosticState.webmcp = 'failed';
+    DiagnosticState.webmcpLastError = error instanceof Error ? error.message : String(error);
+    console.error('[WebMCP] Native tool registration failed:', error);
+    DiagnosticHUD.render();
+  });
+
+  window.addEventListener('godot-engine-ready', () => {
+    DiagnosticState.engine = 'ready';
+    DiagnosticState.engineError = null;
+    DiagnosticHUD.render();
+  });
+  window.addEventListener('godot-engine-failed', (event) => {
+    DiagnosticState.engine = 'failed';
+    DiagnosticState.engineError = event?.detail?.message || 'Godot engine failed to initialize.';
+    DiagnosticHUD.render();
+  });
 
   function initDOM() {
     DiagnosticHUD.init();

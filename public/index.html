@@ -768,6 +768,9 @@ function startEditor(zip, customArgs) {
 		}
 		setStatusMode('notice');
 		initializing = false;
+		window.dispatchEvent(new CustomEvent('godot-engine-failed', {
+			detail: { message: err instanceof Error ? err.message : String(err) }
+		}));
 	}
 
 	if (!Engine.isWebGLAvailable()) {
@@ -804,6 +807,7 @@ function startEditor(zip, customArgs) {
 			editor.start({ 'args': args, 'persistentDrops': true }).then(function () {
 				setStatusMode('hidden');
 				initializing = false;
+				window.dispatchEvent(new Event('godot-engine-ready'));
 			});
 		}).catch(displayFailureNotice);
 	}
