@@ -296,6 +296,12 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
+    name: 'godot_get_input_sequence_status',
+    description: 'Returns planned and actual dispatch timing for coordinated keyboard sequences',
+    input_schema: { type: 'object', properties: { sequence_id: { type: 'string' } }, additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_capture_viewport',
     description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
     input_schema: { type: 'object', properties: {}, additionalProperties: false },

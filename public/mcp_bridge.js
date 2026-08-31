@@ -33,6 +33,7 @@
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
   const projectUploads = new Map();
+  const inputSequences = new Map();
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
   const RecordingState = {
     recorder: null, chunks: [], videoRecorder: null, videoChunks: [], audioRecorder: null, audioChunks: [],
@@ -2672,15 +2673,29 @@ func _physics_process(delta):
         const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
         if (!canvas) throw new Error('No Godot canvas is available to receive input.');
         const sequenceId = `input_sequence_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        const events = args.events.map((entry, index) => ({ index, at_ms: entry.at_ms, key: entry.key, pressed: entry.pressed }));
-        for (const entry of events) {
-          setTimeout(() => {
-            const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
-            window.__godotWebMcpInput = { input_id: sequenceId, event_index: entry.index, key: entry.key, pressed: entry.pressed, dispatched_at: Date.now() };
-            canvas.dispatchEvent(event);
-            document.dispatchEvent(event);
-          }, entry.at_ms);
-        }
+        const events = args.events.map((entry, index) => ({ index, at_ms: entry.at_ms, key: entry.key, pressed: entry.pressed }))
+          .sort((a, b) => a.at_ms - b.at_ms || a.index - b.index);
+        const sequence = { id: sequenceId, status: 'scheduled', scheduled_at: Date.now(), started_at: null, completed_at: null, target: canvas.id, planned_events: events, dispatched_events: [] };
+        inputSequences.set(sequenceId, sequence);
+        while (inputSequences.size > 20) inputSequences.delete(inputSequences.keys().next().value);
+        const dispatchAt = (position) => {
+          const entry = events[position];
+          if (!entry) return;
+          const dispatchedAt = Date.now();
+          if (position === 0) { sequence.status = 'running'; sequence.started_at = dispatchedAt; }
+          const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
+          window.__godotWebMcpInput = { input_id: sequenceId, event_index: entry.index, key: entry.key, pressed: entry.pressed, dispatched_at: dispatchedAt };
+          canvas.dispatchEvent(event);
+          document.dispatchEvent(event);
+          sequence.dispatched_events.push({ ...entry, dispatched_at: dispatchedAt, elapsed_ms: dispatchedAt - sequence.started_at });
+          if (position === events.length - 1) {
+            sequence.status = 'completed';
+            sequence.completed_at = dispatchedAt;
+            return;
+          }
+          setTimeout(() => dispatchAt(position + 1), Math.max(0, events[position + 1].at_ms - entry.at_ms));
+        };
+        setTimeout(() => dispatchAt(0), Math.max(0, events[0].at_ms));
         return {
           success: true,
           sequence_id: sequenceId,
@@ -2691,6 +2706,22 @@ func _physics_process(delta):
           input_acknowledged: false,
           verify_with: 'godot_get_game_telemetry'
         };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_get_input_sequence_status',
+        description: 'Returns planned and actual dispatch timing for one coordinated keyboard sequence, or recent sequences when no ID is supplied',
+        input_schema: { type: 'object', properties: { sequence_id: { type: 'string' } }, additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        if (args.sequence_id) {
+          const sequence = inputSequences.get(args.sequence_id);
+          if (!sequence) throw new Error(`Unknown input sequence: ${args.sequence_id}`);
+          return { success: true, sequence };
+        }
+        return { success: true, recent_sequences: [...inputSequences.values()].slice(-10).reverse() };
       }
     },
     {
@@ -3058,6 +3089,7 @@ func _physics_process(delta):
         godot_stop_game: 'Stopping game session',
         godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
         godot_send_input_sequence: `Scheduling input sequence: ${input.events?.length || 0} events`,
+        godot_get_input_sequence_status: `Inspecting input sequence: ${input.sequence_id || 'recent'}`,
         godot_capture_viewport: 'Capturing live viewport',
         godot_send_pointer: `Pointer ${input.action || 'action'} at ${input.x || 0},${input.y || 0}`,
         godot_start_recording: 'Starting persistent viewport recording',
