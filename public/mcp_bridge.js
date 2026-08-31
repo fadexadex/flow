@@ -2884,6 +2884,7 @@ func _physics_process(delta):
           await advancePhase(operation, 'validating_request');
           const previousFiles = cloneProjectFiles(activeFilesDict);
         const previousMainScene = activeMainScene;
+        const restorePlaytest = typeof window !== 'undefined' && window.__godotGameState === 'running';
         const stagedFiles = cloneProjectFiles(activeFilesDict);
         const changedPaths = [];
         for (const op of args.operations) {
@@ -2943,6 +2944,19 @@ func _physics_process(delta):
         };
           storeIdempotentResult(args.idempotency_key, fingerprint, result);
           result.persisted = await persistActiveProjectState();
+          if (restorePlaytest) {
+            // Keep the collaborator in the same playable surface after the acknowledged
+            // source transaction; the browser page itself never needs to reload.
+            try {
+              await startGameRuntime({ visible: true, timeoutMs: 60000 });
+              DiagnosticState.session = 'playtesting';
+              DiagnosticHUD.render();
+            } catch (previewError) {
+              activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Restore] ${previewError.message || String(previewError)}` });
+              if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+              if (typeof window.showTab === 'function') window.showTab('editor');
+            }
+          }
           return result;
         }, 10000, { key: args.idempotency_key, fingerprint }, context);
       }

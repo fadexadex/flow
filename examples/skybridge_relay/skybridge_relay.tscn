@@ -129,7 +129,8 @@ mesh = SubResource("BlackOrb_mesh")
 material_override = SubResource("BlackOrb_material")
 
 [node name="BlackSignalOrbRight" type="MeshInstance3D" parent="."]
-position = Vector3(3.7, 2.25, -22)
+position = Vector3(-3.7, 2.25, -22)
+scale = Vector3(1.7, 1.7, 1.7)
 mesh = SubResource("BlackOrb_mesh")
 material_override = SubResource("BlackOrb_material")
 
