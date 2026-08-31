@@ -948,7 +948,7 @@
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
-    if (typeof window !== 'undefined' && window.__godotGameState === 'running') holdRuntimeFrame();
+    if (typeof window !== 'undefined') holdRuntimeFrame();
     // A running game owns the same virtual project filesystem. Replacing the
     // editor first can race its shutdown and leave the new --path unmounted.
     if (operation) await advancePhase(operation, 'stopping_runtime');
@@ -958,7 +958,6 @@
       if (operation) await advancePhase(operation, 'replacing_editor');
       if (typeof window.closeEditor === 'function') window.closeEditor();
       await waitFor(() => closeEditorButton.disabled, 3000);
-      if (typeof window.setLoaderEnabled === 'function') window.setLoaderEnabled(true);
     }
 
     window._mcpProjectName = projectName;
@@ -2281,7 +2280,7 @@ func _physics_process(delta):
     return lines.join('\n') + '\n';
   }
 
-  function liveMutateSceneFile(mutatorFn) {
+  async function liveMutateSceneFile(mutatorFn) {
     const mainScenePath = activeMainScene ? cleanProjectPath(activeMainScene) : 'main_3d.tscn';
     let currentTscn = activeFilesDict[mainScenePath] || '';
     if (!currentTscn) {
@@ -2292,6 +2291,9 @@ func _physics_process(delta):
     DiagnosticState.sceneRevision++;
     DiagnosticHUD.render();
     BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+    if (typeof window !== 'undefined' && typeof restartEditorWithProject === 'function') {
+      await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
+    }
     persistActiveProjectState().catch(() => {});
     return {
       revision: DiagnosticState.sceneRevision,
@@ -3965,7 +3967,7 @@ func _physics_process(delta):
 
         const nodeBlock = `\n[node name="${nodeName}" type="MeshInstance3D" parent="${parentPath}"]\ntransform = Transform3D(${scale[0]}, 0, 0, 0, ${scale[1]}, 0, 0, 0, ${scale[2]}, ${pos[0]}, ${pos[1]}, ${pos[2]})\nmesh = SubResource("${meshSubResId}")\nsurface_material_override/0 = SubResource("${matSubResId}")\n`;
 
-        const res = liveMutateSceneFile((source) => {
+        const res = await liveMutateSceneFile((source) => {
           let updated = source;
           const firstNodeIdx = updated.indexOf('\n[node name="');
           if (firstNodeIdx > 0) {
@@ -3976,6 +3978,10 @@ func _physics_process(delta):
           updated = updated + nodeBlock;
           return updated;
         });
+
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.focus(nodeName, pos, meshType, 'SPAWNED');
+        }
 
         return {
           success: true,
@@ -4013,7 +4019,7 @@ func _physics_process(delta):
         const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : null;
         const scale = Array.isArray(args.scale) && args.scale.length >= 3 ? args.scale : [1, 1, 1];
 
-        const res = liveMutateSceneFile((source) => {
+        const res = await liveMutateSceneFile((source) => {
           const nodeHeader = `[node name="${nodeName}"`;
           const nodeIdx = source.indexOf(nodeHeader);
           if (nodeIdx < 0) throw new Error(`Node '${nodeName}' not found in active 3D scene.`);
@@ -4031,6 +4037,10 @@ func _physics_process(delta):
           }
           return source.slice(0, nodeIdx) + nodeBlock + source.slice(blockEnd);
         });
+
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.focus(nodeName, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
+        }
 
         return {
           success: true,
@@ -4067,7 +4077,7 @@ func _physics_process(delta):
         const matSubResId = `Mat_${nodeName}`;
         const newMatSubRes = generateMaterialSubResource(args, matSubResId);
 
-        const res = liveMutateSceneFile((source) => {
+        const res = await liveMutateSceneFile((source) => {
           const matHeader = `[sub_resource type="StandardMaterial3D" id="${matSubResId}"]`;
           let updated = source;
           const matIdx = updated.indexOf(matHeader);
@@ -4088,6 +4098,10 @@ func _physics_process(delta):
           }
           return updated;
         });
+
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.focus(nodeName, [0, 0, 0], 'StandardMaterial3D', 'MATERIAL UPDATED');
+        }
 
         return {
           success: true,
@@ -4121,7 +4135,7 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const nodeName = args.node_path.replace(/^.*\//, '');
-        const res = liveMutateSceneFile((source) => {
+        const res = await liveMutateSceneFile((source) => {
           const nodeHeader = `[node name="${nodeName}"`;
           const nodeIdx = source.indexOf(nodeHeader);
           if (nodeIdx < 0) throw new Error(`Node '${nodeName}' not found in active scene.`);
@@ -4129,6 +4143,10 @@ func _physics_process(delta):
           const blockEnd = nextNodeIdx > 0 ? nextNodeIdx : source.length;
           return source.slice(0, nodeIdx) + source.slice(blockEnd);
         });
+
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.focus(nodeName, [0, 0, 0], 'Node3D', 'DELETED');
+        }
 
         return {
           success: true,
@@ -4642,6 +4660,57 @@ func _physics_process(delta):
       installTestBridge();
     }
   }
+
+  // ==========================================
+  // 8C. Agent 3D View Focus Overlay
+  // ==========================================
+  const AgentFocusOverlay = {
+    overlay: null,
+    timer: null,
+
+    ensure() {
+      if (typeof document === 'undefined' || !document.body) return false;
+      if (!this.overlay) {
+        this.overlay = document.createElement('div');
+        this.overlay.id = 'webmcp-3d-focus-overlay';
+        this.overlay.style.cssText = 'position:fixed;top:44%;left:50%;transform:translate(-50%,-50%);z-index:1000000;pointer-events:none;display:flex;flex-direction:column;align-items:center;opacity:0;transition:opacity .2s ease, transform .25s cubic-bezier(0.16,1,0.3,1);';
+        document.body.appendChild(this.overlay);
+      }
+      return true;
+    },
+
+    focus(nodeName, pos = [0, 0, 0], type = 'Node3D', action = 'SPAWNED') {
+      if (!this.ensure()) return;
+      clearTimeout(this.timer);
+      const posStr = Array.isArray(pos) ? pos.map(n => Number(n).toFixed(1)).join(', ') : String(pos);
+
+      this.overlay.innerHTML = `
+        <div style="position:relative;width:150px;height:150px;border:1px solid rgba(0,229,255,0.5);border-radius:12px;box-shadow:0 0 30px rgba(0,229,255,0.5), inset 0 0 20px rgba(0,229,255,0.15);display:flex;align-items:center;justify-content:center;">
+          <div style="position:absolute;top:-2px;left:-2px;width:16px;height:16px;border-top:3px solid #00e5ff;border-left:3px solid #00e5ff;border-top-left-radius:6px;"></div>
+          <div style="position:absolute;top:-2px;right:-2px;width:16px;height:16px;border-top:3px solid #00e5ff;border-right:3px solid #00e5ff;border-top-right-radius:6px;"></div>
+          <div style="position:absolute;bottom:-2px;left:-2px;width:16px;height:16px;border-bottom:3px solid #00e5ff;border-left:3px solid #00e5ff;border-bottom-left-radius:6px;"></div>
+          <div style="position:absolute;bottom:-2px;right:-2px;width:16px;height:16px;border-bottom:3px solid #00e5ff;border-right:3px solid #00e5ff;border-bottom-right-radius:6px;"></div>
+          <div style="width:10px;height:10px;background:#00e5ff;border-radius:50%;box-shadow:0 0 12px #00e5ff;"></div>
+        </div>
+        <div style="margin-top:14px;display:flex;align-items:center;gap:8px;padding:6px 16px;background:rgba(3,14,24,0.96);border:1px solid #00e5ff;border-radius:8px;box-shadow:0 0 24px rgba(0,229,255,0.6);font-family:ui-monospace,SFMono-Regular,monospace;color:#fff;white-space:nowrap;">
+          <span style="font-weight:750;letter-spacing:0.08em;color:#00e5ff;font-size:11px;text-transform:uppercase;">🎯 [3D FOCUS · ${action}]</span>
+          <span style="font-weight:700;font-size:12px;color:#fff;">${nodeName}</span>
+          <span style="background:rgba(0,229,255,0.2);padding:2px 8px;border-radius:4px;font-size:11px;color:#7feaff;">XYZ: [${posStr}]</span>
+          <span style="font-size:11px;color:#ffd54f;">${type}</span>
+        </div>
+      `;
+
+      this.overlay.style.opacity = '1';
+      this.overlay.style.transform = 'translate(-50%, -50%) scale(1)';
+
+      this.timer = setTimeout(() => {
+        if (this.overlay) {
+          this.overlay.style.opacity = '0';
+          this.overlay.style.transform = 'translate(-50%, -50%) scale(0.95)';
+        }
+      }, 3000);
+    }
+  };
 
   // ==========================================
   // 9. Persistent 3-State Diagnostic Readiness HUD
