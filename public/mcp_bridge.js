@@ -2652,12 +2652,27 @@ func _physics_process(delta):
         canvas.dispatchEvent(event);
         document.dispatchEvent(event);
         if (durationMs > 0) {
-          setTimeout(() => {
+          let released = false;
+          let observedFrames = 0;
+          const pressedAt = Date.now();
+          let safetyTimer = null;
+          const releaseKey = () => {
+            if (released) return;
+            released = true;
             const release = new KeyboardEvent('keyup', { key, code: key, bubbles: true });
             window.__godotWebMcpInput = { input_id: inputId, key, pressed: false, dispatched_at: Date.now(), scheduled_release: true };
             canvas.dispatchEvent(release);
             document.dispatchEvent(release);
-          }, durationMs);
+            clearTimeout(safetyTimer);
+          };
+          const advanceRelease = () => {
+            observedFrames++;
+            if (observedFrames >= 2 && Date.now() - pressedAt >= durationMs) releaseKey();
+            else requestAnimationFrame(advanceRelease);
+          };
+          requestAnimationFrame(advanceRelease);
+          // Avoid a permanently held key if the page stops rendering entirely.
+          safetyTimer = setTimeout(releaseKey, Math.max(durationMs + 5000, 6500));
         } else if (args.await_telemetry !== false) {
           await waitFor(() => GameTelemetryState.latest?.sequence > (before?.sequence || 0), 900, 50);
         }
@@ -2670,6 +2685,7 @@ func _physics_process(delta):
           pressed,
           duration_ms: durationMs || null,
           release_scheduled: durationMs > 0,
+          release_requires_rendered_frames: durationMs > 0 ? 2 : null,
           target: canvas.id,
           input_acknowledged: inputAcknowledged,
           telemetry_observed_after_dispatch: Boolean(after && after.sequence > (before?.sequence || 0)),
