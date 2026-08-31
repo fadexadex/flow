@@ -2208,7 +2208,12 @@ func _physics_process(delta):
         let stream = videoStream;
         const godotAudioContext = window.__godotAudioContext;
         if (godotAudioContext?.state === 'suspended') {
-          try { await godotAudioContext.resume(); } catch (_) {}
+          try {
+            await Promise.race([
+              godotAudioContext.resume(),
+              new Promise(resolve => setTimeout(resolve, 500))
+            ]);
+          } catch (_) {}
           await new Promise(resolve => setTimeout(resolve, 80));
         }
         if (godotAudioContext?.state !== 'closed' && window.__godotAudioMasterNode && typeof MediaStream !== 'undefined') {
