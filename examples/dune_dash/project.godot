@@ -1,0 +1,15 @@
+config_version=5
+
+[application]
+config/name="Dune Dash"
+run/main_scene="res://dune_dash.tscn"
+
+[display]
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.13, 0.07, 0.04, 1)
