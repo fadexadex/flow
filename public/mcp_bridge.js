@@ -64,7 +64,7 @@
   function openRecordingDatabase() {
     return new Promise((resolve, reject) => {
       if (!window.indexedDB) return reject(new Error('IndexedDB is unavailable; artifacts cannot be persisted.'));
-      const request = window.indexedDB.open('godot-webmcp-artifacts', 3);
+      const request = window.indexedDB.open('godot-webmcp-artifacts', 4);
       request.onupgradeneeded = () => {
         if (!request.result.objectStoreNames.contains('recordings')) {
           request.result.createObjectStore('recordings', { keyPath: 'id' });
@@ -74,6 +74,10 @@
         }
         if (!request.result.objectStoreNames.contains('uploads')) {
           request.result.createObjectStore('uploads', { keyPath: 'id' });
+        }
+        if (!request.result.objectStoreNames.contains('upload_chunks')) {
+          const chunks = request.result.createObjectStore('upload_chunks', { keyPath: 'key' });
+          chunks.createIndex('upload_id', 'upload_id', { unique: false });
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -147,12 +151,26 @@
         request.onsuccess = () => resolve(request.result || []);
         request.onerror = () => reject(request.error || new Error('Failed to hydrate staged project uploads.'));
       });
+      const uploadChunkSnapshots = await new Promise((resolve, reject) => {
+        const request = database.transaction('upload_chunks', 'readonly').objectStore('upload_chunks').getAll();
+        request.onsuccess = () => resolve(request.result || []);
+        request.onerror = () => reject(request.error || new Error('Failed to hydrate staged project chunks.'));
+      });
       database.close();
       projectUploads.clear();
       for (const upload of uploadSnapshots.slice(-4)) {
         if (!upload?.id || !upload?.projectName || !Array.isArray(upload.files)) continue;
-        upload.files = new Map(upload.files);
+        let needsChunkMigration = false;
+        upload.files = new Map(upload.files.map(([filePath, file]) => {
+          const persistedChunks = uploadChunkSnapshots
+            .filter(chunk => chunk.upload_id === upload.id && chunk.path === filePath)
+            .sort((a, b) => a.index - b.index)
+            .map(chunk => chunk.bytes);
+          if (Array.isArray(file.chunks)) needsChunkMigration = true;
+          return [filePath, { ...file, chunks: Array.isArray(file.chunks) ? file.chunks : persistedChunks }];
+        }));
         projectUploads.set(upload.id, upload);
+        if (needsChunkMigration) await migrateLegacyProjectUpload(upload);
       }
       if (snapshot) {
         const hydratedFiles = cloneProjectFiles(snapshot.files || {});
@@ -394,13 +412,34 @@
     };
   }
 
-  async function persistProjectUpload(upload) {
+  function projectUploadMetadata(upload) {
+    return {
+      ...upload,
+      files: [...upload.files.entries()].map(([path, file]) => [path, {
+        encoding: file.encoding,
+        receivedBytes: file.receivedBytes,
+        complete: file.complete,
+        chunkCount: file.chunks.length
+      }])
+    };
+  }
+
+  async function persistProjectUpload(upload, appended = null) {
     try {
       const database = await openRecordingDatabase();
-      const snapshot = { ...upload, files: [...upload.files.entries()] };
       await new Promise((resolve, reject) => {
-        const transaction = database.transaction('uploads', 'readwrite');
-        transaction.objectStore('uploads').put(snapshot);
+        const stores = appended ? ['uploads', 'upload_chunks'] : ['uploads'];
+        const transaction = database.transaction(stores, 'readwrite');
+        transaction.objectStore('uploads').put(projectUploadMetadata(upload));
+        if (appended) {
+          transaction.objectStore('upload_chunks').put({
+            key: `${upload.id}\u0000${appended.path}\u0000${appended.index}`,
+            upload_id: upload.id,
+            path: appended.path,
+            index: appended.index,
+            bytes: appended.bytes
+          });
+        }
         transaction.oncomplete = resolve;
         transaction.onerror = () => reject(transaction.error || new Error('Failed to persist staged project upload.'));
       });
@@ -412,11 +451,37 @@
     }
   }
 
+  async function migrateLegacyProjectUpload(upload) {
+    const database = await openRecordingDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(['uploads', 'upload_chunks'], 'readwrite');
+      transaction.objectStore('uploads').put(projectUploadMetadata(upload));
+      const chunkStore = transaction.objectStore('upload_chunks');
+      for (const [filePath, file] of upload.files) {
+        file.chunks.forEach((bytes, index) => chunkStore.put({
+          key: `${upload.id}\u0000${filePath}\u0000${index}`,
+          upload_id: upload.id,
+          path: filePath,
+          index,
+          bytes
+        }));
+      }
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to migrate staged project chunks.'));
+    });
+    database.close();
+  }
+
   async function deletePersistedProjectUpload(uploadId) {
     const database = await openRecordingDatabase();
     await new Promise((resolve, reject) => {
-      const transaction = database.transaction('uploads', 'readwrite');
+      const transaction = database.transaction(['uploads', 'upload_chunks'], 'readwrite');
       transaction.objectStore('uploads').delete(uploadId);
+      const cursorRequest = transaction.objectStore('upload_chunks').index('upload_id').openKeyCursor(IDBKeyRange.only(uploadId));
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (cursor) { transaction.objectStore('upload_chunks').delete(cursor.primaryKey); cursor.continue(); }
+      };
       transaction.oncomplete = resolve;
       transaction.onerror = () => reject(transaction.error || new Error('Failed to remove staged project upload.'));
     });
@@ -1898,12 +1963,13 @@ func _physics_process(delta):
           file = { encoding, chunks: [], receivedBytes: 0, complete: false };
           upload.files.set(filePath, file);
         }
+        const chunkIndex = file.chunks.length;
         file.chunks.push(bytes);
         file.receivedBytes += bytes.byteLength;
         file.complete = args.final === true;
         upload.totalBytes += bytes.byteLength;
         upload.updatedAt = Date.now();
-        const persisted = await persistProjectUpload(upload);
+        const persisted = await persistProjectUpload(upload, { path: filePath, index: chunkIndex, bytes });
         return { success: true, status: file.complete ? 'file_complete' : 'chunk_accepted', persisted, ...publicProjectUpload(upload) };
       }
     },
