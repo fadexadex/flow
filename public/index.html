@@ -691,6 +691,7 @@ function startEditor(zip, customArgs) {
 		window.__godotGameState = 'failed';
 		console.error('[Runtime lifecycle] failed and cleaned up');
 	};
+	window.__forceResetFailedGameRuntime = resetFailedGameRuntime;
 
 	let OnEditorExit = function () {
 		showTab('loader');

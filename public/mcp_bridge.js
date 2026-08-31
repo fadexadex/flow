@@ -665,7 +665,10 @@
     const onFailed = (event) => { failureMessage = event?.detail?.message || 'Godot editor failed to initialize.'; };
     window.addEventListener('godot-engine-ready', onReady, { once: true });
     window.addEventListener('godot-engine-failed', onFailed, { once: true });
-    window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor']);
+    // The editor and game share one generated Web audio module. Giving the
+    // editor a real AudioContext can race game teardown/restart and invalidate
+    // the next AudioWorkletNode. Authoring itself does not need audio output.
+    window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor', '--audio-driver', 'Dummy']);
     const ready = await waitFor(() => {
       if (failureMessage || readyEventObserved) return true;
       const editorTab = document.getElementById('btn-tab-editor');
@@ -726,7 +729,7 @@
     // The web editor emits platform-level `ERROR:` diagnostics for unsupported
     // debugger sockets and Emscripten blocking warnings even when a project is
     // healthy. Treat only project-load/runtime failures as transaction blockers.
-    const patterns = /SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)|Game (?:start|initialization) failed|Invalid project path specified|Invalid get index|Invalid call|Nonexistent function/i;
+    const patterns = /SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)|Game (?:start|initialization) failed|Invalid project path specified|AudioWorkletNode.*BaseAudioContext|Invalid get index|Invalid call|Nonexistent function/i;
     return activeLogs.filter(entry => entry.time >= sinceTime && entry.level === 'error' && patterns.test(entry.msg));
   }
 
@@ -788,10 +791,11 @@
       if (recentGodotErrors(startedAt).length > 0) return true;
       return activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
     }, Math.min(timeoutMs, 2500));
-    await new Promise(resolve => setTimeout(resolve, 450));
+    await new Promise(resolve => setTimeout(resolve, 1200));
     const errors = recentGodotErrors(startedAt);
     if (errors.length > 0) {
-      try { await stopGameRuntime(6000); } catch (_) {}
+      if (typeof window.__forceResetFailedGameRuntime === 'function') window.__forceResetFailedGameRuntime();
+      else try { await stopGameRuntime(6000); } catch (_) {}
       throw new Error(`Godot rejected the project during runtime boot: ${errors[0].msg}`);
     }
     const gameTab = document.getElementById('btn-tab-game');
