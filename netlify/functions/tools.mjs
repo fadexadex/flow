@@ -71,6 +71,39 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_begin_project_upload',
+    description: 'Begins a transport-safe staged custom-project upload',
+    input_schema: { type: 'object', properties: { project_name: { type: 'string' } }, required: ['project_name'], additionalProperties: false },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_upload_project_file_chunk',
+    description: 'Appends one bounded UTF-8 or base64 chunk to a staged project file using an exact decoded-byte offset',
+    input_schema: {
+      type: 'object',
+      properties: {
+        upload_id: { type: 'string' }, path: { type: 'string' },
+        encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+        offset: { type: 'integer', minimum: 0 }, content: { type: 'string', maxLength: 700000 },
+        final: { type: 'boolean', default: false }
+      },
+      required: ['upload_id', 'path', 'offset', 'content'], additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_get_project_upload_status',
+    description: 'Inspects staged project upload progress without returning uploaded contents',
+    input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_commit_project_upload',
+    description: 'Validates and transactionally boots a completed staged project',
+    input_schema: { type: 'object', properties: { upload_id: { type: 'string' }, idempotency_key: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_create_project',
     description: 'Injects complete 2D/3D visual scenes (.tscn), GDScripts, shaders, and audio into Godot virtual FS and boots Godot Viewport',
     input_schema: {

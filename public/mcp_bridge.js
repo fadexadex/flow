@@ -32,6 +32,7 @@
   const idempotentMutations = new Map();
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
+  const projectUploads = new Map();
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
   const RecordingState = {
     recorder: null, chunks: [], videoRecorder: null, videoChunks: [], audioRecorder: null, audioChunks: [],
@@ -356,6 +357,57 @@
       throw new Error('Project name must be 1–64 characters using letters, numbers, underscores, or hyphens, and must start with a letter or number.');
     }
     return rawName;
+  }
+
+  const PROJECT_UPLOAD_CHUNK_BYTES = 512 * 1024;
+  const PROJECT_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024;
+
+  function publicProjectUpload(upload) {
+    return {
+      upload_id: upload.id,
+      project_name: upload.projectName,
+      created_at: upload.createdAt,
+      updated_at: upload.updatedAt,
+      total_bytes: upload.totalBytes,
+      max_total_bytes: PROJECT_UPLOAD_TOTAL_BYTES,
+      max_chunk_bytes: PROJECT_UPLOAD_CHUNK_BYTES,
+      files: [...upload.files.entries()].map(([path, file]) => ({
+        path: `res://${path}`,
+        encoding: file.encoding,
+        received_bytes: file.receivedBytes,
+        complete: file.complete
+      }))
+    };
+  }
+
+  function decodeUploadChunk(content, encoding) {
+    if (typeof content !== 'string') throw new Error('Project upload chunk content must be a string.');
+    let bytes;
+    if (encoding === 'base64') {
+      let binary;
+      try { binary = atob(content); } catch (_) { throw new Error('Project upload chunk is not valid base64.'); }
+      bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+    } else {
+      bytes = new TextEncoder().encode(content);
+    }
+    if (bytes.byteLength > PROJECT_UPLOAD_CHUNK_BYTES) {
+      throw new Error(`Project upload chunks may contain at most ${PROJECT_UPLOAD_CHUNK_BYTES} decoded bytes.`);
+    }
+    return bytes;
+  }
+
+  function assembleProjectUpload(upload) {
+    if (upload.files.size === 0) throw new Error('The project upload contains no files.');
+    const files = {};
+    for (const [filePath, file] of upload.files) {
+      if (!file.complete) throw new Error(`Project upload file is incomplete: res://${filePath}`);
+      const bytes = new Uint8Array(file.receivedBytes);
+      let offset = 0;
+      for (const chunk of file.chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+      files[filePath] = file.encoding === 'utf8' ? new TextDecoder('utf-8', { fatal: true }).decode(bytes) : bytes;
+    }
+    validateProjectFiles(files);
+    return files;
   }
 
   function stableSerialize(value) {
@@ -1748,6 +1800,104 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_begin_project_upload',
+        description: 'Begins a transport-safe staged custom-project upload; send each file through bounded sequential chunks before committing',
+        input_schema: {
+          type: 'object',
+          properties: { project_name: { type: 'string' } },
+          required: ['project_name'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const projectName = cleanProjectName(args.project_name);
+        while (projectUploads.size >= 4) projectUploads.delete(projectUploads.keys().next().value);
+        const now = Date.now();
+        const upload = { id: `upload_${now}_${Math.random().toString(36).slice(2, 8)}`, projectName, createdAt: now, updatedAt: now, totalBytes: 0, files: new Map() };
+        projectUploads.set(upload.id, upload);
+        return { success: true, status: 'staging', ...publicProjectUpload(upload) };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_upload_project_file_chunk',
+        description: 'Appends one bounded UTF-8 or base64 chunk to a staged project file using an exact decoded-byte offset',
+        input_schema: {
+          type: 'object',
+          properties: {
+            upload_id: { type: 'string' },
+            path: { type: 'string' },
+            encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+            offset: { type: 'integer', minimum: 0 },
+            content: { type: 'string', maxLength: 700000 },
+            final: { type: 'boolean', default: false }
+          },
+          required: ['upload_id', 'path', 'offset', 'content'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const upload = projectUploads.get(args.upload_id);
+        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        const filePath = cleanProjectPath(args.path);
+        const encoding = args.encoding || 'utf8';
+        const bytes = decodeUploadChunk(args.content, encoding);
+        let file = upload.files.get(filePath);
+        if (!file) {
+          file = { encoding, chunks: [], receivedBytes: 0, complete: false };
+          upload.files.set(filePath, file);
+        }
+        if (file.complete) throw new Error(`Project upload file is already complete: res://${filePath}`);
+        if (file.encoding !== encoding) throw new Error(`Project upload encoding changed for res://${filePath}.`);
+        if (args.offset !== file.receivedBytes) throw new Error(`Project upload offset mismatch for res://${filePath}: expected ${file.receivedBytes}, received ${args.offset}.`);
+        if (upload.totalBytes + bytes.byteLength > PROJECT_UPLOAD_TOTAL_BYTES) throw new Error('Staged project exceeds the 25 MB authoring limit.');
+        file.chunks.push(bytes);
+        file.receivedBytes += bytes.byteLength;
+        file.complete = args.final === true;
+        upload.totalBytes += bytes.byteLength;
+        upload.updatedAt = Date.now();
+        return { success: true, status: file.complete ? 'file_complete' : 'chunk_accepted', ...publicProjectUpload(upload) };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_get_project_upload_status',
+        description: 'Inspects staged project upload progress without returning uploaded contents',
+        input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const upload = projectUploads.get(args.upload_id);
+        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        return { success: true, status: 'staging', ...publicProjectUpload(upload) };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_commit_project_upload',
+        description: 'Validates and transactionally boots a completed staged project through the same acknowledged custom-project authoring path',
+        input_schema: {
+          type: 'object',
+          properties: { upload_id: { type: 'string' }, idempotency_key: { type: 'string' } },
+          required: ['upload_id'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const upload = projectUploads.get(args.upload_id);
+        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        const files = assembleProjectUpload(upload);
+        const createTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_create_project');
+        if (!createTool) throw new Error('Custom project commit handler is unavailable.');
+        const result = await createTool.handler({ project_name: upload.projectName, template: 'custom', files, idempotency_key: args.idempotency_key });
+        return { ...result, upload_id: upload.id, staged_total_bytes: upload.totalBytes };
+      }
+    },
+    {
+      definition: {
         name: 'godot_create_project',
         description: 'Creates custom 2D/3D visual scenes, GDScripts, shaders, or authors complete project templates (orbital_garden, neon_skyrail_3d, custom) with arbitrary file injection',
         input_schema: {
@@ -2612,6 +2762,10 @@ func _physics_process(delta):
     describe(toolName, input = {}) {
       const labels = {
         godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
+        godot_begin_project_upload: `Beginning staged project: ${input.project_name || 'Untitled'}`,
+        godot_upload_project_file_chunk: `Uploading chunk: ${input.path || 'project file'}`,
+        godot_get_project_upload_status: `Inspecting staged upload: ${input.upload_id || 'unknown'}`,
+        godot_commit_project_upload: `Committing staged upload: ${input.upload_id || 'unknown'}`,
         godot_restore_project_session: 'Restoring persisted editor session',
         godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
         godot_inspect_project_files: 'Inspecting authoritative project files',
