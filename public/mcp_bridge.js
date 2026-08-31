@@ -64,13 +64,16 @@
   function openRecordingDatabase() {
     return new Promise((resolve, reject) => {
       if (!window.indexedDB) return reject(new Error('IndexedDB is unavailable; artifacts cannot be persisted.'));
-      const request = window.indexedDB.open('godot-webmcp-artifacts', 2);
+      const request = window.indexedDB.open('godot-webmcp-artifacts', 3);
       request.onupgradeneeded = () => {
         if (!request.result.objectStoreNames.contains('recordings')) {
           request.result.createObjectStore('recordings', { keyPath: 'id' });
         }
         if (!request.result.objectStoreNames.contains('projects')) {
           request.result.createObjectStore('projects', { keyPath: 'id' });
+        }
+        if (!request.result.objectStoreNames.contains('uploads')) {
+          request.result.createObjectStore('uploads', { keyPath: 'id' });
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -139,7 +142,18 @@
         request.onsuccess = () => resolve(request.result || null);
         request.onerror = () => reject(request.error || new Error('Failed to hydrate project state.'));
       });
+      const uploadSnapshots = await new Promise((resolve, reject) => {
+        const request = database.transaction('uploads', 'readonly').objectStore('uploads').getAll();
+        request.onsuccess = () => resolve(request.result || []);
+        request.onerror = () => reject(request.error || new Error('Failed to hydrate staged project uploads.'));
+      });
       database.close();
+      projectUploads.clear();
+      for (const upload of uploadSnapshots.slice(-4)) {
+        if (!upload?.id || !upload?.projectName || !Array.isArray(upload.files)) continue;
+        upload.files = new Map(upload.files);
+        projectUploads.set(upload.id, upload);
+      }
       if (snapshot) {
         const hydratedFiles = cloneProjectFiles(snapshot.files || {});
         const hasFiles = Object.keys(hydratedFiles).length > 0;
@@ -378,6 +392,35 @@
         complete: file.complete
       }))
     };
+  }
+
+  async function persistProjectUpload(upload) {
+    try {
+      const database = await openRecordingDatabase();
+      const snapshot = { ...upload, files: [...upload.files.entries()] };
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction('uploads', 'readwrite');
+        transaction.objectStore('uploads').put(snapshot);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error('Failed to persist staged project upload.'));
+      });
+      database.close();
+      return true;
+    } catch (error) {
+      activeLogs.push({ level: 'warn', time: Date.now(), msg: `[Upload persistence] ${error instanceof Error ? error.message : String(error)}` });
+      return false;
+    }
+  }
+
+  async function deletePersistedProjectUpload(uploadId) {
+    const database = await openRecordingDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction('uploads', 'readwrite');
+      transaction.objectStore('uploads').delete(uploadId);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to remove staged project upload.'));
+    });
+    database.close();
   }
 
   function decodeUploadChunk(content, encoding) {
@@ -1812,11 +1855,12 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const projectName = cleanProjectName(args.project_name);
-        while (projectUploads.size >= 4) projectUploads.delete(projectUploads.keys().next().value);
+        if (projectUploads.size >= 4) throw new Error('At most four staged project uploads may be active. Abort one before beginning another.');
         const now = Date.now();
         const upload = { id: `upload_${now}_${Math.random().toString(36).slice(2, 8)}`, projectName, createdAt: now, updatedAt: now, totalBytes: 0, files: new Map() };
         projectUploads.set(upload.id, upload);
-        return { success: true, status: 'staging', ...publicProjectUpload(upload) };
+        const persisted = await persistProjectUpload(upload);
+        return { success: true, status: 'staging', persisted, ...publicProjectUpload(upload) };
       }
     },
     {
@@ -1859,7 +1903,8 @@ func _physics_process(delta):
         file.complete = args.final === true;
         upload.totalBytes += bytes.byteLength;
         upload.updatedAt = Date.now();
-        return { success: true, status: file.complete ? 'file_complete' : 'chunk_accepted', ...publicProjectUpload(upload) };
+        const persisted = await persistProjectUpload(upload);
+        return { success: true, status: file.complete ? 'file_complete' : 'chunk_accepted', persisted, ...publicProjectUpload(upload) };
       }
     },
     {
@@ -1873,6 +1918,20 @@ func _physics_process(delta):
         const upload = projectUploads.get(args.upload_id);
         if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
         return { success: true, status: 'staging', ...publicProjectUpload(upload) };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_abort_project_upload',
+        description: 'Removes one staged project upload and all of its persisted chunks without changing the active Godot project',
+        input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        if (!projectUploads.has(args.upload_id)) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        await deletePersistedProjectUpload(args.upload_id);
+        projectUploads.delete(args.upload_id);
+        return { success: true, status: 'aborted', upload_id: args.upload_id };
       }
     },
     {
@@ -2773,6 +2832,7 @@ func _physics_process(delta):
         godot_begin_project_upload: `Beginning staged project: ${input.project_name || 'Untitled'}`,
         godot_upload_project_file_chunk: `Uploading chunk: ${input.path || 'project file'}`,
         godot_get_project_upload_status: `Inspecting staged upload: ${input.upload_id || 'unknown'}`,
+        godot_abort_project_upload: `Aborting staged upload: ${input.upload_id || 'unknown'}`,
         godot_commit_project_upload: `Committing staged upload: ${input.upload_id || 'unknown'}`,
         godot_restore_project_session: 'Restoring persisted editor session',
         godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,

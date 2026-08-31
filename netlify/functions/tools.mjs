@@ -98,6 +98,12 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_abort_project_upload',
+    description: 'Removes one staged project upload and all persisted chunks without changing the active project',
+    input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_commit_project_upload',
     description: 'Validates and transactionally boots a completed staged project',
     input_schema: { type: 'object', properties: { upload_id: { type: 'string' }, idempotency_key: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
