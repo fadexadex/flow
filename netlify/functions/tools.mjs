@@ -232,7 +232,14 @@ export const MCP_TOOL_CATALOG = [
   {
     name: 'godot_start_recording',
     description: 'Starts a real MediaRecorder capture of the visible Godot game canvas',
-    input_schema: { type: 'object', properties: { fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 } }, additionalProperties: false },
+    input_schema: {
+      type: 'object',
+      properties: {
+        fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 },
+        mime_type: { type: 'string' }
+      },
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {

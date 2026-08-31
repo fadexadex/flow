@@ -2185,7 +2185,10 @@ func _physics_process(delta):
         description: 'Starts a real MediaRecorder capture of the visible Godot game canvas; use godot_stop_recording to persist it in IndexedDB',
         input_schema: {
           type: 'object',
-          properties: { fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 } },
+          properties: {
+            fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 },
+            mime_type: { type: 'string', description: 'Optional MediaRecorder MIME override, for example video/webm or video/webm;codecs=vp8,opus' }
+          },
           additionalProperties: false
         },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
@@ -2207,10 +2210,13 @@ func _physics_process(delta):
           audioMaster.connect(audioDestination);
           stream = new MediaStream([...videoStream.getVideoTracks(), ...audioDestination.stream.getAudioTracks()]);
         }
+        if (args.mime_type && !MediaRecorder.isTypeSupported(args.mime_type)) {
+          throw new Error(`Requested recording MIME type is unsupported: ${args.mime_type}`);
+        }
         const mimeCandidates = stream.getAudioTracks().length > 0
-          ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+          ? ['video/webm', 'video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus']
           : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
-        const mimeType = mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+        const mimeType = args.mime_type || mimeCandidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
         const recorder = new MediaRecorder(stream, mimeType ? { mimeType, videoBitsPerSecond: 5_000_000 } : undefined);
         RecordingState.recorder = recorder;
         RecordingState.chunks = [];
