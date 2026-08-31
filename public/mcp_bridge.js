@@ -110,6 +110,7 @@
         scene_revision: DiagnosticState.sceneRevision,
         files: cloneProjectFiles(activeFilesDict),
         undo_stack: undoStack.map(entry => ({ ...entry, files_before: cloneProjectFiles(entry.files_before || {}), files_after: cloneProjectFiles(entry.files_after || {}) })),
+        idempotent_mutations: [...idempotentMutations.entries()].slice(-100),
         updated_at: Date.now()
       };
       await new Promise((resolve, reject) => {
@@ -157,6 +158,12 @@
         DiagnosticState.sceneRevision = snapshot.scene_revision;
         activeFilesDict = hydratedFiles;
         undoStack.splice(0, undoStack.length, ...snapshot.undo_stack);
+        idempotentMutations.clear();
+        for (const entry of snapshot.idempotent_mutations || []) {
+          if (Array.isArray(entry) && typeof entry[0] === 'string' && entry[1]?.fingerprint && entry[1]?.result) {
+            idempotentMutations.set(entry[0], entry[1]);
+          }
+        }
         persistedProjectAvailable = hasFiles;
         DiagnosticState.session = persistedProjectAvailable ? 'persisted' : 'empty';
         DiagnosticState.engine = 'loading';
@@ -1575,14 +1582,12 @@ func _physics_process(delta):
           main_scene_after: activeMainScene,
           files_after: cloneProjectFiles(activeFilesDict)
         });
-        const persisted = await persistActiveProjectState();
-
         const result = {
           success: true,
           project_name: projName,
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
-          persisted,
+          persisted: true,
           main_scene: 'res://main_3d.tscn',
           entities: {
             rail_length_meters: 900,
@@ -1596,6 +1601,7 @@ func _physics_process(delta):
           files_written: Object.keys(activeFilesDict)
         };
           storeIdempotentResult(idempotencyKey, fingerprint, result);
+          result.persisted = await persistActiveProjectState();
           return result;
         }, 10000, { key: idempotencyKey, fingerprint });
       }
@@ -1831,21 +1837,20 @@ func _physics_process(delta):
           main_scene_after: activeMainScene,
           files_after: cloneProjectFiles(activeFilesDict)
         });
-        const persisted = await persistActiveProjectState();
-
         const result = {
           success: true,
           project_name: projName,
           template_type: projectType,
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
-          persisted,
+          persisted: true,
           main_scene: mainScene,
           files_written: Object.keys(activeFilesDict),
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`
         };
 
           storeIdempotentResult(idempotencyKey, fingerprint, result);
+          result.persisted = await persistActiveProjectState();
           return result;
         }, 10000, { key: idempotencyKey, fingerprint });
       }
@@ -1975,13 +1980,12 @@ func _physics_process(delta):
           main_scene_after: stagedMainScene,
           files_after: cloneProjectFiles(stagedFiles)
         });
-        const persisted = await persistActiveProjectState();
         const result = {
           success: true,
           label: args.label || 'Project file transaction',
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
-          persisted,
+          persisted: true,
           changed_paths: changedPaths,
           main_scene: activeMainScene,
           file_count: validation.fileCount,
@@ -1989,6 +1993,7 @@ func _physics_process(delta):
           editor_acknowledged: true
         };
           storeIdempotentResult(args.idempotency_key, fingerprint, result);
+          result.persisted = await persistActiveProjectState();
           return result;
         }, 10000, { key: args.idempotency_key, fingerprint });
       }
