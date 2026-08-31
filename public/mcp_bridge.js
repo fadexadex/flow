@@ -755,14 +755,23 @@
     if (typeof window.Execute !== 'function') throw new Error('Godot editor is not initialized; author or open a project before running it.');
     await stopGameRuntime(10000);
     const startedAt = Date.now();
-    const launchedEvent = waitForRuntimeEvent(
-      'godot-game-launched',
-      'godot-game-failed',
-      timeoutMs,
-      `Godot did not confirm game launch within ${Math.round(timeoutMs / 1000)} seconds.`
-    );
+    let launchedEventObserved = false;
+    let failureMessage = null;
+    const onLaunched = () => { launchedEventObserved = true; };
+    const onFailed = (event) => { failureMessage = event?.detail?.message || 'Godot game launch failed.'; };
+    window.addEventListener('godot-game-launched', onLaunched, { once: true });
+    window.addEventListener('godot-game-failed', onFailed, { once: true });
     window.Execute(['--path', `/home/web_user/projects/${DiagnosticState.activeProject}`]);
-    await launchedEvent;
+    const launched = await waitFor(() => {
+      if (failureMessage || launchedEventObserved) return true;
+      const gameTab = document.getElementById('btn-tab-game');
+      const runtimeTelemetry = activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
+      return Boolean(gameTab && !gameTab.disabled && runtimeTelemetry);
+    }, timeoutMs);
+    window.removeEventListener('godot-game-launched', onLaunched);
+    window.removeEventListener('godot-game-failed', onFailed);
+    if (failureMessage) throw new Error(failureMessage);
+    if (!launched) throw new Error(`Godot did not confirm game launch within ${Math.round(timeoutMs / 1000)} seconds.`);
     await waitFor(() => {
       if (recentGodotErrors(startedAt).length > 0) return true;
       return activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
