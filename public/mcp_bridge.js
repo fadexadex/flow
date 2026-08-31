@@ -227,7 +227,7 @@
     if (!shelf) {
       shelf = document.createElement('div');
       shelf.id = 'webmcp-recording-shelf';
-      shelf.style.cssText = 'position:fixed;left:14px;bottom:46px;z-index:999999;padding:9px 12px;border:1px solid rgba(255,200,87,.55);border-radius:8px;background:rgba(12,15,25,.94);font:600 11px/1.35 Inter,system-ui,sans-serif;color:#ffe6a2';
+      shelf.style.cssText = 'position:fixed;left:14px;bottom:46px;z-index:999998;max-width:calc(100vw - 28px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 12px;border:1px solid rgba(255,200,87,.55);border-radius:8px;background:rgba(12,15,25,.94);font:600 11px/1.35 Inter,system-ui,sans-serif;color:#ffe6a2';
       document.body.appendChild(shelf);
     }
     if (replace) shelf.innerHTML = '';
@@ -3211,7 +3211,8 @@ func _physics_process(delta):
       if (!this.feed) {
         this.feed = document.createElement('div');
         this.feed.id = 'webmcp-agent-action-feed';
-        this.feed.style.cssText = 'position:fixed;right:14px;bottom:42px;z-index:999999;width:min(330px,calc(100vw - 28px));max-height:min(230px,40vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;';
+        const feedBottom = document.getElementById('webmcp-recording-shelf') ? '92px' : '42px';
+        this.feed.style.cssText = `position:fixed;right:14px;bottom:${feedBottom};z-index:999999;width:min(330px,calc(100vw - 28px));max-height:min(230px,40vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;`;
         this.feed.setAttribute('role', 'status');
         this.feed.setAttribute('aria-live', 'polite');
         this.feed.setAttribute('aria-label', 'WebMCP agent activity. Click to collapse or expand.');
@@ -3231,6 +3232,7 @@ func _physics_process(delta):
         this.feed.innerHTML = `<div style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div><div style="margin-top:5px;color:#789099">Waiting for a WebMCP action…</div>`;
         document.body.appendChild(this.feed);
       }
+      this.feed.style.bottom = document.getElementById('webmcp-recording-shelf') ? '92px' : '42px';
       return true;
     },
 
