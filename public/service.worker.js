@@ -1,10 +1,7 @@
-// Godot Web Editor MCP - High Performance Cache Service Worker
-const CACHE_NAME = 'godot-web-mcp-v1';
+// Godot Web Editor MCP - cache large immutable assets without pinning the UI
+// shell or WebMCP bridge to an obsolete deployment.
+const CACHE_NAME = 'godot-web-mcp-v2';
 const PRECACHE_URLS = [
-  '/',
-  '/index.html',
-  '/godot.editor.js',
-  '/mcp_bridge.js',
   '/inter-regular.woff2',
   '/inter-bold.woff2',
   '/logo.svg',
@@ -41,29 +38,22 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      if (cachedResponse) {
-        return cachedResponse;
+  const url = new URL(event.request.url);
+  const immutableRuntimeAsset = url.pathname.endsWith('.wasm') || url.pathname.endsWith('.pck');
+  if (immutableRuntimeAsset) {
+    event.respondWith(caches.match(event.request).then((cachedResponse) => cachedResponse || fetch(event.request).then((networkResponse) => {
+      if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
+        const responseToCache = networkResponse.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, responseToCache));
       }
+      return networkResponse;
+    })));
+    return;
+  }
 
-      return fetch(event.request).then((networkResponse) => {
-        if (!networkResponse || networkResponse.status !== 200 || networkResponse.type !== 'basic') {
-          return networkResponse;
-        }
-
-        // Cache large Godot binaries (wasm, pck) for instant sub-second reloads
-        if (event.request.url.endsWith('.wasm') || event.request.url.endsWith('.pck')) {
-          const responseToCache = networkResponse.clone();
-          caches.open(CACHE_NAME).then((cache) => {
-            cache.put(event.request, responseToCache);
-          });
-        }
-
-        return networkResponse;
-      });
-    })
-  );
+  // HTML and JavaScript are deployment-coherent control surfaces. Always ask
+  // the network first; fall back only for explicitly pre-cached static assets.
+  event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
 });
 
 self.addEventListener('message', (event) => {
