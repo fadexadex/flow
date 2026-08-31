@@ -3553,6 +3553,76 @@ func _physics_process(delta):
     });
   }
 
+  function initWebSocketBridge() {
+    if (typeof window === 'undefined' || typeof WebSocket === 'undefined') return;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/mcp?type=editor`;
+
+    let socket = null;
+    let reconnectTimer = null;
+
+    function connect() {
+      try {
+        socket = new WebSocket(wsUrl);
+        socket.onopen = () => {
+          console.log('[WebMCP] Connected to WebSocket MCP Relay:', wsUrl);
+          DiagnosticState.transport = 'NativeInPageWebMCP + ConnectedWSS';
+          DiagnosticHUD.render();
+        };
+
+        socket.onmessage = async (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.method === 'tools/call' && data.params?.name) {
+              const tool = MANIFEST_TOOLS.find(t => t.definition.name === data.params.name);
+              if (!tool) {
+                socket.send(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: data.id,
+                  error: { code: -32601, message: `Tool '${data.params.name}' not found` }
+                }));
+                return;
+              }
+              try {
+                const result = await executeObservedTool(tool, data.params.arguments || {});
+                socket.send(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: data.id,
+                  result
+                }));
+              } catch (err) {
+                socket.send(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: data.id,
+                  error: { code: -32000, message: err.message || String(err) }
+                }));
+              }
+            }
+          } catch (err) {
+            console.error('[WebMCP] WebSocket message handler error:', err);
+          }
+        };
+
+        socket.onclose = () => {
+          if (!reconnectTimer) {
+            reconnectTimer = setTimeout(() => {
+              reconnectTimer = null;
+              connect();
+            }, 3000);
+          }
+        };
+
+        socket.onerror = () => {
+          socket.close();
+        };
+      } catch (err) {
+        // Silently ignore if running on a host without WebSocket relay
+      }
+    }
+
+    connect();
+  }
+
   function initDOM() {
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
@@ -3560,6 +3630,8 @@ func _physics_process(delta):
       DiagnosticHUD.render();
       AgentObservationHUD.renderFeed();
     });
+
+    initWebSocketBridge();
 
     const readinessObserver = new MutationObserver(() => {
       const previousState = DiagnosticState.engine;
