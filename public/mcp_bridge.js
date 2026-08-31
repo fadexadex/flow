@@ -647,10 +647,9 @@
     await stopGameRuntime(10000);
     const closeEditorButton = document.getElementById('btn-close-editor');
     if (closeEditorButton && !closeEditorButton.disabled) {
-      if (typeof window.closeEditor !== 'function') throw new Error('The existing editor cannot be closed safely.');
-      window.closeEditor();
-      const closed = await waitFor(() => closeEditorButton.disabled, 12000);
-      if (!closed) throw new Error('Existing Godot editor did not stop within 12 seconds.');
+      if (typeof window.closeEditor === 'function') window.closeEditor();
+      await waitFor(() => closeEditorButton.disabled, 3000);
+      if (typeof window.setLoaderEnabled === 'function') window.setLoaderEnabled(true);
     }
 
     window._mcpProjectName = projectName;
@@ -750,7 +749,7 @@
     });
   }
 
-  async function stopGameRuntime(timeoutMs = 10000) {
+  async function stopGameRuntime(timeoutMs = 6000) {
     const closeGameButton = document.getElementById('btn-close-game');
     const wasRunning = Boolean(closeGameButton && !closeGameButton.disabled);
     if (!wasRunning) return false;
@@ -761,9 +760,11 @@
     window.closeGame();
     const stopped = await waitFor(() => stoppedEventObserved || closeGameButton.disabled || ['stopped', 'failed'].includes(window.__godotGameState), timeoutMs);
     window.removeEventListener('godot-game-stopped', onStopped);
-    if (!stopped) throw new Error(`Godot did not confirm the game stopped within ${Math.round(timeoutMs / 1000)} seconds.`);
-    const controlsStopped = closeGameButton.disabled || await waitFor(() => closeGameButton.disabled, 2000);
-    if (!controlsStopped) throw new Error('Godot reported a stopped runtime, but its controls still report a running process.');
+    if (!stopped || !closeGameButton.disabled) {
+      if (typeof window.__forceResetFailedGameRuntime === 'function') {
+        window.__forceResetFailedGameRuntime();
+      }
+    }
     return true;
   }
 
