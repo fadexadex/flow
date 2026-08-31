@@ -1,0 +1,177 @@
+[gd_scene load_steps=11 format=3]
+
+[ext_resource type="Script" path="res://skybridge_relay.gd" id="1_script"]
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 1
+background_color = Color(0.035, 0.072, 0.11, 1)
+ambient_light_source = 3
+ambient_light_color = Color(0.31, 0.5, 0.66, 1)
+ambient_light_energy = 0.7
+fog_enabled = true
+fog_light_color = Color(0.13, 0.23, 0.32, 1)
+fog_density = 0.008
+
+[sub_resource type="BoxMesh" id="Deck_mesh"]
+size = Vector3(10, 0.3, 126)
+
+[sub_resource type="BoxMesh" id="Rail_mesh"]
+size = Vector3(0.16, 0.18, 126)
+
+[sub_resource type="BoxMesh" id="Gate_post_mesh"]
+size = Vector3(0.32, 2.4, 0.36)
+
+[sub_resource type="BoxMesh" id="Gate_beam_mesh"]
+size = Vector3(2.9, 0.34, 0.46)
+
+[sub_resource type="CapsuleMesh" id="Runner_mesh"]
+radius = 0.46
+height = 1.7
+
+[sub_resource type="StandardMaterial3D" id="Deck_material"]
+albedo_color = Color(0.07, 0.13, 0.18, 1)
+metallic = 0.55
+roughness = 0.44
+
+[sub_resource type="StandardMaterial3D" id="Rail_material"]
+albedo_color = Color(0.29, 0.76, 0.82, 1)
+emission_enabled = true
+emission = Color(0.05, 0.38, 0.44, 1)
+emission_energy_multiplier = 0.8
+
+[sub_resource type="StandardMaterial3D" id="Gate_material"]
+albedo_color = Color(0.94, 0.46, 0.22, 1)
+emission_enabled = true
+emission = Color(0.42, 0.07, 0.025, 1)
+emission_energy_multiplier = 0.55
+
+[sub_resource type="StandardMaterial3D" id="Runner_material"]
+albedo_color = Color(0.92, 0.86, 0.61, 1)
+metallic = 0.45
+roughness = 0.28
+emission_enabled = true
+emission = Color(0.36, 0.23, 0.04, 1)
+emission_energy_multiplier = 0.35
+
+[node name="SkybridgeRelay" type="Node3D"]
+script = ExtResource("1_script")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_main")
+
+[node name="KeyLight" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-48, -28, 0)
+light_color = Color(0.88, 0.95, 1, 1)
+light_energy = 1.6
+
+[node name="RelayCamera" type="Camera3D" parent="."]
+position = Vector3(0, 5.2, 10.5)
+rotation_degrees = Vector3(-20, 0, 0)
+current = true
+fov = 66.0
+
+[node name="Skybridge" type="Node3D" parent="."]
+
+[node name="Deck" type="MeshInstance3D" parent="Skybridge"]
+position = Vector3(0, -0.15, -58)
+mesh = SubResource("Deck_mesh")
+material_override = SubResource("Deck_material")
+
+[node name="LeftGuide" type="MeshInstance3D" parent="Skybridge"]
+position = Vector3(-1.55, 0.04, -58)
+mesh = SubResource("Rail_mesh")
+material_override = SubResource("Rail_material")
+
+[node name="RightGuide" type="MeshInstance3D" parent="Skybridge"]
+position = Vector3(1.55, 0.04, -58)
+mesh = SubResource("Rail_mesh")
+material_override = SubResource("Rail_material")
+
+[node name="Runner" type="Node3D" parent="."]
+position = Vector3(0, 0.85, 0)
+
+[node name="Body" type="MeshInstance3D" parent="Runner"]
+mesh = SubResource("Runner_mesh")
+material_override = SubResource("Runner_material")
+
+[node name="Gates" type="Node3D" parent="."]
+
+[node name="Gate01" type="Node3D" parent="Gates"]
+position = Vector3(0, 0, -18)
+[node name="LeftPost" type="MeshInstance3D" parent="Gates/Gate01"]
+position = Vector3(-1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="RightPost" type="MeshInstance3D" parent="Gates/Gate01"]
+position = Vector3(1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="Beam" type="MeshInstance3D" parent="Gates/Gate01"]
+position = Vector3(0, 1.55, 0)
+mesh = SubResource("Gate_beam_mesh")
+material_override = SubResource("Gate_material")
+
+[node name="Gate02" type="Node3D" parent="Gates"]
+position = Vector3(-3, 0, -34)
+[node name="LeftPost" type="MeshInstance3D" parent="Gates/Gate02"]
+position = Vector3(-1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="RightPost" type="MeshInstance3D" parent="Gates/Gate02"]
+position = Vector3(1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="Beam" type="MeshInstance3D" parent="Gates/Gate02"]
+position = Vector3(0, 1.55, 0)
+mesh = SubResource("Gate_beam_mesh")
+material_override = SubResource("Gate_material")
+
+[node name="Gate03" type="Node3D" parent="Gates"]
+position = Vector3(3, 0, -50)
+[node name="LeftPost" type="MeshInstance3D" parent="Gates/Gate03"]
+position = Vector3(-1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="RightPost" type="MeshInstance3D" parent="Gates/Gate03"]
+position = Vector3(1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="Beam" type="MeshInstance3D" parent="Gates/Gate03"]
+position = Vector3(0, 1.55, 0)
+mesh = SubResource("Gate_beam_mesh")
+material_override = SubResource("Gate_material")
+
+[node name="Gate04" type="Node3D" parent="Gates"]
+position = Vector3(0, 0, -66)
+[node name="LeftPost" type="MeshInstance3D" parent="Gates/Gate04"]
+position = Vector3(-1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="RightPost" type="MeshInstance3D" parent="Gates/Gate04"]
+position = Vector3(1.25, 1.2, 0)
+mesh = SubResource("Gate_post_mesh")
+material_override = SubResource("Gate_material")
+[node name="Beam" type="MeshInstance3D" parent="Gates/Gate04"]
+position = Vector3(0, 1.55, 0)
+mesh = SubResource("Gate_beam_mesh")
+material_override = SubResource("Gate_material")
+
+[node name="HUD" type="CanvasLayer" parent="."]
+[node name="Objective" type="Label" parent="HUD"]
+offset_left = 28.0
+offset_top = 24.0
+theme_override_colors/font_color = Color(0.84, 0.94, 0.95, 1)
+theme_override_font_sizes/font_size = 22
+text = "SKYBRIDGE RELAY · FIND THE CLEAR LANE"
+[node name="Progress" type="Label" parent="HUD"]
+offset_left = 30.0
+offset_top = 57.0
+theme_override_colors/font_color = Color(0.48, 0.74, 0.78, 1)
+theme_override_font_sizes/font_size = 16
+[node name="Cue" type="Label" parent="HUD"]
+offset_left = 0.0
+offset_top = 650.0
+offset_right = 1280.0
+theme_override_colors/font_color = Color(0.87, 0.94, 0.93, 1)
+theme_override_font_sizes/font_size = 18
+horizontal_alignment = 1

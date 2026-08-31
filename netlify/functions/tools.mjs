@@ -165,6 +165,12 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_inspect_scene_graph',
+    description: 'Returns durable authored scene nodes so collaborators can distinguish editable 3D objects from runtime-only script output',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_apply_file_transaction',
     description: 'Revision-checked atomic project edit that restarts the real Godot Editor and records an undo snapshot',
     input_schema: {

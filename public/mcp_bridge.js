@@ -274,9 +274,35 @@
     }
   }
 
+  function isFreshStartRequested() {
+    if (typeof window === 'undefined') return false;
+    try {
+      return new URLSearchParams(window.location.search).get('fresh') === '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function clearPersistedAuthoringState(database) {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(['projects', 'uploads', 'upload_chunks'], 'readwrite');
+      transaction.objectStore('projects').delete('active');
+      transaction.objectStore('uploads').clear();
+      transaction.objectStore('upload_chunks').clear();
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to clear the persisted authoring session.'));
+    });
+  }
+
   async function hydratePersistedProjectState() {
     try {
       const database = await openRecordingDatabase();
+      const freshStartRequested = isFreshStartRequested();
+      if (freshStartRequested) {
+        await clearPersistedAuthoringState(database);
+        // Keep the reset a one-time, inspectable browser action rather than a sticky URL mode.
+        window.history?.replaceState?.({}, '', window.location.pathname || '/');
+      }
       const snapshot = await new Promise((resolve, reject) => {
         const request = database.transaction('projects', 'readonly').objectStore('projects').get('active');
         request.onsuccess = () => resolve(request.result || null);
@@ -2049,6 +2075,22 @@ func _physics_process(delta):
   // ==========================================
   // 6. Authoritative Native Tool Manifest
   // ==========================================
+  function sceneGraphFromFiles(filesDict = {}) {
+    const nodes = [];
+    for (const [path, source] of Object.entries(filesDict)) {
+      if (!path.endsWith('.tscn') || typeof source !== 'string') continue;
+      const pattern = /^\[node name="([^"]+)" type="([^"]+)"(?: parent="([^"]+)")?/gm;
+      for (const match of source.matchAll(pattern)) {
+        nodes.push({ path: `res://${path}`, name: match[1], type: match[2], parent: match[3] || null });
+      }
+    }
+    const byType = nodes.reduce((summary, node) => {
+      summary[node.type] = (summary[node.type] || 0) + 1;
+      return summary;
+    }, {});
+    return { nodes, by_type: byType, scene_count: new Set(nodes.map(node => node.path)).size };
+  }
+
   const MANIFEST_TOOLS = [
     {
       definition: {
@@ -2216,6 +2258,7 @@ func _physics_process(delta):
           await advancePhase(operation, 'persisting_commit');
           DiagnosticState.sceneRevision++;
           DiagnosticHUD.render();
+          BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
           undoStack.push({
             undo_id: undoId,
             revision: DiagnosticState.sceneRevision,
@@ -2659,6 +2702,7 @@ func _physics_process(delta):
         await advancePhase(operation, 'persisting_commit');
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
+        BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
         undoStack.push({
           undo_id: undoId,
           revision: DiagnosticState.sceneRevision,
@@ -2727,6 +2771,20 @@ func _physics_process(delta):
           files
         };
       }
+    },
+    {
+      definition: {
+        name: 'godot_inspect_scene_graph',
+        description: 'Returns the durable authored Godot scene graph so collaborators can verify which visible objects are editable in the 3D editor, rather than runtime-only script output',
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async () => ({
+        success: true,
+        project_name: DiagnosticState.activeProject,
+        scene_revision: DiagnosticState.sceneRevision,
+        ...sceneGraphFromFiles(activeFilesDict)
+      })
     },
     {
       definition: {
@@ -2804,6 +2862,7 @@ func _physics_process(delta):
         activeMainScene = stagedMainScene;
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
+        BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
         const undoId = `undo_files_${Date.now()}`;
         undoStack.push({
           undo_id: undoId,
@@ -2955,6 +3014,7 @@ func _physics_process(delta):
         undoStack.splice(index, 1);
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
+        BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
         const persisted = await persistActiveProjectState();
           return {
           success: true,
@@ -3884,6 +3944,20 @@ func _physics_process(delta):
 
       const blocks = [];
       const fileKeys = Object.keys(filesDict || {});
+      const sceneGraph = sceneGraphFromFiles(filesDict);
+
+      if (sceneGraph.nodes.length > 0) {
+        const visibleNodes = sceneGraph.nodes.filter(node => [
+          'MeshInstance3D', 'Camera3D', 'DirectionalLight3D', 'WorldEnvironment', 'CanvasLayer'
+        ].includes(node.type));
+        blocks.push({
+          icon: '◌',
+          name: `Authored scene · ${sceneGraph.nodes.length} editable nodes`,
+          files: visibleNodes.slice(0, 4).map(node => `${node.name} (${node.type})`),
+          status: `Scene rev #${activeRevision}`,
+          color: '#e7c47a'
+        });
+      }
 
       if (fileKeys.some(f => f.includes('main_3d'))) {
         blocks.push({
