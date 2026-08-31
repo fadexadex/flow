@@ -788,7 +788,7 @@
 
   async function validateProjectRuntimeBoot() {
     try {
-      await startGameRuntime({ visible: false, timeoutMs: 30000 });
+      await startGameRuntime({ visible: false, timeoutMs: 60000 });
     } finally {
       try { await stopGameRuntime(10000); } catch (_) {}
       if (typeof window.showTab === 'function') window.showTab('editor');
