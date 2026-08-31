@@ -1871,13 +1871,7 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const upload = projectUploads.get(args.upload_id);
-        if (!upload) {
-          const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
-          if (receipt?.metadata?.source_upload_id === args.upload_id || receipt?.result?.upload_receipt_id === args.upload_id) {
-            return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
-          }
-          throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
-        }
+        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
         return { success: true, status: 'staging', ...publicProjectUpload(upload) };
       }
     },
@@ -1895,7 +1889,13 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const upload = projectUploads.get(args.upload_id);
-        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        if (!upload) {
+          const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
+          if (receipt?.metadata?.source_upload_id === args.upload_id || receipt?.result?.upload_receipt_id === args.upload_id) {
+            return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
+          }
+          throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        }
         const files = assembleProjectUpload(upload);
         const createTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_create_project');
         if (!createTool) throw new Error('Custom project commit handler is unavailable.');
