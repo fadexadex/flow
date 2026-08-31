@@ -54,7 +54,7 @@
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
   const RecordingState = {
     recorder: null, chunks: [], videoRecorder: null, videoChunks: [], audioRecorder: null, audioChunks: [],
-    startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null,
+    startedAt: 0, id: null, canvas: null, captureCanvas: null, captureContext: null, captureRaf: null, audioDestination: null, audioMaster: null,
     autoStopTimer: null, lastAutoStop: null
   };
   const activeLogs = [];
@@ -151,6 +151,45 @@
     return records;
   }
 
+  function createRecordingSurface(sourceCanvas) {
+    if (typeof document === 'undefined' || typeof document.createElement !== 'function') return sourceCanvas;
+    const surface = document.createElement('canvas');
+    surface.id = 'webmcp-recording-surface';
+    surface.width = sourceCanvas.width;
+    surface.height = sourceCanvas.height;
+    surface.style.cssText = 'position:fixed;left:-10000px;top:-10000px;width:1px;height:1px;opacity:0;pointer-events:none;';
+    document.body.appendChild(surface);
+    const context = surface.getContext('2d', { alpha: false });
+    if (!context) {
+      surface.remove();
+      return sourceCanvas;
+    }
+    RecordingState.captureCanvas = surface;
+    RecordingState.captureContext = context;
+    const paint = () => {
+      if (!RecordingState.captureCanvas || !RecordingState.captureContext) return;
+      const currentCanvas = document.getElementById('game-canvas');
+      // During an acknowledged scene rebuild the game canvas is replaced. Keep
+      // the prior compositor frame until the new runtime is actually running.
+      if (window.__godotGameState === 'running' && currentCanvas?.width && currentCanvas?.height) {
+        try { context.drawImage(currentCanvas, 0, 0, surface.width, surface.height); } catch (_) {}
+      }
+      RecordingState.captureRaf = requestAnimationFrame(paint);
+    };
+    paint();
+    return surface;
+  }
+
+  function releaseRecordingSurface() {
+    if (RecordingState.captureRaf !== null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(RecordingState.captureRaf);
+    }
+    RecordingState.captureRaf = null;
+    RecordingState.captureContext = null;
+    RecordingState.captureCanvas?.remove();
+    RecordingState.captureCanvas = null;
+  }
+
   async function computeProjectContentFingerprint(filesDict) {
     try {
       const entries = Object.entries(filesDict).sort(([a], [b]) => a.localeCompare(b));
@@ -218,6 +257,32 @@
       failed: 'Failed'
     };
     return labels[phase] || phase;
+  }
+
+  function holdRuntimeFrame() {
+    if (typeof document === 'undefined') return false;
+    const canvas = document.getElementById('game-canvas');
+    if (!canvas || !canvas.width || !canvas.height || typeof canvas.toDataURL !== 'function') return false;
+    let frame;
+    try { frame = canvas.toDataURL('image/png'); } catch (_) { return false; }
+    if (!frame || !frame.startsWith('data:image/')) return false;
+    let cover = document.getElementById('webmcp-runtime-frame-hold');
+    if (!cover) {
+      cover = document.createElement('img');
+      cover.id = 'webmcp-runtime-frame-hold';
+      cover.alt = '';
+      cover.setAttribute('aria-hidden', 'true');
+      cover.style.cssText = 'position:fixed;inset:0;z-index:999998;width:100vw;height:100vh;object-fit:fill;background:#141414;pointer-events:none;';
+      document.body.appendChild(cover);
+    }
+    cover.src = frame;
+    cover.style.display = 'block';
+    return true;
+  }
+
+  function releaseRuntimeFrame() {
+    if (typeof document === 'undefined') return;
+    document.getElementById('webmcp-runtime-frame-hold')?.remove();
   }
 
   async function advancePhase(operation, phase, phaseIndex = null, phaseCount = null) {
@@ -885,6 +950,7 @@
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
+    if (typeof window !== 'undefined' && window.__godotGameState === 'running') holdRuntimeFrame();
     // A running game owns the same virtual project filesystem. Replacing the
     // editor first can race its shutdown and leave the new --path unmounted.
     if (operation) await advancePhase(operation, 'stopping_runtime');
@@ -934,6 +1000,7 @@
     DiagnosticState.engine = 'ready';
     DiagnosticState.session = 'editor-ready';
     DiagnosticHUD.render();
+    if (typeof window === 'undefined' || !window.__godotWebMcpKeepRuntimeFrame) releaseRuntimeFrame();
     return true;
   }
 
@@ -2885,6 +2952,7 @@ func _physics_process(delta):
           const previousFiles = cloneProjectFiles(activeFilesDict);
         const previousMainScene = activeMainScene;
         const restorePlaytest = typeof window !== 'undefined' && window.__godotGameState === 'running';
+        if (typeof window !== 'undefined') window.__godotWebMcpKeepRuntimeFrame = restorePlaytest;
         const stagedFiles = cloneProjectFiles(activeFilesDict);
         const changedPaths = [];
         for (const op of args.operations) {
@@ -2909,7 +2977,10 @@ func _physics_process(delta):
           await validateProjectRuntimeBoot(operation);
         } catch (error) {
           try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject, 60000, operation); } catch (_) {}
+          releaseRuntimeFrame();
           throw error;
+        } finally {
+          if (typeof window !== 'undefined') window.__godotWebMcpKeepRuntimeFrame = false;
         }
 
         await advancePhase(operation, 'persisting_commit');
@@ -2951,11 +3022,15 @@ func _physics_process(delta):
               await startGameRuntime({ visible: true, timeoutMs: 60000 });
               DiagnosticState.session = 'playtesting';
               DiagnosticHUD.render();
+              releaseRuntimeFrame();
             } catch (previewError) {
               activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Restore] ${previewError.message || String(previewError)}` });
               if (activeLogs.length > MAX_LOGS) activeLogs.shift();
               if (typeof window.showTab === 'function') window.showTab('editor');
+              releaseRuntimeFrame();
             }
+          } else {
+            releaseRuntimeFrame();
           }
           return result;
         }, 10000, { key: args.idempotency_key, fingerprint }, context);
@@ -3515,7 +3590,12 @@ func _physics_process(delta):
         const canvas = document.getElementById('game-canvas');
         if (!canvas || typeof canvas.captureStream !== 'function') throw new Error('The visible game canvas does not support stream capture. Run the game first.');
         const fps = Math.max(10, Math.min(Number(args.fps) || 30, 60));
-        const videoStream = canvas.captureStream(fps);
+        const recordingSurface = createRecordingSurface(canvas);
+        if (!recordingSurface || typeof recordingSurface.captureStream !== 'function') {
+          releaseRecordingSurface();
+          throw new Error('The browser could not create a persistent recording surface.');
+        }
+        const videoStream = recordingSurface.captureStream(fps);
         let audioDestination = null;
         let audioMaster = null;
         let stream = videoStream;
@@ -3624,6 +3704,7 @@ func _physics_process(delta):
           candidate.stop();
         })));
         for (const track of recorder.stream.getTracks()) track.stop();
+        releaseRecordingSurface();
         if (RecordingState.audioDestination && RecordingState.audioMaster) {
           try { RecordingState.audioMaster.disconnect(RecordingState.audioDestination); } catch (_) {}
         }
