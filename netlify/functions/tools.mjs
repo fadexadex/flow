@@ -277,6 +277,25 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
+    name: 'godot_send_input_sequence',
+    description: 'Schedules a bounded keyboard timeline for coordinated controls',
+    input_schema: {
+      type: 'object',
+      properties: {
+        events: {
+          type: 'array', minItems: 1, maxItems: 32,
+          items: {
+            type: 'object',
+            properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
+            required: ['at_ms', 'key', 'pressed'], additionalProperties: false
+          }
+        }
+      },
+      required: ['events'], additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_capture_viewport',
     description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
     input_schema: { type: 'object', properties: {}, additionalProperties: false },

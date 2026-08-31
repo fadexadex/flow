@@ -2649,6 +2649,52 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_send_input_sequence',
+        description: 'Schedules a bounded timeline of keyboard down/up edges in one call for chords, diagonals, jumps, dodges, and other coordinated controls',
+        input_schema: {
+          type: 'object',
+          properties: {
+            events: {
+              type: 'array', minItems: 1, maxItems: 32,
+              items: {
+                type: 'object',
+                properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
+                required: ['at_ms', 'key', 'pressed'], additionalProperties: false
+              }
+            }
+          },
+          required: ['events'], additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        if (!Array.isArray(args.events) || args.events.length < 1 || args.events.length > 32) throw new Error('An input sequence requires 1–32 events.');
+        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
+        if (!canvas) throw new Error('No Godot canvas is available to receive input.');
+        const sequenceId = `input_sequence_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const events = args.events.map((entry, index) => ({ index, at_ms: entry.at_ms, key: entry.key, pressed: entry.pressed }));
+        for (const entry of events) {
+          setTimeout(() => {
+            const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
+            window.__godotWebMcpInput = { input_id: sequenceId, event_index: entry.index, key: entry.key, pressed: entry.pressed, dispatched_at: Date.now() };
+            canvas.dispatchEvent(event);
+            document.dispatchEvent(event);
+          }, entry.at_ms);
+        }
+        return {
+          success: true,
+          sequence_id: sequenceId,
+          status: 'scheduled',
+          target: canvas.id,
+          event_count: events.length,
+          duration_ms: Math.max(...events.map(entry => entry.at_ms)),
+          input_acknowledged: false,
+          verify_with: 'godot_get_game_telemetry'
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_capture_viewport',
         description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
         input_schema: { type: 'object', properties: {}, additionalProperties: false },
@@ -3011,6 +3057,7 @@ func _physics_process(delta):
         godot_run_game: 'Launching game viewport',
         godot_stop_game: 'Stopping game session',
         godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
+        godot_send_input_sequence: `Scheduling input sequence: ${input.events?.length || 0} events`,
         godot_capture_viewport: 'Capturing live viewport',
         godot_send_pointer: `Pointer ${input.action || 'action'} at ${input.x || 0},${input.y || 0}`,
         godot_start_recording: 'Starting persistent viewport recording',
