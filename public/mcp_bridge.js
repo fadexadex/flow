@@ -1845,14 +1845,15 @@ func _physics_process(delta):
         const encoding = args.encoding || 'utf8';
         const bytes = decodeUploadChunk(args.content, encoding);
         let file = upload.files.get(filePath);
+        const expectedOffset = file?.receivedBytes || 0;
+        if (file?.complete) throw new Error(`Project upload file is already complete: res://${filePath}`);
+        if (file && file.encoding !== encoding) throw new Error(`Project upload encoding changed for res://${filePath}.`);
+        if (args.offset !== expectedOffset) throw new Error(`Project upload offset mismatch for res://${filePath}: expected ${expectedOffset}, received ${args.offset}.`);
+        if (upload.totalBytes + bytes.byteLength > PROJECT_UPLOAD_TOTAL_BYTES) throw new Error('Staged project exceeds the 25 MB authoring limit.');
         if (!file) {
           file = { encoding, chunks: [], receivedBytes: 0, complete: false };
           upload.files.set(filePath, file);
         }
-        if (file.complete) throw new Error(`Project upload file is already complete: res://${filePath}`);
-        if (file.encoding !== encoding) throw new Error(`Project upload encoding changed for res://${filePath}.`);
-        if (args.offset !== file.receivedBytes) throw new Error(`Project upload offset mismatch for res://${filePath}: expected ${file.receivedBytes}, received ${args.offset}.`);
-        if (upload.totalBytes + bytes.byteLength > PROJECT_UPLOAD_TOTAL_BYTES) throw new Error('Staged project exceeds the 25 MB authoring limit.');
         file.chunks.push(bytes);
         file.receivedBytes += bytes.byteLength;
         file.complete = args.final === true;
