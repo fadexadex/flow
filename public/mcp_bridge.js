@@ -2207,6 +2207,10 @@ func _physics_process(delta):
         let audioMaster = null;
         let stream = videoStream;
         const godotAudioContext = window.__godotAudioContext;
+        if (godotAudioContext?.state === 'suspended') {
+          try { await godotAudioContext.resume(); } catch (_) {}
+          await new Promise(resolve => setTimeout(resolve, 80));
+        }
         if (godotAudioContext?.state !== 'closed' && window.__godotAudioMasterNode && typeof MediaStream !== 'undefined') {
           audioDestination = godotAudioContext.createMediaStreamDestination();
           audioMaster = window.__godotAudioMasterNode;
@@ -2250,7 +2254,9 @@ func _physics_process(delta):
           mime_type: recorder.mimeType || mimeType || 'video/webm',
           width: canvas.width,
           height: canvas.height,
-          audio_tracks: stream.getAudioTracks().length
+          audio_tracks: stream.getAudioTracks().length,
+          audio_context_state: godotAudioContext?.state || 'unavailable',
+          audio_capture_ready: stream.getAudioTracks().length > 0 && godotAudioContext?.state === 'running'
         };
       }
     },
