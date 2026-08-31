@@ -33,7 +33,10 @@
   const inflightIdempotency = new Map();
   const managedOperations = new Map();
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
-  const RecordingState = { recorder: null, chunks: [], startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null };
+  const RecordingState = {
+    recorder: null, chunks: [], videoRecorder: null, videoChunks: [], audioRecorder: null, audioChunks: [],
+    startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null
+  };
   const activeLogs = [];
   const MAX_LOGS = 500;
   let activeFilesDict = {};
@@ -89,7 +92,7 @@
     return records;
   }
 
-  function exposeRecordingDownload(record) {
+  function exposeRecordingDownload(record, replace = true) {
     if (record.object_url) URL.revokeObjectURL(record.object_url);
     record.object_url = URL.createObjectURL(record.blob);
     let shelf = document.getElementById('webmcp-recording-shelf');
@@ -99,7 +102,7 @@
       shelf.style.cssText = 'position:fixed;left:14px;bottom:46px;z-index:999999;padding:9px 12px;border:1px solid rgba(255,200,87,.55);border-radius:8px;background:rgba(12,15,25,.94);font:600 11px/1.35 Inter,system-ui,sans-serif;color:#ffe6a2';
       document.body.appendChild(shelf);
     }
-    shelf.innerHTML = '';
+    if (replace) shelf.innerHTML = '';
     const link = document.createElement('a');
     link.href = record.object_url;
     link.download = record.filename;
@@ -2226,6 +2229,18 @@ func _physics_process(delta):
         RecordingState.audioDestination = audioDestination;
         RecordingState.audioMaster = audioMaster;
         recorder.ondataavailable = event => { if (event.data?.size) RecordingState.chunks.push(event.data); };
+        if (stream.getAudioTracks().length > 0) {
+          const videoMime = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find(type => MediaRecorder.isTypeSupported(type)) || '';
+          const audioMime = ['audio/webm;codecs=opus', 'audio/webm'].find(type => MediaRecorder.isTypeSupported(type)) || '';
+          RecordingState.videoChunks = [];
+          RecordingState.audioChunks = [];
+          RecordingState.videoRecorder = new MediaRecorder(videoStream, videoMime ? { mimeType: videoMime, videoBitsPerSecond: 5_000_000 } : undefined);
+          RecordingState.audioRecorder = new MediaRecorder(audioDestination.stream, audioMime ? { mimeType: audioMime, audioBitsPerSecond: 160_000 } : undefined);
+          RecordingState.videoRecorder.ondataavailable = event => { if (event.data?.size) RecordingState.videoChunks.push(event.data); };
+          RecordingState.audioRecorder.ondataavailable = event => { if (event.data?.size) RecordingState.audioChunks.push(event.data); };
+          RecordingState.videoRecorder.start(500);
+          RecordingState.audioRecorder.start(500);
+        }
         recorder.start(500);
         return {
           success: true,
@@ -2250,23 +2265,71 @@ func _physics_process(delta):
         const recorder = RecordingState.recorder;
         if (!recorder || recorder.state !== 'recording') throw new Error('No viewport recording is active.');
         const stoppedAt = Date.now();
-        recorder.requestData();
+        const activeRecorders = [recorder, RecordingState.videoRecorder, RecordingState.audioRecorder]
+          .filter(candidate => candidate?.state === 'recording');
+        for (const candidate of activeRecorders) candidate.requestData();
         await new Promise(resolve => setTimeout(resolve, 180));
-        await new Promise((resolve, reject) => {
-          recorder.addEventListener('stop', resolve, { once: true });
-          recorder.addEventListener('error', event => reject(event.error || new Error('Recording failed.')), { once: true });
-          recorder.stop();
-        });
+        await Promise.all(activeRecorders.map(candidate => new Promise((resolve, reject) => {
+          candidate.addEventListener('stop', resolve, { once: true });
+          candidate.addEventListener('error', event => reject(event.error || new Error('Recording failed.')), { once: true });
+          candidate.stop();
+        })));
         for (const track of recorder.stream.getTracks()) track.stop();
         if (RecordingState.audioDestination && RecordingState.audioMaster) {
           try { RecordingState.audioMaster.disconnect(RecordingState.audioDestination); } catch (_) {}
         }
         const blob = new Blob(RecordingState.chunks, { type: recorder.mimeType || 'video/webm' });
+        const videoBlob = RecordingState.videoRecorder
+          ? new Blob(RecordingState.videoChunks, { type: RecordingState.videoRecorder.mimeType || 'video/webm' })
+          : null;
+        const audioBlob = RecordingState.audioRecorder
+          ? new Blob(RecordingState.audioChunks, { type: RecordingState.audioRecorder.mimeType || 'audio/webm' })
+          : null;
         RecordingState.recorder = null;
         RecordingState.chunks = [];
+        RecordingState.videoRecorder = null;
+        RecordingState.videoChunks = [];
+        RecordingState.audioRecorder = null;
+        RecordingState.audioChunks = [];
         RecordingState.audioDestination = null;
         RecordingState.audioMaster = null;
-        if (!blob.size) throw new Error('The browser produced an empty recording. Recorder state was cleaned up; retry with a longer run or a different codec.');
+        if (!blob.size && !videoBlob?.size && !audioBlob?.size) {
+          throw new Error('The browser produced empty combined, video, and audio recordings. Recorder state was cleaned up.');
+        }
+        if (!blob.size && videoBlob?.size) {
+          const base = {
+            project_name: DiagnosticState.activeProject,
+            created_at: RecordingState.startedAt,
+            duration_ms: stoppedAt - RecordingState.startedAt,
+            width: RecordingState.canvas?.width || null,
+            height: RecordingState.canvas?.height || null
+          };
+          const videoRecord = {
+            ...base, id: `${RecordingState.id}_video`, filename: `${DiagnosticState.activeProject}-${RecordingState.startedAt}-video.webm`,
+            mime_type: videoBlob.type, blob: videoBlob
+          };
+          const splitRecords = [videoRecord];
+          if (audioBlob?.size) splitRecords.push({
+            ...base, id: `${RecordingState.id}_audio`, filename: `${DiagnosticState.activeProject}-${RecordingState.startedAt}-audio.webm`,
+            mime_type: audioBlob.type, width: null, height: null, blob: audioBlob
+          });
+          for (const splitRecord of splitRecords) await storeRecording(splitRecord);
+          splitRecords.forEach((splitRecord, index) => exposeRecordingDownload(splitRecord, index === 0));
+          return {
+            success: true,
+            status: audioBlob?.size ? 'persisted_split' : 'persisted_video_only',
+            recording_id: RecordingState.id,
+            duration_ms: base.duration_ms,
+            persistence: 'IndexedDB + visible download links',
+            muxed: false,
+            warning: audioBlob?.size
+              ? 'This browser produced an empty combined stream; synchronized video and audio artifacts were persisted separately.'
+              : 'This browser produced no combined or audio artifact; the video fallback was persisted.',
+            artifacts: splitRecords.map(splitRecord => ({
+              recording_id: splitRecord.id, filename: splitRecord.filename, size_bytes: splitRecord.blob.size, mime_type: splitRecord.mime_type
+            }))
+          };
+        }
         const record = {
           id: RecordingState.id,
           filename: `${DiagnosticState.activeProject}-${RecordingState.startedAt}.webm`,
