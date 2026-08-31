@@ -3091,6 +3091,8 @@ func _physics_process(delta):
     banner: null,
     feed: null,
     entries: [],
+    feedExpanded: true,
+    _feedCollapseTimer: null,
 
     describe(toolName, input = {}) {
       const labels = {
@@ -3144,7 +3146,23 @@ func _physics_process(delta):
       if (!this.feed) {
         this.feed = document.createElement('div');
         this.feed.id = 'webmcp-agent-action-feed';
-        this.feed.style.cssText = 'position:fixed;top:84px;right:14px;z-index:999999;width:330px;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:none;';
+        this.feed.style.cssText = 'position:fixed;right:14px;bottom:42px;z-index:999999;width:min(330px,calc(100vw - 28px));max-height:min(230px,40vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;';
+        this.feed.setAttribute('role', 'status');
+        this.feed.setAttribute('aria-live', 'polite');
+        this.feed.setAttribute('aria-label', 'WebMCP agent activity. Click to collapse or expand.');
+        this.feed.tabIndex = 0;
+        const toggleFeed = () => {
+          this.feedExpanded = !this.feedExpanded;
+          clearTimeout(this._feedCollapseTimer);
+          this.renderFeed();
+        };
+        this.feed.addEventListener('click', toggleFeed);
+        this.feed.addEventListener('keydown', event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            toggleFeed();
+          }
+        });
         this.feed.innerHTML = `<div style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div><div style="margin-top:5px;color:#789099">Waiting for a WebMCP action…</div>`;
         document.body.appendChild(this.feed);
       }
@@ -3153,11 +3171,23 @@ func _physics_process(delta):
 
     renderFeed() {
       if (!this.ensure()) return;
+      const latest = this.entries[this.entries.length - 1];
+      if (!this.feedExpanded) {
+        const color = latest?.status === 'succeeded' ? '#45e7a4' : latest?.status === 'failed' ? '#ff667f' : latest?.status === 'pending' ? '#ffc857' : '#4de8ff';
+        const status = latest ? this.escape(latest.status) : 'idle';
+        const label = latest ? this.escape(latest.label) : 'Waiting for a WebMCP action…';
+        this.feed.style.maxHeight = '34px';
+        this.feed.style.padding = '7px 10px';
+        this.feed.innerHTML = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap"><span style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent · Rev #${DiagnosticState.sceneRevision}</span><span style="color:${color};text-transform:uppercase">${status}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;color:#9bbbc1">${label}</span><span style="margin-left:auto;color:#789099">⌃</span></div>`;
+        return;
+      }
+      this.feed.style.maxHeight = 'min(230px,40vh)';
+      this.feed.style.padding = '10px';
       const rows = this.entries.slice(-5).reverse().map((entry) => {
         const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : entry.status === 'pending' ? '#ffc857' : '#4de8ff';
         return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}</span></div>`;
       }).join('');
-      this.feed.innerHTML = `<div style="margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div>${rows}`;
+      this.feed.innerHTML = `<div style="display:flex;margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase"><span>Agent activity · Rev #${DiagnosticState.sceneRevision}</span><span style="margin-left:auto;color:#789099">⌄</span></div>${rows}`;
     },
 
     escape(value) {
@@ -3181,6 +3211,8 @@ func _physics_process(delta):
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
       if (this.ensure()) {
+        this.feedExpanded = true;
+        clearTimeout(this._feedCollapseTimer);
         const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : status === 'pending' ? '…' : '✦';
         this.banner.textContent = `${icon} AI Agent · ${label}${detail ? ` · ${detail}` : ''}`;
         this.banner.style.borderColor = status === 'failed' ? '#ff667f' : status === 'succeeded' ? '#45e7a4' : '#00e5ff';
@@ -3189,6 +3221,12 @@ func _physics_process(delta):
         clearTimeout(this._hideTimer);
         this._hideTimer = setTimeout(() => { if (this.banner) this.banner.style.opacity = '0'; }, status === 'running' ? 2200 : 3200);
         this.renderFeed();
+        if (status !== 'running' && status !== 'pending') {
+          this._feedCollapseTimer = setTimeout(() => {
+            this.feedExpanded = false;
+            this.renderFeed();
+          }, 4200);
+        }
       }
       if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
         window.dispatchEvent(new CustomEvent('godot:webmcp-observation', { detail: entry }));
