@@ -2678,24 +2678,33 @@ func _physics_process(delta):
         const sequence = { id: sequenceId, status: 'scheduled', scheduled_at: Date.now(), started_at: null, completed_at: null, target: canvas.id, planned_events: events, dispatched_events: [] };
         inputSequences.set(sequenceId, sequence);
         while (inputSequences.size > 20) inputSequences.delete(inputSequences.keys().next().value);
-        const dispatchAt = (position) => {
-          const entry = events[position];
-          if (!entry) return;
-          const dispatchedAt = Date.now();
-          if (position === 0) { sequence.status = 'running'; sequence.started_at = dispatchedAt; }
-          const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
-          window.__godotWebMcpInput = { input_id: sequenceId, event_index: entry.index, key: entry.key, pressed: entry.pressed, dispatched_at: dispatchedAt };
-          canvas.dispatchEvent(event);
-          document.dispatchEvent(event);
-          sequence.dispatched_events.push({ ...entry, dispatched_at: dispatchedAt, elapsed_ms: dispatchedAt - sequence.started_at });
-          if (position === events.length - 1) {
-            sequence.status = 'completed';
-            sequence.completed_at = dispatchedAt;
-            return;
+        let frameStartedAt = null;
+        let nextEvent = 0;
+        const dispatchFrame = (frameTime) => {
+          if (frameStartedAt === null) {
+            frameStartedAt = frameTime;
+            sequence.status = 'running';
+            sequence.started_at = Date.now();
           }
-          setTimeout(() => dispatchAt(position + 1), Math.max(0, events[position + 1].at_ms - entry.at_ms));
+          const activeElapsed = frameTime - frameStartedAt;
+          while (nextEvent < events.length && events[nextEvent].at_ms <= activeElapsed) {
+            const entry = events[nextEvent];
+            const dispatchedAt = Date.now();
+            const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
+            window.__godotWebMcpInput = { input_id: sequenceId, event_index: entry.index, key: entry.key, pressed: entry.pressed, dispatched_at: dispatchedAt };
+            canvas.dispatchEvent(event);
+            document.dispatchEvent(event);
+            sequence.dispatched_events.push({ ...entry, dispatched_at: dispatchedAt, elapsed_ms: Math.round(activeElapsed) });
+            nextEvent++;
+          }
+          if (nextEvent >= events.length) {
+            sequence.status = 'completed';
+            sequence.completed_at = Date.now();
+          } else {
+            requestAnimationFrame(dispatchFrame);
+          }
         };
-        setTimeout(() => dispatchAt(0), Math.max(0, events[0].at_ms));
+        requestAnimationFrame(dispatchFrame);
         return {
           success: true,
           sequence_id: sequenceId,
