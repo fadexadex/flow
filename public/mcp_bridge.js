@@ -1923,6 +1923,8 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const fingerprint = mutationFingerprint('godot_apply_file_transaction', args);
+        const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
+        if (replay) return replay;
         if (args.expected_revision !== DiagnosticState.sceneRevision) {
           throw new Error(`Revision conflict: expected ${args.expected_revision}, current ${DiagnosticState.sceneRevision}. Inspect before editing.`);
         }
