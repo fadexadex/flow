@@ -149,6 +149,30 @@ a:active {
 	max-width: 100%;
 }
 
+/* Keep a clear escape hatch above the full-screen playtest canvas. */
+#game-return-to-editor {
+	position: fixed;
+	top: 14px;
+	right: 18px;
+	z-index: 1000002;
+	border: 1px solid rgba(77, 232, 255, .75);
+	border-radius: 999px;
+	padding: 9px 15px;
+	background: rgba(5, 12, 20, .92);
+	box-shadow: 0 0 18px rgba(0, 229, 255, .28);
+	color: #e8fdff;
+	font: 700 12px/1 Inter, system-ui, sans-serif;
+	letter-spacing: .03em;
+	cursor: pointer;
+}
+
+#game-return-to-editor:hover,
+#game-return-to-editor:focus-visible {
+	background: rgba(0, 229, 255, .18);
+	outline: 2px solid rgba(255, 200, 87, .85);
+	outline-offset: 2px;
+}
+
 /* Don't show distracting focus outlines for the main tabs' contents. */
 #tab-editor canvas:focus,
 #tab-game canvas:focus,
@@ -391,6 +415,7 @@ a:active {
 				</canvas>
 			</div>
 			<div id="tab-game" style="display: none;">
+				<button id="game-return-to-editor" type="button" onclick="leaveGamePreview()" aria-label="Return to the editor">← Back to Editor <span aria-hidden="true">(Esc)</span></button>
 				<canvas id="game-canvas" tabindex="2">
 					HTML5 canvas appears to be unsupported in the current browser.<br >
 					Please try updating or use a different browser.
@@ -558,6 +583,20 @@ function closeGame() {
 		game.requestQuit();
 	}
 }
+
+function leaveGamePreview() {
+		// Navigation is immediate; stop the hidden runtime so the editor is truly idle.
+		if (typeof window.showTab === 'function') window.showTab('editor');
+		if (typeof window.closeGame === 'function') window.closeGame();
+		window.dispatchEvent(new Event('godot-preview-left'));
+}
+
+document.addEventListener('keydown', function (event) {
+	if (event.key === 'Escape' && document.getElementById('tab-game')?.style.display !== 'none') {
+		event.preventDefault();
+		leaveGamePreview();
+	}
+}, true);
 
 function closeEditor() { // eslint-disable-line no-unused-vars
 	closeGame();

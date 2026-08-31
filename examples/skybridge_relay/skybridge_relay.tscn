@@ -1,4 +1,4 @@
-[gd_scene load_steps=13 format=3]
+[gd_scene load_steps=15 format=3]
 
 [ext_resource type="Script" path="res://skybridge_relay.gd" id="1_script"]
 
@@ -38,13 +38,13 @@ metallic = 0.55
 roughness = 0.44
 
 [sub_resource type="StandardMaterial3D" id="Rail_material"]
-albedo_color = Color(0.62, 0.22, 1, 1)
+albedo_color = Color(0.12, 0.86, 1, 1)
 emission_enabled = true
 emission = Color(0.22, 0.015, 0.8, 1)
 emission_energy_multiplier = 1.9
 
 [sub_resource type="StandardMaterial3D" id="Gate_material"]
-albedo_color = Color(1, 0.12, 0.55, 1)
+albedo_color = Color(1, 0.46, 0.08, 1)
 emission_enabled = true
 emission = Color(0.82, 0.01, 0.18, 1)
 emission_energy_multiplier = 1.45
@@ -61,7 +61,16 @@ emission_energy_multiplier = 1.1
 albedo_color = Color(0.12, 0.88, 1, 1)
 emission_enabled = true
 emission = Color(0.02, 0.48, 1, 1)
-emission_energy_multiplier = 2.6
+emission_energy_multiplier = 3.6
+
+[sub_resource type="SphereMesh" id="BlackOrb_mesh"]
+radius = 0.9
+height = 1.8
+
+[sub_resource type="StandardMaterial3D" id="BlackOrb_material"]
+albedo_color = Color(0.005, 0.005, 0.008, 1)
+metallic = 0.65
+roughness = 0.18
 
 [node name="SkybridgeRelay" type="Node3D"]
 script = ExtResource("1_script")
@@ -113,6 +122,16 @@ material_override = SubResource("Beacon_material")
 position = Vector3(-4.1, 1.0, -54)
 mesh = SubResource("Beacon_mesh")
 material_override = SubResource("Beacon_material")
+
+[node name="BlackSignalOrb" type="MeshInstance3D" parent="."]
+position = Vector3(0, 3.2, -11)
+mesh = SubResource("BlackOrb_mesh")
+material_override = SubResource("BlackOrb_material")
+
+[node name="BlackSignalOrbRight" type="MeshInstance3D" parent="."]
+position = Vector3(3.7, 2.25, -22)
+mesh = SubResource("BlackOrb_mesh")
+material_override = SubResource("BlackOrb_material")
 
 [node name="Runner" type="Node3D" parent="."]
 position = Vector3(0, 0.85, 0)

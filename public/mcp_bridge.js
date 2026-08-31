@@ -2113,14 +2113,8 @@ func _physics_process(delta):
         DiagnosticHUD.render();
         try {
           await executeRestoreOperation('editor_only', `Auto-resuming ${DiagnosticState.activeProject}`);
-          if (shouldRestorePreview()) {
-            await startGameRuntime({ visible: true, timeoutMs: 60000 });
-            DiagnosticState.session = 'playtesting';
-            DiagnosticHUD.render();
-          }
         } catch (_) {
-          // A failed preview restore falls back to the restored editor rather than leaving a blurred Game tab.
-          forgetPreviewWasRunning();
+          // A failed restore falls back to the loader/editor recovery state.
         }
       } else {
         DiagnosticState.session = 'resume_available';
@@ -4416,6 +4410,15 @@ func _physics_process(delta):
       // A deliberate close should return to the editor. A page reload, however,
       // keeps the preview intent so the host can rebuild the Game canvas.
       if (!window.__godotWebMcpPageUnloading) forgetPreviewWasRunning();
+      if (DiagnosticState.session === 'playtesting') {
+        DiagnosticState.session = 'editor-ready';
+        DiagnosticHUD.render();
+      }
+    });
+
+    window.addEventListener('godot-preview-left', () => {
+      // Leaving the preview is an explicit user choice; never auto-enter it on reload.
+      forgetPreviewWasRunning();
       if (DiagnosticState.session === 'playtesting') {
         DiagnosticState.session = 'editor-ready';
         DiagnosticHUD.render();
