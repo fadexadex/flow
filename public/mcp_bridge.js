@@ -22,7 +22,7 @@
     webmcpRegisteredCount: 0,
     webmcpLastError: null,
     webmcpSurface: 'none',
-    session: 'authoring', // 'empty' | 'authoring' | 'editor-ready' | 'playtesting' | 'stopped' | 'failed'
+    session: 'authoring', // 'empty' | 'authoring' | 'persisted' | 'editor-ready' | 'playtesting' | 'stopped' | 'failed'
     sceneRevision: 1,
     undoDepth: 0,
     activeProject: 'neon_skyrail_3d'
@@ -42,6 +42,10 @@
   let activeFilesDict = {};
   let activeMainScene = 'res://main_3d.tscn';
   let activeManagedMutationId = null;
+  let projectStateHydrated = false;
+  let persistedProjectAvailable = false;
+  let projectPersistenceError = null;
+  let projectHydrationPromise = Promise.resolve();
 
   if (typeof window !== 'undefined') {
     window.addEventListener('godot-game-telemetry', (event) => {
@@ -58,15 +62,19 @@
 
   function openRecordingDatabase() {
     return new Promise((resolve, reject) => {
-      if (!window.indexedDB) return reject(new Error('IndexedDB is unavailable; recordings cannot be persisted.'));
-      const request = window.indexedDB.open('godot-webmcp-artifacts', 1);
+      if (!window.indexedDB) return reject(new Error('IndexedDB is unavailable; artifacts cannot be persisted.'));
+      const request = window.indexedDB.open('godot-webmcp-artifacts', 2);
       request.onupgradeneeded = () => {
         if (!request.result.objectStoreNames.contains('recordings')) {
           request.result.createObjectStore('recordings', { keyPath: 'id' });
         }
+        if (!request.result.objectStoreNames.contains('projects')) {
+          request.result.createObjectStore('projects', { keyPath: 'id' });
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error || new Error('Failed to open recording database.'));
+      request.onblocked = () => reject(new Error('Artifact database upgrade is blocked by another open page.'));
     });
   }
 
@@ -91,6 +99,84 @@
     database.close();
     return records;
   }
+
+  async function persistActiveProjectState() {
+    try {
+      const database = await openRecordingDatabase();
+      const snapshot = {
+        id: 'active',
+        project_name: DiagnosticState.activeProject,
+        main_scene: activeMainScene,
+        scene_revision: DiagnosticState.sceneRevision,
+        files: cloneProjectFiles(activeFilesDict),
+        undo_stack: undoStack.map(entry => ({ ...entry, files_before: cloneProjectFiles(entry.files_before || {}), files_after: cloneProjectFiles(entry.files_after || {}) })),
+        updated_at: Date.now()
+      };
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction('projects', 'readwrite');
+        transaction.objectStore('projects').put(snapshot);
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error('Failed to persist project state.'));
+      });
+      database.close();
+      persistedProjectAvailable = Object.keys(snapshot.files).length > 0;
+      projectPersistenceError = null;
+      return true;
+    } catch (error) {
+      projectPersistenceError = error instanceof Error ? error.message : String(error);
+      activeLogs.push({ level: 'warn', time: Date.now(), msg: `[Persistence] ${projectPersistenceError}` });
+      return false;
+    }
+  }
+
+  async function hydratePersistedProjectState() {
+    try {
+      const database = await openRecordingDatabase();
+      const snapshot = await new Promise((resolve, reject) => {
+        const request = database.transaction('projects', 'readonly').objectStore('projects').get('active');
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error || new Error('Failed to hydrate project state.'));
+      });
+      database.close();
+      if (snapshot) {
+        const hydratedFiles = cloneProjectFiles(snapshot.files || {});
+        const hasFiles = Object.keys(hydratedFiles).length > 0;
+        const hydratedProject = cleanProjectName(snapshot.project_name);
+        if (!Number.isInteger(snapshot.scene_revision) || snapshot.scene_revision < 1) {
+          throw new Error('Persisted project revision is invalid.');
+        }
+        if (hasFiles) validateProjectFiles(hydratedFiles);
+        if (!Array.isArray(snapshot.undo_stack)) throw new Error('Persisted undo history is invalid.');
+        for (const entry of snapshot.undo_stack) {
+          if (!entry || typeof entry.undo_id !== 'string' || !entry.files_before || !entry.files_after) {
+            throw new Error('Persisted undo history contains an invalid transaction.');
+          }
+        }
+        DiagnosticState.activeProject = hydratedProject;
+        activeMainScene = normalizeResourcePath(snapshot.main_scene || (hasFiles ? inferMainScene(hydratedFiles) : activeMainScene));
+        DiagnosticState.sceneRevision = snapshot.scene_revision;
+        activeFilesDict = hydratedFiles;
+        undoStack.splice(0, undoStack.length, ...snapshot.undo_stack);
+        persistedProjectAvailable = hasFiles;
+        DiagnosticState.session = persistedProjectAvailable ? 'persisted' : 'empty';
+        DiagnosticState.engine = 'loading';
+        projectPersistenceError = null;
+      } else {
+        DiagnosticState.session = 'empty';
+        DiagnosticState.engine = 'loading';
+      }
+    } catch (error) {
+      projectPersistenceError = error instanceof Error ? error.message : String(error);
+      persistedProjectAvailable = false;
+      DiagnosticState.session = 'empty';
+      DiagnosticState.engine = 'loading';
+      activeLogs.push({ level: 'warn', time: Date.now(), msg: `[Persistence] ${projectPersistenceError}` });
+    } finally {
+      projectStateHydrated = true;
+    }
+  }
+
+  projectHydrationPromise = hydratePersistedProjectState();
 
   function exposeRecordingDownload(record, replace = true) {
     if (record.object_url) URL.revokeObjectURL(record.object_url);
@@ -1317,6 +1403,12 @@ func _physics_process(delta):
             undo_stack_depth: undoStack.length,
             active_operation_id: activeManagedMutationId
           },
+          persistence: {
+            hydrated: projectStateHydrated,
+            project_available: persistedProjectAvailable,
+            restore_required: DiagnosticState.session === 'persisted',
+            last_error: projectPersistenceError
+          },
           transport: {
             type: 'NativeInPageWebMCP + OptionalWSS',
             protocol: typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws',
@@ -1328,6 +1420,45 @@ func _physics_process(delta):
             screen_resolution: typeof window !== 'undefined' ? `${window.innerWidth}x${window.innerHeight}` : '1280x720'
           }
         };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_restore_project_session',
+        description: 'Restores the persisted authoritative project into a fresh Godot Editor process after a page reload without changing scene revision or undo history',
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async () => {
+        if (Object.keys(activeFilesDict).length === 0) {
+          throw new Error('No persisted project session is available to restore.');
+        }
+        if (DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
+          return {
+            success: true,
+            restored: false,
+            reason: 'already_ready',
+            active_project: DiagnosticState.activeProject,
+            main_scene: activeMainScene,
+            scene_revision: DiagnosticState.sceneRevision,
+            undo_stack_depth: undoStack.length,
+            editor_acknowledged: true
+          };
+        }
+        return runManagedMutation('godot_restore_project_session', `Restoring persisted project: ${DiagnosticState.activeProject}`, async () => {
+          await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
+          await validateProjectRuntimeBoot();
+          return {
+            success: true,
+            restored: true,
+            active_project: DiagnosticState.activeProject,
+            main_scene: activeMainScene,
+            scene_revision: DiagnosticState.sceneRevision,
+            undo_stack_depth: undoStack.length,
+            files_restored: Object.keys(activeFilesDict),
+            editor_acknowledged: true
+          };
+        });
       }
     },
     {
@@ -1424,12 +1555,14 @@ func _physics_process(delta):
           main_scene_after: activeMainScene,
           files_after: cloneProjectFiles(activeFilesDict)
         });
+        const persisted = await persistActiveProjectState();
 
         const result = {
           success: true,
           project_name: projName,
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
+          persisted,
           main_scene: 'res://main_3d.tscn',
           entities: {
             rail_length_meters: 900,
@@ -1678,6 +1811,7 @@ func _physics_process(delta):
           main_scene_after: activeMainScene,
           files_after: cloneProjectFiles(activeFilesDict)
         });
+        const persisted = await persistActiveProjectState();
 
         const result = {
           success: true,
@@ -1685,6 +1819,7 @@ func _physics_process(delta):
           template_type: projectType,
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
+          persisted,
           main_scene: mainScene,
           files_written: Object.keys(activeFilesDict),
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`
@@ -1818,11 +1953,13 @@ func _physics_process(delta):
           main_scene_after: stagedMainScene,
           files_after: cloneProjectFiles(stagedFiles)
         });
+        const persisted = await persistActiveProjectState();
         const result = {
           success: true,
           label: args.label || 'Project file transaction',
           scene_revision: DiagnosticState.sceneRevision,
           undo_id: undoId,
+          persisted,
           changed_paths: changedPaths,
           main_scene: activeMainScene,
           file_count: validation.fileCount,
@@ -1889,10 +2026,12 @@ func _physics_process(delta):
         undoStack.splice(index, 1);
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
+        const persisted = await persistActiveProjectState();
           return {
           success: true,
           undone_id: transaction.undo_id,
           scene_revision: DiagnosticState.sceneRevision,
+          persisted,
           active_project: DiagnosticState.activeProject,
           main_scene: activeMainScene,
           files_restored: Object.keys(activeFilesDict),
@@ -2446,6 +2585,7 @@ func _physics_process(delta):
     describe(toolName, input = {}) {
       const labels = {
         godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
+        godot_restore_project_session: 'Restoring persisted editor session',
         godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
         godot_inspect_project_files: 'Inspecting authoritative project files',
         godot_apply_file_transaction: `Applying file transaction: ${input.label || 'Project update'}`,
@@ -2540,6 +2680,7 @@ func _physics_process(delta):
   };
 
   async function executeObservedTool(tool, input = {}) {
+    await projectHydrationPromise;
     const observation = AgentObservationHUD.update('running', tool.definition.name, input);
     try {
       const result = await tool.handler(input);
@@ -2725,6 +2866,10 @@ func _physics_process(delta):
   function initDOM() {
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
+    projectHydrationPromise.then(() => {
+      DiagnosticHUD.render();
+      AgentObservationHUD.renderFeed();
+    });
 
     const readinessObserver = new MutationObserver(() => {
       const previousState = DiagnosticState.engine;

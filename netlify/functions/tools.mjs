@@ -6,6 +6,12 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_restore_project_session',
+    description: 'Restores the persisted authoritative project into a fresh Godot Editor process after a page reload without changing scene revision or undo history',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_get_operation_status',
     description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
     input_schema: {
