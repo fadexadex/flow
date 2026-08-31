@@ -713,7 +713,10 @@ function startEditor(zip, customArgs) {
 			game = new Engine(gameConfig);
 			showTab('game');
 			game.init().then(function () {
-				requestAnimationFrame(function () {
+				let launchStarted = false;
+				const launchGame = function () {
+					if (launchStarted || !game) return;
+					launchStarted = true;
 					const gameRun = game.start({ 'args': args, 'canvas': gameCanvas });
 					window.__godotGameState = 'running';
 					gameCanvas.focus();
@@ -726,7 +729,9 @@ function startEditor(zip, customArgs) {
 							detail: { message: error instanceof Error ? error.message : String(error) }
 						}));
 					});
-				});
+				};
+				requestAnimationFrame(launchGame);
+				setTimeout(launchGame, 250);
 			}).catch(function (error) {
 				console.error('Game initialization failed:', error);
 				resetFailedGameRuntime();
