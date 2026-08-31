@@ -23,6 +23,21 @@
     Content-Type = "application/octet-stream"
     Cache-Control = "public, max-age=31536000, immutable"
 
+[[headers]]
+  for = "/"
+  [headers.values]
+    Cache-Control = "no-store, max-age=0"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-store, max-age=0"
+
+[[headers]]
+  for = "/*.js"
+  [headers.values]
+    Cache-Control = "no-cache, must-revalidate"
+
 [[redirects]]
   from = "/api/health"
   to = "/.netlify/functions/health"
