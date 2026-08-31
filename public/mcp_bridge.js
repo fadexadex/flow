@@ -446,8 +446,8 @@
     return { ...stored.result, idempotent_replay: true };
   }
 
-  function storeIdempotentResult(key, fingerprint, result) {
-    if (key) idempotentMutations.set(key, { fingerprint, result });
+  function storeIdempotentResult(key, fingerprint, result, metadata = {}) {
+    if (key) idempotentMutations.set(key, { fingerprint, result, metadata });
   }
 
   function validateProjectFiles(files) {
@@ -1840,7 +1840,13 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const upload = projectUploads.get(args.upload_id);
-        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        if (!upload) {
+          const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
+          if (receipt?.metadata?.source_upload_id === args.upload_id) {
+            return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
+          }
+          throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        }
         const filePath = cleanProjectPath(args.path);
         const encoding = args.encoding || 'utf8';
         const bytes = decodeUploadChunk(args.content, encoding);
@@ -1893,7 +1899,7 @@ func _physics_process(delta):
         const files = assembleProjectUpload(upload);
         const createTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_create_project');
         if (!createTool) throw new Error('Custom project commit handler is unavailable.');
-        const result = await createTool.handler({ project_name: upload.projectName, template: 'custom', files, idempotency_key: args.idempotency_key });
+        const result = await createTool.handler({ project_name: upload.projectName, template: 'custom', files, idempotency_key: args.idempotency_key, _upload_id: upload.id });
         return { ...result, upload_id: upload.id, staged_total_bytes: upload.totalBytes };
       }
     },
@@ -2000,7 +2006,7 @@ func _physics_process(delta):
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`
         };
 
-          storeIdempotentResult(idempotencyKey, fingerprint, result);
+          storeIdempotentResult(idempotencyKey, fingerprint, result, { source_upload_id: args._upload_id || null });
           result.persisted = await persistActiveProjectState();
           return result;
         }, 10000, { key: idempotencyKey, fingerprint });
