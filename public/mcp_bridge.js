@@ -37,7 +37,8 @@
   const GameTelemetryState = { sequence: 0, latest: null, recent: [] };
   const RecordingState = {
     recorder: null, chunks: [], videoRecorder: null, videoChunks: [], audioRecorder: null, audioChunks: [],
-    startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null
+    startedAt: 0, id: null, canvas: null, audioDestination: null, audioMaster: null,
+    autoStopTimer: null, lastAutoStop: null
   };
   const activeLogs = [];
   const MAX_LOGS = 500;
@@ -2871,12 +2872,13 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_start_recording',
-        description: 'Starts a real MediaRecorder capture of the visible Godot game canvas; use godot_stop_recording to persist it in IndexedDB',
+        description: 'Starts a real MediaRecorder capture of the visible Godot game canvas; optionally auto-stops and persists after a bounded duration',
         input_schema: {
           type: 'object',
           properties: {
             fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 },
-            mime_type: { type: 'string', description: 'Optional MediaRecorder MIME override, for example video/webm or video/webm;codecs=vp8,opus' }
+            mime_type: { type: 'string', description: 'Optional MediaRecorder MIME override, for example video/webm or video/webm;codecs=vp8,opus' },
+            duration_ms: { type: 'integer', minimum: 500, maximum: 60000, description: 'Optional in-page auto-stop duration for precise persistence without a second Browser round trip' }
           },
           additionalProperties: false
         },
@@ -2937,6 +2939,26 @@ func _physics_process(delta):
           RecordingState.audioRecorder.start(500);
         }
         recorder.start(500);
+        const autoStopDuration = Number.isInteger(args.duration_ms) ? args.duration_ms : 0;
+        clearTimeout(RecordingState.autoStopTimer);
+        RecordingState.lastAutoStop = null;
+        if (autoStopDuration > 0) {
+          const scheduledRecordingId = RecordingState.id;
+          RecordingState.autoStopTimer = setTimeout(async () => {
+            try {
+              const stopTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_stop_recording');
+              if (!stopTool) throw new Error('Recording stop handler is unavailable.');
+              const result = await stopTool.handler();
+              RecordingState.lastAutoStop = { recording_id: scheduledRecordingId, status: 'succeeded', completed_at: Date.now(), result };
+              activeLogs.push({ level: 'info', time: Date.now(), msg: `[Recording] auto-stop succeeded: ${scheduledRecordingId}` });
+              if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+            } catch (error) {
+              RecordingState.lastAutoStop = { recording_id: scheduledRecordingId, status: 'failed', completed_at: Date.now(), error: error instanceof Error ? error.message : String(error) };
+              activeLogs.push({ level: 'error', time: Date.now(), msg: `[Recording] auto-stop failed: ${scheduledRecordingId} — ${RecordingState.lastAutoStop.error}` });
+              if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+            }
+          }, autoStopDuration);
+        }
         return {
           success: true,
           status: 'recording',
@@ -2945,6 +2967,9 @@ func _physics_process(delta):
           mime_type: recorder.mimeType || mimeType || 'video/webm',
           width: canvas.width,
           height: canvas.height,
+          duration_ms: autoStopDuration || null,
+          auto_stop_scheduled: autoStopDuration > 0,
+          poll_with: autoStopDuration > 0 ? 'godot_list_recordings' : null,
           audio_tracks: stream.getAudioTracks().length,
           audio_context_state: godotAudioContext?.state || 'unavailable',
           audio_capture_ready: stream.getAudioTracks().length > 0 && godotAudioContext?.state === 'running'
@@ -2959,6 +2984,8 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async () => {
+        clearTimeout(RecordingState.autoStopTimer);
+        RecordingState.autoStopTimer = null;
         const recorder = RecordingState.recorder;
         if (!recorder || recorder.state !== 'recording') throw new Error('No viewport recording is active.');
         const stoppedAt = Date.now();
@@ -3066,6 +3093,7 @@ func _physics_process(delta):
         if (records[0]) exposeRecordingDownload(records[0]);
         return {
           count: records.length,
+          last_auto_stop: RecordingState.lastAutoStop,
           recordings: records.map(record => ({
             recording_id: record.id,
             filename: record.filename,

@@ -324,12 +324,13 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_start_recording',
-    description: 'Starts a real MediaRecorder capture of the visible Godot game canvas',
+    description: 'Starts a real MediaRecorder capture of the visible Godot game canvas with optional in-page auto-stop persistence',
     input_schema: {
       type: 'object',
       properties: {
         fps: { type: 'integer', minimum: 10, maximum: 60, default: 30 },
-        mime_type: { type: 'string' }
+        mime_type: { type: 'string' },
+        duration_ms: { type: 'integer', minimum: 500, maximum: 60000 }
       },
       additionalProperties: false
     },
