@@ -271,7 +271,7 @@ export const MCP_TOOL_CATALOG = [
     description: 'Dispatches a keyboard event and reports subsequent project telemetry without claiming unverified gameplay acknowledgement',
     input_schema: {
       type: 'object',
-      properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, await_telemetry: { type: 'boolean', default: true } },
+      properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true } },
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: false }

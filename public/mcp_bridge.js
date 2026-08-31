@@ -2604,12 +2604,14 @@ func _physics_process(delta):
       definition: {
         name: 'godot_send_input',
         description: 'Dispatches a keyboard event to the game canvas and reports any subsequent project-owned telemetry without claiming unverified gameplay acknowledgement',
-        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, await_telemetry: { type: 'boolean', default: true } }, additionalProperties: false },
+        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
         const key = args.key || 'Space';
         const pressed = args.pressed !== false;
+        const durationMs = Number.isInteger(args.duration_ms) ? args.duration_ms : 0;
+        if (durationMs > 0 && !pressed) throw new Error('duration_ms is only valid for a key press pulse.');
         const before = GameTelemetryState.latest;
         const inputId = `input_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
@@ -2618,7 +2620,14 @@ func _physics_process(delta):
         const event = new KeyboardEvent(pressed ? 'keydown' : 'keyup', { key, code: key, bubbles: true });
         canvas.dispatchEvent(event);
         document.dispatchEvent(event);
-        if (args.await_telemetry !== false) {
+        if (durationMs > 0) {
+          setTimeout(() => {
+            const release = new KeyboardEvent('keyup', { key, code: key, bubbles: true });
+            window.__godotWebMcpInput = { input_id: inputId, key, pressed: false, dispatched_at: Date.now(), scheduled_release: true };
+            canvas.dispatchEvent(release);
+            document.dispatchEvent(release);
+          }, durationMs);
+        } else if (args.await_telemetry !== false) {
           await waitFor(() => GameTelemetryState.latest?.sequence > (before?.sequence || 0), 900, 50);
         }
         const after = GameTelemetryState.latest;
@@ -2628,6 +2637,8 @@ func _physics_process(delta):
           input_id: inputId,
           dispatched_key: key,
           pressed,
+          duration_ms: durationMs || null,
+          release_scheduled: durationMs > 0,
           target: canvas.id,
           input_acknowledged: inputAcknowledged,
           telemetry_observed_after_dispatch: Boolean(after && after.sequence > (before?.sequence || 0)),
