@@ -2696,7 +2696,9 @@ func _physics_process(delta):
             sequence.started_at = Date.now();
           }
           const activeElapsed = frameTime - frameStartedAt;
-          while (nextEvent < events.length && events[nextEvent].at_ms <= activeElapsed) {
+          if (nextEvent < events.length && events[nextEvent].at_ms <= activeElapsed) {
+            const timestampGroup = events[nextEvent].at_ms;
+            while (nextEvent < events.length && events[nextEvent].at_ms === timestampGroup) {
             const entry = events[nextEvent];
             const dispatchedAt = Date.now();
             const event = new KeyboardEvent(entry.pressed ? 'keydown' : 'keyup', { key: entry.key, code: entry.key, bubbles: true });
@@ -2705,6 +2707,7 @@ func _physics_process(delta):
             document.dispatchEvent(event);
             sequence.dispatched_events.push({ ...entry, dispatched_at: dispatchedAt, elapsed_ms: Math.round(activeElapsed) });
             nextEvent++;
+            }
           }
           if (nextEvent >= events.length) {
             sequence.status = 'completed';
