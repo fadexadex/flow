@@ -392,6 +392,88 @@ export const MCP_TOOL_CATALOG = [
     description: 'Retrieves engine logs and stdout telemetry',
     input_schema: { type: 'object', properties: { limit: { type: 'number', default: 50 } }, additionalProperties: false },
     annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_node_spawn',
+    description: 'Instantly spawns and attaches a 3D node with coordinates [X,Y,Z], transform, and material directly into the live 3D scene in <16ms without reloading the engine',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Unique name of the 3D node' },
+        parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+        mesh_type: { type: 'string', enum: ['box', 'cylinder', 'sphere', 'torus', 'prism', 'capsule', 'plane'], default: 'box' },
+        size: { type: 'array', items: { type: 'number' }, description: 'Vector3 dimensions [x, y, z] for box/prism' },
+        radius: { type: 'number', description: 'Radius for sphere/cylinder/capsule' },
+        height: { type: 'number', description: 'Height for cylinder/capsule/prism' },
+        inner_radius: { type: 'number', description: 'Inner radius for torus' },
+        outer_radius: { type: 'number', description: 'Outer radius for torus' },
+        position: { type: 'array', items: { type: 'number' }, description: '3D position coordinates [X, Y, Z]' },
+        rotation: { type: 'array', items: { type: 'number' }, description: '3D rotation in degrees [Pitch, Yaw, Roll]' },
+        scale: { type: 'array', items: { type: 'number' }, description: '3D scale factors [sx, sy, sz]' },
+        material: {
+          type: 'object',
+          properties: {
+            albedo_color: { type: 'string', description: 'Hex color (e.g. #00e5ff) or rgba string' },
+            metallic: { type: 'number', minimum: 0, maximum: 1 },
+            roughness: { type: 'number', minimum: 0, maximum: 1 },
+            emission: { type: 'string', description: 'Hex emissive color' },
+            emission_energy: { type: 'number', description: 'Emissive energy multiplier' }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_transform',
+    description: 'Instantly translates, rotates, or scales any 3D node in the live editor scene in real-time (<16ms) without reloading',
+    input_schema: {
+      type: 'object',
+      properties: {
+        node_path: { type: 'string', description: 'Path or name of the node in the scene tree' },
+        position: { type: 'array', items: { type: 'number' }, description: 'New position coordinates [X, Y, Z]' },
+        rotation: { type: 'array', items: { type: 'number' }, description: 'New rotation angles in degrees [Pitch, Yaw, Roll]' },
+        scale: { type: 'array', items: { type: 'number' }, description: 'New scale factors [sx, sy, sz]' },
+        relative: { type: 'boolean', default: false, description: 'If true, offsets existing transform instead of setting absolute values' }
+      },
+      required: ['node_path'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_material',
+    description: 'Instantly updates material colors, metallic, roughness, and emissive properties of a 3D node in real-time (<16ms)',
+    input_schema: {
+      type: 'object',
+      properties: {
+        node_path: { type: 'string', description: 'Path or name of the node' },
+        albedo_color: { type: 'string', description: 'Albedo color hex or rgb' },
+        metallic: { type: 'number', minimum: 0, maximum: 1 },
+        roughness: { type: 'number', minimum: 0, maximum: 1 },
+        emission: { type: 'string', description: 'Emission color hex' },
+        emission_energy: { type: 'number', description: 'Emission energy multiplier' }
+      },
+      required: ['node_path'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_delete',
+    description: 'Instantly deletes a 3D node from the live scene tree in real-time (<16ms) without reloading',
+    input_schema: {
+      type: 'object',
+      properties: {
+        node_path: { type: 'string', description: 'Path or name of the node to remove' }
+      },
+      required: ['node_path'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
   }
 ];
 
