@@ -673,8 +673,21 @@ function startEditor(zip, customArgs) {
 			setGameTabEnabled(false);
 			showTab('editor');
 			game = null;
+			window.__godotGameState = 'stopped';
 			window.dispatchEvent(new Event('godot-game-stopped'));
 		},
+	};
+	const resetFailedGameRuntime = function () {
+		try {
+			if (game) game.requestQuit();
+		} catch (_) {
+			// Initialization failures may not have a quit-capable engine yet.
+		}
+		gameCanvas = replaceCanvas(gameCanvas);
+		setGameTabEnabled(false);
+		showTab('editor');
+		game = null;
+		window.__godotGameState = 'failed';
 	};
 
 	let OnEditorExit = function () {
@@ -696,16 +709,19 @@ function startEditor(zip, customArgs) {
 				return;
 			}
 			setGameTabEnabled(true);
+			window.__godotGameState = 'initializing';
 			game = new Engine(gameConfig);
 			showTab('game');
 			game.init().then(function () {
 				requestAnimationFrame(function () {
 					const gameRun = game.start({ 'args': args, 'canvas': gameCanvas });
+					window.__godotGameState = 'running';
 					gameCanvas.focus();
 					window.dispatchEvent(new Event('godot-game-launched'));
 					gameRun.then(function () {
 					}).catch(function (error) {
 						console.error('Game start failed:', error);
+						resetFailedGameRuntime();
 						window.dispatchEvent(new CustomEvent('godot-game-failed', {
 							detail: { message: error instanceof Error ? error.message : String(error) }
 						}));
@@ -713,6 +729,7 @@ function startEditor(zip, customArgs) {
 				});
 			}).catch(function (error) {
 				console.error('Game initialization failed:', error);
+				resetFailedGameRuntime();
 				window.dispatchEvent(new CustomEvent('godot-game-failed', {
 					detail: { message: error instanceof Error ? error.message : String(error) }
 				}));

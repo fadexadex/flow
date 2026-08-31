@@ -755,7 +755,7 @@
     const onStopped = () => { stoppedEventObserved = true; };
     window.addEventListener('godot-game-stopped', onStopped, { once: true });
     window.closeGame();
-    const stopped = await waitFor(() => stoppedEventObserved || closeGameButton.disabled, timeoutMs);
+    const stopped = await waitFor(() => stoppedEventObserved || closeGameButton.disabled || ['stopped', 'failed'].includes(window.__godotGameState), timeoutMs);
     window.removeEventListener('godot-game-stopped', onStopped);
     if (!stopped) throw new Error(`Godot did not confirm the game stopped within ${Math.round(timeoutMs / 1000)} seconds.`);
     const controlsStopped = closeGameButton.disabled || await waitFor(() => closeGameButton.disabled, 2000);
@@ -778,7 +778,7 @@
       if (failureMessage || launchedEventObserved) return true;
       const gameTab = document.getElementById('btn-tab-game');
       const runtimeTelemetry = activeLogs.some(entry => entry.time >= startedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
-      return Boolean(gameTab && !gameTab.disabled && runtimeTelemetry);
+      return Boolean(gameTab && !gameTab.disabled && runtimeTelemetry && window.__godotGameState === 'running');
     }, timeoutMs);
     window.removeEventListener('godot-game-launched', onLaunched);
     window.removeEventListener('godot-game-failed', onFailed);
@@ -810,8 +810,8 @@
   async function validateProjectRuntimeBoot() {
     try {
       await startGameRuntime({ visible: false, timeoutMs: 60000 });
+      await stopGameRuntime(15000);
     } finally {
-      try { await stopGameRuntime(10000); } catch (_) {}
       if (typeof window.showTab === 'function') window.showTab('editor');
     }
     return true;
