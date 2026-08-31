@@ -59,6 +59,7 @@
   };
   const activeLogs = [];
   const MAX_LOGS = 500;
+  const PREVIEW_RESTORE_KEY = 'godot-webmcp-preview-running';
   let activeFilesDict = {};
   let activeMainScene = 'res://main_3d.tscn';
   let activeManagedMutationId = null;
@@ -68,6 +69,27 @@
   let hydratedSnapshot = null;
   let projectHydrationPromise = Promise.resolve();
   let nativeRegistrationPromise = Promise.resolve();
+
+  function rememberPreviewWasRunning() {
+    try {
+      // This survives a browser-level reload as well as Godot rebuilding its canvas.
+      window.localStorage?.setItem(PREVIEW_RESTORE_KEY, '1');
+    } catch (_) {}
+  }
+
+  function forgetPreviewWasRunning() {
+    try {
+      window.localStorage?.removeItem(PREVIEW_RESTORE_KEY);
+    } catch (_) {}
+  }
+
+  function shouldRestorePreview() {
+    try {
+      return window.localStorage?.getItem(PREVIEW_RESTORE_KEY) === '1';
+    } catch (_) {
+      return false;
+    }
+  }
 
   if (typeof window !== 'undefined') {
     window.addEventListener('godot-game-telemetry', (event) => {
@@ -205,6 +227,17 @@
     if (phaseCount !== null) operation.phaseCount = phaseCount;
     operation.sequence += 1;
     operation.lastProgressAt = Date.now();
+    const elapsedMs = operation.lastProgressAt - operation.startedAt;
+    const previousEvent = operation.timeline.at(-1);
+    if (!previousEvent || previousEvent.phase !== phase) {
+      operation.timeline.push({
+        phase,
+        label: phaseLabel(phase),
+        sequence: operation.sequence,
+        elapsed_ms: elapsedMs,
+        at: operation.lastProgressAt
+      });
+    }
 
     for (const waiter of operation.waiters) {
       waiter();
@@ -215,7 +248,12 @@
       const elapsed = ((Date.now() - operation.startedAt) / 1000).toFixed(1);
       const detail = `${phaseLabel(phase)} · ${elapsed} s`;
       for (const obsId of operation.observationIds) {
-        AgentObservationHUD.update('running', operation.tool, {}, detail, obsId);
+        AgentObservationHUD.update('running', operation.tool, {}, detail, obsId, {
+          operation_id: operation.id,
+          phase: operation.phase,
+          sequence: operation.sequence,
+          timeline: operation.timeline
+        });
       }
     }
 
@@ -411,6 +449,7 @@
       status: operation.status,
       phase: operation.phase,
       sequence: operation.sequence,
+      timeline: operation.timeline.map(event => ({ ...event })),
       terminal: operation.terminal,
       last_progress_at: operation.lastProgressAt,
       started_at: operation.startedAt,
@@ -458,6 +497,7 @@
       phaseIndex: 0,
       phaseCount: 7,
       sequence: 0,
+      timeline: [{ phase: 'accepted', label: phaseLabel('accepted'), sequence: 0, elapsed_ms: 0, at: Date.now() }],
       lastProgressAt: Date.now(),
       terminal: false,
       startedAt: Date.now(),
@@ -491,6 +531,13 @@
         operation.phase = operation.status === 'succeeded' ? 'ready' : 'failed';
         operation.sequence += 1;
         operation.lastProgressAt = Date.now();
+        operation.timeline.push({
+          phase: operation.phase,
+          label: phaseLabel(operation.phase),
+          sequence: operation.sequence,
+          elapsed_ms: operation.lastProgressAt - operation.startedAt,
+          at: operation.lastProgressAt
+        });
 
         if (activeManagedMutationId === operation.id) activeManagedMutationId = null;
         if (idempotency?.key && inflightIdempotency.get(idempotency.key)?.operationId === operation.id) {
@@ -507,7 +554,13 @@
             ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
             : operation.error;
           for (const observationId of operation.observationIds) {
-            AgentObservationHUD.update(operation.status, operation.tool, {}, detail, observationId);
+            AgentObservationHUD.update(operation.status, operation.tool, {}, detail, observationId, {
+              operation_id: operation.id,
+              phase: operation.phase,
+              sequence: operation.sequence,
+              terminal: true,
+              timeline: operation.timeline
+            });
           }
         }
       }
@@ -1004,6 +1057,7 @@
     const gamePanel = document.getElementById('tab-game');
     const gameVisible = Boolean(gamePanel && gamePanel.style.display !== 'none');
     if (visible && !gameVisible) throw new Error('Game runtime started, but the Game viewport could not be made visible.');
+    if (visible) rememberPreviewWasRunning();
     return { gameReady: true, gameVisible: visible ? gameVisible : false, startedAt };
   }
 
@@ -2059,8 +2113,14 @@ func _physics_process(delta):
         DiagnosticHUD.render();
         try {
           await executeRestoreOperation('editor_only', `Auto-resuming ${DiagnosticState.activeProject}`);
+          if (shouldRestorePreview()) {
+            await startGameRuntime({ visible: true, timeoutMs: 60000 });
+            DiagnosticState.session = 'playtesting';
+            DiagnosticHUD.render();
+          }
         } catch (_) {
-          // Failure handled in executeRestoreOperation
+          // A failed preview restore falls back to the restored editor rather than leaving a blurred Game tab.
+          forgetPreviewWasRunning();
         }
       } else {
         DiagnosticState.session = 'resume_available';
@@ -2923,7 +2983,7 @@ func _physics_process(delta):
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
-      handler: async (args = {}) => {
+      handler: async (args = {}, context = {}) => {
         const fingerprint = mutationFingerprint('godot_apply_text_patch', args);
         const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
         if (replay) return replay;
@@ -2955,7 +3015,7 @@ func _physics_process(delta):
           operations: [...stagedText.entries()].map(([path, content]) => ({ kind: 'write', path, content })),
           idempotency_key: args.idempotency_key,
           _mutation_fingerprint: fingerprint
-        });
+        }, context);
         return { ...result, patch_summary: patchSummary };
       }
     },
@@ -3181,6 +3241,7 @@ func _physics_process(delta):
       },
       handler: async () => {
         const wasRunning = await stopGameRuntime(10000);
+        forgetPreviewWasRunning();
         if (typeof window.showTab === 'function') window.showTab('editor');
         else document.getElementById('btn-tab-editor')?.click();
         DiagnosticState.session = 'editor-ready';
@@ -3714,6 +3775,7 @@ func _physics_process(delta):
     entries: [],
     userExpandedPreference: typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-feed-expanded') !== 'false' : true,
     _feedCollapseTimer: null,
+    keepExpandedUntil: 0,
 
     describe(toolName, input = {}) {
       const labels = {
@@ -3769,13 +3831,14 @@ func _physics_process(delta):
         this.feed = document.createElement('div');
         this.feed.id = 'webmcp-agent-action-feed';
         const feedBottom = document.getElementById('webmcp-recording-shelf') ? '92px' : '42px';
-        this.feed.style.cssText = `position:fixed;right:14px;bottom:${feedBottom};z-index:999999;width:min(330px,calc(100vw - 28px));max-height:min(230px,40vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;`;
+        this.feed.style.cssText = `position:fixed;right:14px;bottom:${feedBottom};z-index:999999;width:min(360px,calc(100vw - 28px));max-height:min(270px,44vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;`;
         this.feed.setAttribute('role', 'status');
         this.feed.setAttribute('aria-live', 'polite');
         this.feed.setAttribute('aria-label', 'WebMCP agent activity. Click to collapse or expand.');
         this.feed.tabIndex = 0;
         const toggleFeed = () => {
           this.userExpandedPreference = !this.userExpandedPreference;
+          this.keepExpandedUntil = 0;
           if (typeof localStorage !== 'undefined') {
             localStorage.setItem('godot-webmcp-feed-expanded', this.userExpandedPreference ? 'true' : 'false');
           }
@@ -3799,7 +3862,7 @@ func _physics_process(delta):
     renderFeed() {
       if (!this.ensure()) return;
       const isOperationActive = activeManagedMutationId !== null || [...managedOperations.values()].some(op => op.status === 'running');
-      const isExpanded = this.userExpandedPreference || isOperationActive;
+      const isExpanded = this.userExpandedPreference || isOperationActive || Date.now() < this.keepExpandedUntil;
       const latest = this.entries[this.entries.length - 1];
 
       if (!isExpanded) {
@@ -3812,12 +3875,15 @@ func _physics_process(delta):
         return;
       }
 
-      this.feed.style.maxHeight = 'min(230px,40vh)';
+      this.feed.style.maxHeight = 'min(270px,44vh)';
       this.feed.style.padding = '10px';
-      const rows = this.entries.slice(-6).reverse().map((entry) => {
+      const rows = this.entries.slice(-4).reverse().map((entry) => {
         const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : entry.status === 'pending' ? '#ffc857' : '#4de8ff';
         const detailText = entry.detail ? ` (${this.escape(entry.detail)})` : '';
-        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}${detailText}</span></div>`;
+        const timeline = Array.isArray(entry.timeline) && entry.timeline.length > 0
+          ? `<div style="display:grid;gap:2px;margin:6px 0 1px;padding:5px 7px;border-left:1px solid rgba(77,232,255,.45);background:rgba(0,229,255,.035);color:#91b8bf">${entry.timeline.slice(-7).map(event => `<div><span style="color:${event.phase === entry.phase ? '#fff0a6' : '#4de8ff'}">${event.phase === entry.phase ? '●' : '·'}</span> ${this.escape(event.label)} <span style="color:#627c84">${(event.elapsed_ms / 1000).toFixed(1)}s</span></div>`).join('')}</div>`
+          : '';
+        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}${detailText}${timeline}</span></div>`;
       }).join('');
       this.feed.innerHTML = `<div style="display:flex;margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase"><span>Agent activity · Rev #${DiagnosticState.sceneRevision}</span><span style="margin-left:auto;color:#789099">⌄</span></div>${rows}`;
     },
@@ -3839,6 +3905,7 @@ func _physics_process(delta):
         if (extra.operation_id) entry.operationId = extra.operation_id;
         if (extra.phase) entry.phase = extra.phase;
         if (extra.sequence) entry.sequence = extra.sequence;
+        if (Array.isArray(extra.timeline)) entry.timeline = extra.timeline.map(event => ({ ...event }));
         if (typeof extra.terminal === 'boolean') entry.terminal = extra.terminal;
       } else {
         entry = {
@@ -3847,6 +3914,7 @@ func _physics_process(delta):
           phase: extra.phase || null,
           sequence: extra.sequence || 0,
           terminal: extra.terminal || false,
+          timeline: Array.isArray(extra.timeline) ? extra.timeline.map(event => ({ ...event })) : [],
           status,
           toolName,
           label,
@@ -3859,6 +3927,9 @@ func _physics_process(delta):
       }
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+      if (Array.isArray(entry.timeline) && entry.timeline.length > 0) {
+        this.keepExpandedUntil = now + 9000;
+      }
       if (this.ensure()) {
         clearTimeout(this._feedCollapseTimer);
         const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : status === 'pending' ? '…' : '✦';
@@ -3873,7 +3944,7 @@ func _physics_process(delta):
         if (!isAnyActive && status !== 'running' && status !== 'pending' && !this.userExpandedPreference) {
           this._feedCollapseTimer = setTimeout(() => {
             this.renderFeed();
-          }, 4200);
+          }, 9200);
         }
       }
       const observationDetail = {
@@ -4336,6 +4407,20 @@ func _physics_process(delta):
     });
 
     initWebSocketBridge();
+
+    window.addEventListener('beforeunload', () => {
+      window.__godotWebMcpPageUnloading = true;
+    });
+
+    window.addEventListener('godot-game-stopped', () => {
+      // A deliberate close should return to the editor. A page reload, however,
+      // keeps the preview intent so the host can rebuild the Game canvas.
+      if (!window.__godotWebMcpPageUnloading) forgetPreviewWasRunning();
+      if (DiagnosticState.session === 'playtesting') {
+        DiagnosticState.session = 'editor-ready';
+        DiagnosticHUD.render();
+      }
+    });
 
     const readinessObserver = new MutationObserver(() => {
       const previousState = DiagnosticState.engine;
