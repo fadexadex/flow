@@ -235,14 +235,24 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_select_node_live',
-    description: 'Requests native Godot Editor node selection and fails explicitly when no acknowledged editor command channel is installed',
-    input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, additionalProperties: false },
+    description: 'Selects a node in the live Godot Editor scene dock through the WebMCP editor command channel; fails explicitly when the channel is unavailable',
+    input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, required: ['node_path'], additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
     name: 'godot_transform_node_live',
-    description: 'Requests a native Godot node transform and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { node_path: { type: 'string' }, translation: { type: 'array' } }, additionalProperties: false },
+    description: 'Transforms a node in the live Godot Editor through the editor command channel and its UndoRedo stack; viewport-only, use godot_node_transform to persist to source',
+    input_schema: {
+      type: 'object',
+      properties: {
+        node_path: { type: 'string' },
+        translation: { type: 'array', items: { type: 'number' }, description: 'Absolute position [X, Y, Z]' },
+        rotation: { type: 'array', items: { type: 'number' }, description: 'Rotation in degrees [Pitch, Yaw, Roll]' },
+        scale: { type: 'array', items: { type: 'number' } },
+        relative: { type: 'boolean', default: false }
+      },
+      required: ['node_path'], additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -265,9 +275,9 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_inspect_property_live',
-    description: 'Requests a native Inspector property read and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { property: { type: 'string' }, value: {} }, additionalProperties: false },
-    annotations: { readOnlyHint: false, untrustedContentHint: false }
+    description: 'Reads a live Inspector property from the edited scene through the editor command channel; omit property to list the editable property names',
+    input_schema: { type: 'object', properties: { node_path: { type: 'string' }, property: { type: 'string' } }, required: ['node_path'], additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
     name: 'godot_generate_audio_fx',
@@ -283,8 +293,8 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_open_scene',
-    description: 'Requests a native scene-open operation and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, additionalProperties: false },
+    description: 'Opens a res:// scene in the live Godot Editor through the editor command channel; changes the edited scene only, not project.godot run/main_scene',
+    input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, required: ['scene_path'], additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -310,7 +320,7 @@ export const MCP_TOOL_CATALOG = [
     description: 'Dispatches a keyboard event and reports subsequent project telemetry without claiming unverified gameplay acknowledgement',
     input_schema: {
       type: 'object',
-      properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true } },
+      properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } },
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
@@ -328,7 +338,8 @@ export const MCP_TOOL_CATALOG = [
             properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
             required: ['at_ms', 'key', 'pressed'], additionalProperties: false
           }
-        }
+        },
+        target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." }
       },
       required: ['events'], additionalProperties: false
     },
@@ -342,8 +353,8 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_capture_viewport',
-    description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
-    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    description: 'Captures the pixel buffer of the editor viewport or the running playtest canvas as a base64 PNG data URL',
+    input_schema: { type: 'object', properties: { target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } }, additionalProperties: false },
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
@@ -355,7 +366,8 @@ export const MCP_TOOL_CATALOG = [
         action: { type: 'string', enum: ['move', 'down', 'up', 'click', 'wheel'] },
         x: { type: 'number', minimum: 0 }, y: { type: 'number', minimum: 0 },
         button: { type: 'string', enum: ['left', 'middle', 'right'], default: 'left' },
-        delta_y: { type: 'number', default: 0 }
+        delta_y: { type: 'number', default: 0 },
+        target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." }
       },
       required: ['action', 'x', 'y'], additionalProperties: false
     },
@@ -394,8 +406,28 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_camera_focus',
+    description: "Transient viewport-only framing: selects a node and dispatches Godot's own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node's projected screen position. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload.",
+    input_schema: {
+      type: 'object',
+      properties: { node_path: { type: 'string', description: 'Node name or scene-relative path to frame' } },
+      required: ['node_path'], additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_camera_follow',
+    description: 'Enables or disables automatic camera follow for this browser session. A geometry change queues exactly one coalesced framing move; material-only changes never move the camera.',
+    input_schema: {
+      type: 'object',
+      properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_node_spawn',
-    description: 'Instantly spawns and attaches a 3D node with coordinates [X,Y,Z], transform, and material directly into the live 3D scene in <16ms without reloading the engine',
+    description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
     input_schema: {
       type: 'object',
       properties: {
@@ -429,7 +461,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_node_transform',
-    description: 'Instantly translates, rotates, or scales any 3D node in the live editor scene in real-time (<16ms) without reloading',
+    description: 'Translates, rotates, or scales a 3D node in the live editor scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart.',
     input_schema: {
       type: 'object',
       properties: {
@@ -446,7 +478,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_node_material',
-    description: 'Instantly updates material colors, metallic, roughness, and emissive properties of a 3D node in real-time (<16ms)',
+    description: 'Updates the albedo, metallic, roughness, and emissive properties of a 3D node material. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Material changes never move the camera.',
     input_schema: {
       type: 'object',
       properties: {
@@ -464,7 +496,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_node_delete',
-    description: 'Instantly deletes a 3D node from the live scene tree in real-time (<16ms) without reloading',
+    description: 'Removes a 3D node from the live scene tree. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart.',
     input_schema: {
       type: 'object',
       properties: {

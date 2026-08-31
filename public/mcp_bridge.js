@@ -168,7 +168,7 @@
     RecordingState.captureContext = context;
     const paint = () => {
       if (!RecordingState.captureCanvas || !RecordingState.captureContext) return;
-      const currentCanvas = (window.__godotGameState === 'running' ? document.getElementById('game-canvas') : null) || document.getElementById('editor-canvas') || document.getElementById('game-canvas');
+      const currentCanvas = resolveGodotCanvas('auto')?.canvas;
       if (currentCanvas?.width && currentCanvas?.height) {
         try { context.drawImage(currentCanvas, 0, 0, surface.width, surface.height); } catch (_) {}
       }
@@ -240,6 +240,34 @@
     });
   }
 
+  // Godot owns two canvases. `#game-canvas` is a static element in index.html and
+  // therefore ALWAYS exists, so `getElementById('game-canvas') || getElementById('editor-canvas')`
+  // can never reach the editor. Route by the tab the host is actually showing instead.
+  function activeGodotViewport() {
+    if (typeof document === 'undefined') return 'editor';
+    const gameTab = document.getElementById('tab-game');
+    const gameVisible = Boolean(gameTab) && gameTab.style.display === 'block';
+    if (gameVisible && window.__godotGameState === 'running') return 'game';
+    return 'editor';
+  }
+
+  // Never cache the element: `replaceCanvas` in index.html destroys and recreates
+  // both canvases on every engine exit.
+  function resolveGodotCanvas(target = 'auto') {
+    if (typeof document === 'undefined') return null;
+    const wanted = target === 'auto' || !target ? activeGodotViewport() : target;
+    const canvases = {
+      editor: document.getElementById('editor-canvas'),
+      game: document.getElementById('game-canvas')
+    };
+    const primary = canvases[wanted];
+    if (primary && primary.width && primary.height) return { canvas: primary, viewport: wanted, requested: wanted };
+    if (primary) return { canvas: primary, viewport: wanted, requested: wanted };
+    const other = wanted === 'game' ? 'editor' : 'game';
+    if (canvases[other]) return { canvas: canvases[other], viewport: other, requested: wanted };
+    return null;
+  }
+
   function phaseLabel(phase) {
     const labels = {
       accepted: 'Accepted',
@@ -259,7 +287,7 @@
 
   function holdRuntimeFrame() {
     if (typeof document === 'undefined') return false;
-    const canvas = (window.__godotGameState === 'running' ? document.getElementById('game-canvas') : null) || document.getElementById('editor-canvas') || document.getElementById('game-canvas');
+    const canvas = resolveGodotCanvas('auto')?.canvas;
     if (!canvas || !canvas.width || !canvas.height || typeof canvas.toDataURL !== 'function') return false;
     let frame;
     try { frame = canvas.toDataURL('image/png'); } catch (_) { return false; }
@@ -270,7 +298,7 @@
       cover.id = 'webmcp-runtime-frame-hold';
       cover.alt = '';
       cover.setAttribute('aria-hidden', 'true');
-      cover.style.cssText = 'position:fixed;inset:0;z-index:999998;width:100vw;height:100vh;object-fit:fill;background:#141414;pointer-events:none;';
+      cover.style.cssText = 'position:fixed;inset:0;z-index:var(--gd-z-frame-hold, 950);width:100vw;height:100vh;object-fit:fill;background:var(--gd-surface, #141414);pointer-events:none;';
       document.body.appendChild(cover);
     }
     cover.src = frame;
@@ -491,7 +519,7 @@
     if (!shelf) {
       shelf = document.createElement('div');
       shelf.id = 'webmcp-recording-shelf';
-      shelf.style.cssText = 'position:fixed;left:14px;bottom:46px;z-index:999998;max-width:calc(100vw - 28px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:9px 12px;border:1px solid rgba(255,200,87,.55);border-radius:8px;background:rgba(12,15,25,.94);font:600 11px/1.35 Inter,system-ui,sans-serif;color:#ffe6a2';
+      shelf.style.cssText = 'position:fixed;left:10px;bottom:52px;z-index:var(--gd-z-rail, 900);max-width:calc(100vw - 20px);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:6px 10px;border:1px solid var(--gd-border, #484848);border-radius:6px;background:var(--gd-panel, #1b1b1b);box-shadow:0 8px 24px rgba(0,0,0,.45);font:500 12px/1.35 var(--gd-font-ui, Inter, system-ui, sans-serif);color:var(--gd-text, #d0d0d0)';
       document.body.appendChild(shelf);
     }
     if (replace) shelf.innerHTML = '';
@@ -499,7 +527,7 @@
     link.href = record.object_url;
     link.download = record.filename;
     link.textContent = `Download recording · ${record.filename} · ${(record.blob.size / 1024 / 1024).toFixed(2)} MB`;
-    link.style.cssText = 'color:#ffc857;text-decoration:none;pointer-events:auto';
+    link.style.cssText = 'color:var(--gd-accent, #538dda);text-decoration:none;pointer-events:auto';
     shelf.appendChild(link);
     return record.object_url;
   }
@@ -943,11 +971,15 @@
     return normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
   }
 
+  let editorRestartCount = 0;
+
   async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
+    editorRestartCount += 1;
+    window.__webmcpRestartCount = editorRestartCount;
     if (typeof window !== 'undefined') holdRuntimeFrame();
     // A running game owns the same virtual project filesystem. Replacing the
     // editor first can race its shutdown and leave the new --path unmounted.
@@ -961,7 +993,9 @@
     }
 
     window._mcpProjectName = projectName;
-    window._mcpProjectFiles = files;
+    // The agent command plugin rides along on disk without entering activeFilesDict.
+    window._mcpProjectFiles = withEditorPlugin(files);
+    EditorCommandChannel.nextGeneration();
     DiagnosticState.engine = 'loading';
     DiagnosticState.session = 'authoring';
     DiagnosticHUD.render();
@@ -996,6 +1030,9 @@
     }
     DiagnosticState.engine = 'ready';
     DiagnosticState.session = 'editor-ready';
+    // The plugin publishes its callback from _enter_tree, which runs a little after the
+    // engine reports ready. Give it a bounded window; its absence is never fatal.
+    await EditorCommandChannel.waitForReady(4000);
     DiagnosticHUD.render();
     if (typeof window === 'undefined' || !window.__godotWebMcpKeepRuntimeFrame) releaseRuntimeFrame();
     return true;
@@ -1997,15 +2034,15 @@ func _physics_process(delta):
 
     const panel = document.createElement('div');
     panel.id = 'webmcp-resume-panel';
-    panel.style.cssText = 'margin:16px auto;max-width:540px;padding:18px 22px;background:#1b263b;border:1px solid #00e5ff;border-radius:10px;color:#e2e8f0;text-align:left;box-shadow:0 8px 24px rgba(0,0,0,0.5);';
+    panel.style.cssText = 'margin:16px auto;max-width:540px;padding:18px 22px;background:var(--gd-panel, #1b1b1b);border:1px solid var(--gd-border, #484848);border-radius:6px;color:var(--gd-text, #d0d0d0);text-align:left;box-shadow:0 8px 24px rgba(0,0,0,.45);';
 
     const heading = document.createElement('h3');
-    heading.style.cssText = 'margin:0 0 8px;color:#00e5ff;font-size:16px;';
+    heading.style.cssText = 'margin:0 0 8px;color:var(--gd-accent, #538dda);font-size:16px;';
     heading.textContent = `Resume Project: ${DiagnosticState.activeProject}`;
     panel.appendChild(heading);
 
     const info = document.createElement('p');
-    info.style.cssText = 'margin:0 0 14px;color:#94a3b8;font-size:12px;line-height:1.4;';
+    info.style.cssText = 'margin:0 0 14px;color:var(--gd-text-muted, #9a9a9a);font-size:12px;line-height:1.4;';
     info.textContent = `Rev #${DiagnosticState.sceneRevision} · ${Object.keys(activeFilesDict).length} files · ${undoStack.length} undo snapshots saved in local IndexedDB.`;
     panel.appendChild(info);
 
@@ -2014,7 +2051,7 @@ func _physics_process(delta):
 
     const btnResume = document.createElement('button');
     btnResume.className = 'btn';
-    btnResume.style.cssText = 'font-weight:700;background:#00e5ff;color:#03121c;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;';
+    btnResume.style.cssText = 'font-weight:600;background:var(--gd-accent, #538dda);color:var(--gd-surface, #141414);border:none;padding:6px 14px;border-radius:4px;cursor:pointer;';
     btnResume.textContent = 'Resume Project';
     btnResume.onclick = async () => {
       panel.remove();
@@ -2026,7 +2063,7 @@ func _physics_process(delta):
 
     const btnSafe = document.createElement('button');
     btnSafe.className = 'btn';
-    btnSafe.style.cssText = 'background:#334155;color:#e2e8f0;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnSafe.style.cssText = 'background:var(--gd-panel-raised, #262626);color:var(--gd-text, #d0d0d0);border:1px solid var(--gd-border, #484848);padding:6px 12px;border-radius:4px;cursor:pointer;';
     btnSafe.textContent = 'Open in Safe Mode';
     btnSafe.onclick = async () => {
       panel.remove();
@@ -2038,7 +2075,7 @@ func _physics_process(delta):
 
     const btnExport = document.createElement('button');
     btnExport.className = 'btn';
-    btnExport.style.cssText = 'background:#334155;color:#e2e8f0;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnExport.style.cssText = 'background:var(--gd-panel-raised, #262626);color:var(--gd-text, #d0d0d0);border:1px solid var(--gd-border, #484848);padding:6px 12px;border-radius:4px;cursor:pointer;';
     btnExport.textContent = 'Export Snapshot';
     btnExport.onclick = () => {
       const zipBytes = ZipBuilder.createZip(activeFilesDict);
@@ -2049,14 +2086,14 @@ func _physics_process(delta):
 
     const btnDismiss = document.createElement('button');
     btnDismiss.className = 'btn';
-    btnDismiss.style.cssText = 'background:transparent;color:#94a3b8;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnDismiss.style.cssText = 'background:transparent;color:var(--gd-text-muted, #9a9a9a);border:1px solid var(--gd-border, #484848);padding:6px 12px;border-radius:4px;cursor:pointer;';
     btnDismiss.textContent = 'Create Another Project';
     btnDismiss.onclick = () => { panel.remove(); };
     btnGroup.appendChild(btnDismiss);
 
     const btnDelete = document.createElement('button');
     btnDelete.className = 'btn';
-    btnDelete.style.cssText = 'background:transparent;color:#f87171;border:1px solid #7f1d1d;padding:6px 10px;border-radius:5px;cursor:pointer;margin-left:auto;font-size:11px;';
+    btnDelete.style.cssText = 'background:transparent;color:var(--gd-error, #d16969);border:1px solid var(--gd-border, #484848);padding:6px 10px;border-radius:4px;cursor:pointer;margin-left:auto;font-size:11px;';
     btnDelete.textContent = 'Delete Saved Project';
     btnDelete.onclick = async () => {
       if (window.confirm(`Permanently delete the saved snapshot for '${DiagnosticState.activeProject}'? This cannot be undone.`)) {
@@ -2095,10 +2132,10 @@ func _physics_process(delta):
 
     const panel = document.createElement('div');
     panel.id = 'webmcp-recovery-panel';
-    panel.style.cssText = 'margin:16px auto;max-width:480px;padding:16px 20px;background:#2d1215;border:1px solid #f87171;border-radius:10px;color:#fecaca;text-align:left;box-shadow:0 8px 24px rgba(0,0,0,0.5);';
+    panel.style.cssText = 'margin:16px auto;max-width:480px;padding:16px 20px;background:var(--gd-panel, #1b1b1b);border:1px solid var(--gd-error, #d16969);border-radius:6px;color:var(--gd-text, #d0d0d0);text-align:left;box-shadow:0 8px 24px rgba(0,0,0,.45);';
 
     const heading = document.createElement('h3');
-    heading.style.cssText = 'margin:0 0 8px;color:#f87171;font-size:16px;';
+    heading.style.cssText = 'margin:0 0 8px;color:var(--gd-error, #d16969);font-size:16px;';
     heading.textContent = 'Project Restoration Failed';
     panel.appendChild(heading);
 
@@ -2117,7 +2154,7 @@ func _physics_process(delta):
 
     const btnRetry = document.createElement('button');
     btnRetry.className = 'btn';
-    btnRetry.style.cssText = 'background:#f87171;color:#1c0406;font-weight:700;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;';
+    btnRetry.style.cssText = 'background:var(--gd-error, #d16969);color:var(--gd-surface, #141414);font-weight:600;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;';
     btnRetry.textContent = 'Retry Full Restore';
     btnRetry.onclick = async () => {
       panel.remove();
@@ -2129,7 +2166,7 @@ func _physics_process(delta):
 
     const btnSafe = document.createElement('button');
     btnSafe.className = 'btn';
-    btnSafe.style.cssText = 'background:#475569;color:#e2e8f0;border:none;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnSafe.style.cssText = 'background:var(--gd-panel-raised, #262626);color:var(--gd-text, #d0d0d0);border:1px solid var(--gd-border, #484848);padding:6px 12px;border-radius:4px;cursor:pointer;';
     btnSafe.textContent = 'Open in Safe Mode';
     btnSafe.onclick = async () => {
       panel.remove();
@@ -2141,7 +2178,7 @@ func _physics_process(delta):
 
     const btnExport = document.createElement('button');
     btnExport.className = 'btn';
-    btnExport.style.cssText = 'background:#475569;color:#e2e8f0;border:none;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnExport.style.cssText = 'background:var(--gd-panel-raised, #262626);color:var(--gd-text, #d0d0d0);border:1px solid var(--gd-border, #484848);padding:6px 12px;border-radius:4px;cursor:pointer;';
     btnExport.textContent = 'Export Project ZIP';
     btnExport.onclick = () => {
       const zipBytes = ZipBuilder.createZip(activeFilesDict);
@@ -2195,22 +2232,927 @@ func _physics_process(delta):
   }
 
   // ==========================================
+  // 5C. Godot Editor Command Channel
+  // ==========================================
+  // An @tool EditorPlugin shipped inside the authored project publishes a synchronous
+  // JS-callable function on `window.__godotEditorCommand`. That is the only supported
+  // way to drive the real editor from this page: `JavaScriptBridge` is registered
+  // unconditionally in platform/web/api/api.cpp, but `Module.FS`/`Module.ccall` are not
+  // exported by godot.editor.js, and there is no public API for setting the 3D viewport
+  // camera (godot-proposals#12112) — only selection plus `spatial_editor/focus_selection`,
+  // which Godot itself eases with the configured navigation inertia.
+  //
+  // The plugin source below is copied verbatim from public/addons/webmcp/plugin.{gd,cfg};
+  // test/plugin_source_parity.test.mjs fails if the two ever diverge.
+  const WEBMCP_PLUGIN_CFG = `[plugin]
+
+name="WebMCP Command Channel"
+description="Publishes a synchronous JS-callable command channel on window.__godotEditorCommand so the in-page WebMCP bridge can select, focus, and mutate the edited scene without restarting the editor."
+author="Godot WebMCP"
+version="1.0.0"
+script="plugin.gd"
+`;
+
+  const WEBMCP_PLUGIN_GD = `@tool
+extends EditorPlugin
+
+## WebMCP command channel.
+##
+## Publishes a synchronous, JSON-in/JSON-out function on 'window.__godotEditorCommand'
+## so the in-page WebMCP bridge can drive the *real* editor: selection, Godot's own
+## damped 'focus_selection' fly-to, viewport camera reads, and scene mutations that go
+## through the editor's own UndoRedo stack instead of rebooting the WASM process.
+##
+## Every reply carries 'generation', which the JS side fences against its editor-boot
+## counter so a command issued before a restart can never be mistaken for a live one.
+
+const CHANNEL_VERSION := "1.0.0"
+
+var _command_callback: JavaScriptObject = null
+var _window: JavaScriptObject = null
+
+func _enter_tree() -> void:
+	if not OS.has_feature("web"):
+		return
+	if not Engine.has_singleton("JavaScriptBridge") and not ClassDB.class_exists("JavaScriptBridge"):
+		return
+	_window = JavaScriptBridge.get_interface("window")
+	if _window == null:
+		return
+	_command_callback = JavaScriptBridge.create_callback(_on_command)
+	_window.__godotEditorCommand = _command_callback
+	_window.__godotEditorPluginVersion = CHANNEL_VERSION
+	_window.__godotEditorPluginReady = true
+	_tune_navigation_feel()
+
+func _exit_tree() -> void:
+	if _window == null:
+		return
+	_window.__godotEditorPluginReady = false
+	_window.__godotEditorCommand = null
+	_command_callback = null
+
+## Godot already owns a damped fly-to; we only widen its easing so agent-driven
+## framing reads as cinematic motion rather than a snap.
+func _tune_navigation_feel() -> void:
+	var settings := EditorInterface.get_editor_settings()
+	if settings == null:
+		return
+	var feel := {
+		"editors/3d/navigation_feel/orbit_inertia": 0.22,
+		"editors/3d/navigation_feel/translation_inertia": 0.22,
+		"editors/3d/navigation_feel/zoom_inertia": 0.22,
+	}
+	for key in feel:
+		if settings.has_setting(key):
+			settings.set_setting(key, feel[key])
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+func _on_command(args: Array) -> String:
+	var payload: Variant = null
+	if args.size() > 0 and typeof(args[0]) == TYPE_STRING:
+		payload = JSON.parse_string(args[0])
+	if typeof(payload) != TYPE_DICTIONARY:
+		return _reply({"ok": false, "error": "Command payload must be a JSON object string."})
+	var op := String(payload.get("op", ""))
+	var reply: Dictionary
+	match op:
+		"ping": reply = _op_ping()
+		"viewport_state": reply = _op_viewport_state()
+		"camera_pose": reply = _op_camera_pose()
+		"select": reply = _op_select(payload)
+		"focus": reply = _op_focus(payload)
+		"focus_dispatch": reply = _op_focus_dispatch()
+		"view_preset": reply = _op_view_preset(payload)
+		"viewport_tree": reply = _op_viewport_tree()
+		"node_add": reply = _op_node_add(payload)
+		"node_transform": reply = _op_node_transform(payload)
+		"node_material": reply = _op_node_material(payload)
+		"node_delete": reply = _op_node_delete(payload)
+		"inspect_property": reply = _op_inspect_property(payload)
+		"open_scene": reply = _op_open_scene(payload)
+		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
+	return _reply(reply)
+
+func _reply(body: Dictionary) -> String:
+	body["generation"] = _generation()
+	body["channel_version"] = CHANNEL_VERSION
+	var text := JSON.stringify(body)
+	# Belt-and-braces: some browsers drop synchronous return values across the
+	# JavaScriptBridge boundary, so the last reply is also readable from JS.
+	if _window != null:
+		_window.__godotEditorCommandResult = text
+	return text
+
+## The boot generation the JS bridge stamped on 'window' before starting this editor.
+func _generation() -> int:
+	if _window == null:
+		return 0
+	var value = _window.__godotEditorGeneration
+	return int(value) if value != null else 0
+
+# ---------------------------------------------------------------------------
+# Read operations
+# ---------------------------------------------------------------------------
+
+func _op_ping() -> Dictionary:
+	return {
+		"ok": true,
+		"engine_version": Engine.get_version_info().get("string", ""),
+		"has_edited_scene": EditorInterface.get_edited_scene_root() != null,
+	}
+
+func _viewport_camera() -> Camera3D:
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	return viewport.get_camera_3d() if viewport != null else null
+
+func _op_camera_pose() -> Dictionary:
+	var camera := _viewport_camera()
+	if camera == null:
+		return {"ok": false, "error": "No 3D editor viewport camera is available."}
+	var transform := camera.global_transform
+	var basis := transform.basis
+	return {
+		"ok": true,
+		"position": [transform.origin.x, transform.origin.y, transform.origin.z],
+		"basis": [
+			basis.x.x, basis.x.y, basis.x.z,
+			basis.y.x, basis.y.y, basis.y.z,
+			basis.z.x, basis.z.y, basis.z.z,
+		],
+		"fov": camera.fov,
+		"near": camera.near,
+		"far": camera.far,
+		"projection": camera.projection,
+	}
+
+func _op_viewport_state() -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	var selected: Array = []
+	for node in EditorInterface.get_selection().get_selected_nodes():
+		if root != null:
+			selected.append(String(root.get_path_to(node)))
+	var pose := _op_camera_pose()
+	return {
+		"ok": true,
+		"edited_scene": root.scene_file_path if root != null else "",
+		"root_name": root.name if root != null else "",
+		"selection": selected,
+		"unsaved": EditorInterface.get_edited_scene_root() != null and _scene_is_dirty(),
+		"camera": pose if pose.get("ok", false) else null,
+	}
+
+func _scene_is_dirty() -> bool:
+	# 4.x exposes no public dirty flag; the marker is advisory only.
+	return false
+
+func _op_inspect_property(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+	var property_name := String(payload.get("property", ""))
+	if property_name == "":
+		var names: Array = []
+		for entry in node.get_property_list():
+			if int(entry.get("usage", 0)) & PROPERTY_USAGE_EDITOR:
+				names.append(entry.get("name", ""))
+		return {"ok": true, "node_path": String(payload.get("node_path", "")), "properties": names}
+	var value = node.get(property_name)
+	return {
+		"ok": true,
+		"node_path": String(payload.get("node_path", "")),
+		"property": property_name,
+		"value": str(value),
+		"type": type_string(typeof(value)),
+	}
+
+# ---------------------------------------------------------------------------
+# Selection and framing
+# ---------------------------------------------------------------------------
+
+func _resolve_node(node_path: String) -> Node:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null or node_path == "":
+		return null
+	if node_path == "." or node_path == String(root.name):
+		return root
+	var direct := root.get_node_or_null(NodePath(node_path))
+	if direct != null:
+		return direct
+	# Fall back to a by-name search so agents can address nodes without full paths.
+	var leaf := node_path.get_file() if node_path.contains("/") else node_path
+	return _find_by_name(root, leaf)
+
+func _find_by_name(node: Node, wanted: String) -> Node:
+	if String(node.name) == wanted:
+		return node
+	for child in node.get_children():
+		var found := _find_by_name(child, wanted)
+		if found != null:
+			return found
+	return null
+
+func _op_select(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+	var selection := EditorInterface.get_selection()
+	selection.clear()
+	selection.add_node(node)
+	var root := EditorInterface.get_edited_scene_root()
+	return {
+		"ok": true,
+		"selected": String(root.get_path_to(node)),
+		"node_class": node.get_class(),
+	}
+
+## Frame the node using Godot's own 'spatial_editor/focus_selection' shortcut, which eases
+## the viewport camera with the editor's configured navigation inertia. There is no public
+## API for setting the 3D viewport camera (godot-proposals#12112), and Camera3D.look_at is
+## reset by the user's next navigation input, so the shortcut is the only supported path.
+##
+## Node3DEditorViewport handles that shortcut in _sinput, which is connected to the
+## gui_input signal of its focusable 'surface' Control. Pushing the key into the SubViewport
+## does not reach it: the SubViewport is a *child* of the container, so input pushed there
+## only travels down into the 3D scene. Emitting gui_input on the surface reaches the handler
+## directly, without depending on where the mouse happens to be.
+func _spatial_editor_surface() -> Control:
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	if viewport == null:
+		return null
+	var editor_viewport := viewport.get_parent()
+	if editor_viewport != null:
+		editor_viewport = editor_viewport.get_parent()
+	if editor_viewport == null:
+		return null
+	for child in editor_viewport.get_children():
+		if child is Control and (child as Control).focus_mode != Control.FOCUS_NONE:
+			return child as Control
+	return null
+
+func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
+	var surface := _spatial_editor_surface()
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	if surface == null and viewport == null:
+		return {"ok": false, "error": "No 3D editor viewport is available."}
+	var mechanism := ""
+	for pressed in [true, false]:
+		var event := InputEventKey.new()
+		event.keycode = keycode
+		event.physical_keycode = keycode
+		event.pressed = pressed
+		event.echo = false
+		if surface != null:
+			if pressed:
+				surface.grab_focus()
+			surface.emit_signal("gui_input", event)
+			mechanism = "surface.gui_input"
+		else:
+			viewport.push_input(event)
+			mechanism = "subviewport.push_input"
+	return {"ok": true, "mechanism": mechanism}
+
+func _op_focus(payload: Dictionary) -> Dictionary:
+	var selected := _op_select(payload)
+	if not selected.get("ok", false):
+		return selected
+	var dispatched := _op_focus_dispatch()
+	selected["focused"] = dispatched.get("ok", false)
+	selected["mechanism"] = dispatched.get("mechanism", "")
+	selected["shortcut"] = "spatial_editor/focus_selection"
+	selected["camera_moved"] = dispatched.get("camera_moved", false)
+	return selected
+
+## Dispatch only, no selection. Node3DEditor reacts to EditorSelection changes on a deferred
+## call, so a shortcut sent in the same frame as the selection frames an empty set. The JS
+## side selects, waits a frame, then calls this.
+func _op_focus_dispatch() -> Dictionary:
+	var camera := _viewport_camera()
+	var before := camera.global_transform.origin if camera != null else Vector3.ZERO
+	var dispatched := _dispatch_viewport_shortcut(KEY_F)
+	if not dispatched.get("ok", false):
+		return dispatched
+	var selection_count := EditorInterface.get_selection().get_selected_nodes().size()
+	var after := camera.global_transform.origin if camera != null else Vector3.ZERO
+	dispatched["selection_count"] = selection_count
+	dispatched["camera_before"] = [before.x, before.y, before.z]
+	# The camera itself eases over several frames; camera_cursor moves immediately, so an
+	# unchanged origin here is not yet proof that nothing happened.
+	dispatched["camera_after_immediate"] = [after.x, after.y, after.z]
+	dispatched["camera_moved"] = before.distance_to(after) > 0.0001
+	return dispatched
+
+## Diagnostic: report the ancestor chain of the 3D editor viewport so the JS side can see
+## which control actually owns the spatial editor shortcuts.
+func _op_viewport_tree() -> Dictionary:
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	if viewport == null:
+		return {"ok": false, "error": "No 3D editor viewport."}
+	var chain: Array = []
+	var node: Node = viewport
+	while node != null and chain.size() < 12:
+		chain.append({"class": node.get_class(), "name": String(node.name)})
+		node = node.get_parent()
+	return {"ok": true, "chain": chain}
+
+## Godot's own numpad view shortcuts, dispatched through the same surface handler so the
+## camera interpolates to the preset with the editor's configured inertia.
+func _op_view_preset(payload: Dictionary) -> Dictionary:
+	var preset := String(payload.get("preset", "")).to_lower()
+	var keycode := 0
+	match preset:
+		"front": keycode = KEY_KP_1
+		"top": keycode = KEY_KP_7
+		"left": keycode = KEY_KP_3
+		"perspective": keycode = KEY_KP_5
+		_: return {"ok": false, "error": "Unknown view preset: %s" % preset}
+	var dispatched := _dispatch_viewport_shortcut(keycode)
+	if not dispatched.get("ok", false):
+		return dispatched
+	return {"ok": true, "preset": preset, "mechanism": dispatched.get("mechanism", "")}
+
+# ---------------------------------------------------------------------------
+# Mutations — every one lands in the editor's own undo stack
+# ---------------------------------------------------------------------------
+
+func _vector3(value: Variant, fallback: Vector3) -> Vector3:
+	if typeof(value) != TYPE_ARRAY or (value as Array).size() < 3:
+		return fallback
+	var array := value as Array
+	return Vector3(float(array[0]), float(array[1]), float(array[2]))
+
+func _color(value: Variant, fallback: Color) -> Color:
+	if typeof(value) != TYPE_STRING:
+		return fallback
+	var text := String(value)
+	return Color(text) if text.begins_with("#") else fallback
+
+func _build_mesh(payload: Dictionary) -> Mesh:
+	var mesh_type := String(payload.get("mesh_type", "box")).to_lower()
+	match mesh_type:
+		"cylinder":
+			var cylinder := CylinderMesh.new()
+			cylinder.top_radius = float(payload.get("radius", 0.5))
+			cylinder.bottom_radius = float(payload.get("radius", 0.5))
+			cylinder.height = float(payload.get("height", 2.0))
+			return cylinder
+		"sphere":
+			var sphere := SphereMesh.new()
+			sphere.radius = float(payload.get("radius", 1.0))
+			sphere.height = float(payload.get("height", float(payload.get("radius", 1.0)) * 2.0))
+			return sphere
+		"torus":
+			var torus := TorusMesh.new()
+			torus.inner_radius = float(payload.get("inner_radius", 2.0))
+			torus.outer_radius = float(payload.get("outer_radius", 2.6))
+			return torus
+		"prism":
+			var prism := PrismMesh.new()
+			prism.size = _vector3(payload.get("size"), Vector3(1, 2, 1))
+			return prism
+		"capsule":
+			var capsule := CapsuleMesh.new()
+			capsule.radius = float(payload.get("radius", 0.5))
+			capsule.height = float(payload.get("height", 2.0))
+			return capsule
+		"plane":
+			var plane := PlaneMesh.new()
+			var plane_size := _vector3(payload.get("size"), Vector3(10, 10, 0))
+			plane.size = Vector2(plane_size.x, plane_size.y)
+			return plane
+		_:
+			var box := BoxMesh.new()
+			box.size = _vector3(payload.get("size"), Vector3(2, 2, 2))
+			return box
+
+func _build_material(payload: Dictionary, base: StandardMaterial3D = null) -> StandardMaterial3D:
+	var material := base if base != null else StandardMaterial3D.new()
+	if payload.has("albedo_color"):
+		material.albedo_color = _color(payload["albedo_color"], material.albedo_color)
+	if payload.has("metallic"):
+		material.metallic = float(payload["metallic"])
+	if payload.has("roughness"):
+		material.roughness = float(payload["roughness"])
+	if payload.has("emission"):
+		material.emission_enabled = true
+		material.emission = _color(payload["emission"], material.emission)
+	if payload.has("emission_energy"):
+		material.emission_enabled = true
+		material.emission_energy_multiplier = float(payload["emission_energy"])
+	return material
+
+func _compose_transform(position: Vector3, rotation_degrees: Vector3, scale: Vector3) -> Transform3D:
+	var node := Node3D.new()
+	node.position = position
+	node.rotation_degrees = rotation_degrees
+	node.scale = scale
+	var composed := node.transform
+	node.free()
+	return composed
+
+func _op_node_add(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var parent := _resolve_node(String(payload.get("parent_path", ".")))
+	if parent == null:
+		parent = root
+	var node_name := String(payload.get("name", ""))
+	if node_name == "":
+		return {"ok": false, "error": "node_add requires a name."}
+	if _find_by_name(root, node_name) != null:
+		return {"ok": false, "error": "A node named '%s' already exists in this scene." % node_name}
+
+	var instance := MeshInstance3D.new()
+	instance.name = node_name
+	instance.mesh = _build_mesh(payload)
+	if typeof(payload.get("material")) == TYPE_DICTIONARY:
+		instance.set_surface_override_material(0, _build_material(payload["material"]))
+	instance.transform = _compose_transform(
+		_vector3(payload.get("position"), Vector3.ZERO),
+		_vector3(payload.get("rotation"), Vector3.ZERO),
+		_vector3(payload.get("scale"), Vector3.ONE))
+
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: add %s" % node_name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "add_child", instance, true)
+	undo.add_do_method(instance, "set_owner", root)
+	undo.add_do_reference(instance)
+	undo.add_undo_method(parent, "remove_child", instance)
+	undo.commit_action()
+	EditorInterface.save_scene()
+	return {
+		"ok": true,
+		"node_path": String(root.get_path_to(instance)),
+		"node_name": node_name,
+		"aabb": _aabb_of(instance),
+	}
+
+func _op_node_transform(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null or not (node is Node3D):
+		return {"ok": false, "error": "Node3D not found: %s" % payload.get("node_path", "")}
+	var node3d := node as Node3D
+	var relative := bool(payload.get("relative", false))
+	var target := node3d.transform
+	var position := _vector3(payload.get("position"), node3d.position)
+	var rotation := _vector3(payload.get("rotation"), node3d.rotation_degrees)
+	var scale := _vector3(payload.get("scale"), node3d.scale)
+	if relative:
+		position = node3d.position + _vector3(payload.get("position"), Vector3.ZERO)
+		rotation = node3d.rotation_degrees + _vector3(payload.get("rotation"), Vector3.ZERO)
+		scale = node3d.scale * _vector3(payload.get("scale"), Vector3.ONE)
+	target = _compose_transform(position, rotation, scale)
+
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: transform %s" % node3d.name, UndoRedo.MERGE_ENDS, node3d)
+	undo.add_do_property(node3d, "transform", target)
+	undo.add_undo_property(node3d, "transform", node3d.transform)
+	undo.commit_action()
+	EditorInterface.save_scene()
+	return {
+		"ok": true,
+		"node_path": String(EditorInterface.get_edited_scene_root().get_path_to(node3d)),
+		"position": [target.origin.x, target.origin.y, target.origin.z],
+		"aabb": _aabb_of(node3d),
+	}
+
+func _op_node_material(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null or not (node is MeshInstance3D):
+		return {"ok": false, "error": "MeshInstance3D not found: %s" % payload.get("node_path", "")}
+	var instance := node as MeshInstance3D
+	var previous := instance.get_surface_override_material(0)
+	var updated := _build_material(payload, previous.duplicate() if previous != null else null)
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: material %s" % instance.name, UndoRedo.MERGE_ENDS, instance)
+	undo.add_do_method(instance, "set_surface_override_material", 0, updated)
+	undo.add_do_reference(updated)
+	undo.add_undo_method(instance, "set_surface_override_material", 0, previous)
+	undo.commit_action()
+	EditorInterface.save_scene()
+	return {"ok": true, "node_path": String(payload.get("node_path", ""))}
+
+func _op_node_delete(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+	var root := EditorInterface.get_edited_scene_root()
+	if node == root:
+		return {"ok": false, "error": "The scene root cannot be deleted through the command channel."}
+	var parent := node.get_parent()
+	var index := node.get_index()
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: delete %s" % node.name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "remove_child", node)
+	undo.add_undo_method(parent, "add_child", node, true)
+	undo.add_undo_method(parent, "move_child", node, index)
+	undo.add_undo_method(node, "set_owner", root)
+	undo.add_undo_reference(node)
+	undo.commit_action()
+	EditorInterface.save_scene()
+	return {"ok": true, "deleted_node": String(payload.get("node_path", ""))}
+
+func _op_open_scene(payload: Dictionary) -> Dictionary:
+	var scene_path := String(payload.get("scene_path", ""))
+	if not scene_path.begins_with("res://"):
+		return {"ok": false, "error": "scene_path must be a res:// path."}
+	if not ResourceLoader.exists(scene_path):
+		return {"ok": false, "error": "Scene does not exist: %s" % scene_path}
+	EditorInterface.open_scene_from_path(scene_path)
+	return {"ok": true, "scene_path": scene_path}
+
+func _aabb_of(node: Node) -> Array:
+	if node is VisualInstance3D:
+		var box := (node as VisualInstance3D).get_aabb()
+		var origin := (node as Node3D).global_transform.origin
+		return [
+			origin.x + box.position.x, origin.y + box.position.y, origin.z + box.position.z,
+			box.size.x, box.size.y, box.size.z,
+		]
+	return []
+`;
+
+  const WEBMCP_PLUGIN_CFG_PATH = 'addons/webmcp/plugin.cfg';
+  const WEBMCP_PLUGIN_GD_PATH = 'addons/webmcp/plugin.gd';
+  const WEBMCP_PLUGIN_RES = 'res://addons/webmcp/plugin.cfg';
+
+  function enableEditorPluginInProjectConfig(projectConfig) {
+    if (typeof projectConfig !== 'string') return projectConfig;
+    if (projectConfig.includes(WEBMCP_PLUGIN_RES)) return projectConfig;
+    const sectionMatch = projectConfig.match(/^\[editor_plugins\][^\[]*/m);
+    if (!sectionMatch) {
+      const separator = projectConfig.endsWith('\n') ? '' : '\n';
+      return `${projectConfig}${separator}\n[editor_plugins]\n\nenabled=PackedStringArray("${WEBMCP_PLUGIN_RES}")\n`;
+    }
+    const section = sectionMatch[0];
+    const enabledMatch = section.match(/enabled\s*=\s*PackedStringArray\(([^)]*)\)/);
+    if (!enabledMatch) {
+      return projectConfig.replace(section, `${section.trimEnd()}\nenabled=PackedStringArray("${WEBMCP_PLUGIN_RES}")\n`);
+    }
+    const existing = enabledMatch[1].trim();
+    const merged = existing ? `${existing}, "${WEBMCP_PLUGIN_RES}"` : `"${WEBMCP_PLUGIN_RES}"`;
+    return projectConfig.replace(enabledMatch[0], `enabled=PackedStringArray(${merged})`);
+  }
+
+  // The addon is a browser-only agent channel, not part of the authored game, so it is
+  // injected at the boot choke point rather than into `activeFilesDict`. That keeps it out
+  // of exports, undo snapshots, and `godot_inspect_project_files`, while still putting it
+  // on disk for every editor process — including one started by a rollback.
+  function withEditorPlugin(files) {
+    if (!files || typeof files !== 'object') return files;
+    const staged = { ...files };
+    staged[WEBMCP_PLUGIN_CFG_PATH] = WEBMCP_PLUGIN_CFG;
+    staged[WEBMCP_PLUGIN_GD_PATH] = WEBMCP_PLUGIN_GD;
+    if (typeof staged['project.godot'] === 'string') {
+      staged['project.godot'] = enableEditorPluginInProjectConfig(staged['project.godot']);
+    }
+    return staged;
+  }
+
+  const EditorCommandChannel = {
+    generation: 0,
+    lastError: null,
+    lastReplyAt: 0,
+    unavailableReason: 'The editor command plugin has not reported ready.',
+
+    // Bumped immediately before each `startEditor` call. The plugin echoes it back, so a
+    // command issued against the previous WASM process is rejected rather than silently
+    // applied to the new one.
+    nextGeneration() {
+      this.generation += 1;
+      if (typeof window !== 'undefined') {
+        window.__godotEditorGeneration = this.generation;
+        window.__godotEditorPluginReady = false;
+      }
+      return this.generation;
+    },
+
+    available() {
+      if (typeof window === 'undefined') return false;
+      return window.__godotEditorPluginReady === true && typeof window.__godotEditorCommand === 'function';
+    },
+
+    async waitForReady(timeoutMs = 6000) {
+      if (this.available()) return true;
+      return waitFor(() => this.available(), timeoutMs, 100);
+    },
+
+    // Returns { ok: true, ... } or { ok: false, error, unsupported? , stale? }. It never
+    // throws: every caller has a transaction-channel fallback, and a throw here would turn
+    // a degraded path into a failed tool call.
+    call(op, payload = {}) {
+      if (!this.available()) return { ok: false, unsupported: true, error: this.unavailableReason };
+      const expectedGeneration = this.generation;
+      let raw;
+      try {
+        raw = window.__godotEditorCommand(JSON.stringify({ op, ...payload }));
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : String(error);
+        return { ok: false, unsupported: true, error: `Editor command channel threw: ${this.lastError}` };
+      }
+      if (typeof raw !== 'string' || !raw) raw = window.__godotEditorCommandResult;
+      if (typeof raw !== 'string' || !raw) {
+        return { ok: false, unsupported: true, error: 'The editor command channel returned no reply.' };
+      }
+      let reply;
+      try {
+        reply = JSON.parse(raw);
+      } catch (error) {
+        return { ok: false, error: `Malformed editor command reply: ${String(raw).slice(0, 200)}` };
+      }
+      if (Number(reply.generation) !== expectedGeneration) {
+        return { ok: false, stale: true, error: `Editor command reply is from boot generation ${reply.generation}, not ${expectedGeneration}.` };
+      }
+      this.lastReplyAt = Date.now();
+      if (!reply.ok) this.lastError = reply.error || 'Unknown editor command failure.';
+      return reply;
+    },
+
+    describe() {
+      return {
+        available: this.available(),
+        generation: this.generation,
+        plugin_version: typeof window !== 'undefined' ? (window.__godotEditorPluginVersion || null) : null,
+        last_reply_at: this.lastReplyAt || null,
+        last_error: this.lastError
+      };
+    }
+  };
+
+  // ==========================================
   // 6. Authoritative Native Tool Manifest
   // ==========================================
+  // Mesh half-extents keyed to `generateMeshSubResource`'s own defaults, so the parser
+  // and the emitter can never disagree about how big a primitive is.
+  function meshHalfExtents(type, params = {}) {
+    const number = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
+    switch (String(type || '').toLowerCase()) {
+      case 'cylindermesh':
+      case 'cylinder': {
+        const radius = number(params.top_radius ?? params.bottom_radius ?? params.radius, 0.5);
+        return [radius, number(params.height, 2) / 2, radius];
+      }
+      case 'spheremesh':
+      case 'sphere': {
+        const radius = number(params.radius, 1);
+        return [radius, number(params.height, radius * 2) / 2, radius];
+      }
+      case 'torusmesh':
+      case 'torus': {
+        const outer = number(params.outer_radius, 2.6);
+        const inner = number(params.inner_radius, 2);
+        return [outer, Math.max((outer - inner) / 2, 0.05), outer];
+      }
+      case 'prismmesh':
+      case 'prism': {
+        const size = Array.isArray(params.size) ? params.size : [1, 2, 1];
+        return [number(size[0], 1) / 2, number(size[1], 2) / 2, number(size[2], 1) / 2];
+      }
+      case 'capsulemesh':
+      case 'capsule': {
+        const radius = number(params.radius, 0.5);
+        return [radius, number(params.height, 2) / 2, radius];
+      }
+      case 'planemesh':
+      case 'plane': {
+        const size = Array.isArray(params.size) ? params.size : [10, 10];
+        return [number(size[0], 10) / 2, 0.02, number(size[1], 10) / 2];
+      }
+      case 'boxmesh':
+      case 'box': {
+        const size = Array.isArray(params.size) ? params.size : [2, 2, 2];
+        return [number(size[0], 2) / 2, number(size[1], 2) / 2, number(size[2], 2) / 2];
+      }
+      default:
+        return [0.5, 0.5, 0.5];
+    }
+  }
+
+  function parseVectorLiteral(text) {
+    // Read only what is inside the parentheses: the `3` in `Vector3(...)` is part of the
+    // type name, not a component.
+    const body = String(text);
+    const open = body.indexOf('(');
+    const inner = open >= 0 ? body.slice(open + 1, body.lastIndexOf(')') >= 0 ? body.lastIndexOf(')') : undefined) : body;
+    const numbers = inner.match(/-?\d+(?:\.\d+)?(?:e-?\d+)?/gi);
+    return numbers ? numbers.map(Number) : [];
+  }
+
+  // A Transform3D in .tscn is nine basis components in column-major order followed by the
+  // origin: Transform3D(xx, xy, xz, yx, yy, yz, zx, zy, zz, ox, oy, oz).
+  function transformFromLiteral(values) {
+    if (!Array.isArray(values) || values.length < 12) return null;
+    return {
+      basis: values.slice(0, 9),
+      origin: values.slice(9, 12)
+    };
+  }
+
+  const IDENTITY_TRANSFORM = { basis: [1, 0, 0, 0, 1, 0, 0, 0, 1], origin: [0, 0, 0] };
+
+  function composeTransforms(parent, child) {
+    if (!parent) return child;
+    if (!child) return parent;
+    const [ax, ay, az, bx, by, bz, cx, cy, cz] = parent.basis;
+    const apply = ([x, y, z]) => [
+      ax * x + bx * y + cx * z,
+      ay * x + by * y + cy * z,
+      az * x + bz * y + cz * z
+    ];
+    const col0 = apply(child.basis.slice(0, 3));
+    const col1 = apply(child.basis.slice(3, 6));
+    const col2 = apply(child.basis.slice(6, 9));
+    const origin = apply(child.origin);
+    return {
+      basis: [...col0, ...col1, ...col2],
+      origin: [origin[0] + parent.origin[0], origin[1] + parent.origin[1], origin[2] + parent.origin[2]]
+    };
+  }
+
+  function basisScale(basis) {
+    return [
+      Math.hypot(basis[0], basis[1], basis[2]),
+      Math.hypot(basis[3], basis[4], basis[5]),
+      Math.hypot(basis[6], basis[7], basis[8])
+    ];
+  }
+
+  function parseSubResources(source) {
+    const resources = new Map();
+    // `$(?![\s\S])` is end-of-input. Plain `$` would match every line end under /m, and
+    // JavaScript has no `\Z` — spelling it that way silently dropped the last block.
+    const pattern = /^\[sub_resource type="([^"]+)" id="([^"]+)"\]([\s\S]*?)(?=^\[|$(?![\s\S]))/gm;
+    for (const match of source.matchAll(pattern)) {
+      const params = {};
+      for (const line of match[3].split('\n')) {
+        const assignment = line.match(/^\s*([A-Za-z0-9_/]+)\s*=\s*(.+?)\s*$/);
+        if (!assignment) continue;
+        const raw = assignment[2];
+        params[assignment[1]] = /^-?\d+(\.\d+)?$/.test(raw)
+          ? Number(raw)
+          : (/^Vector[23]\(/.test(raw) ? parseVectorLiteral(raw) : raw);
+      }
+      resources.set(match[2], { type: match[1], params });
+    }
+    return resources;
+  }
+
+  // The previous implementation was a flat regex over `[node name=...]` that extracted no
+  // transforms at all, which is why nothing downstream could know where a node actually is.
   function sceneGraphFromFiles(filesDict = {}) {
     const nodes = [];
     for (const [path, source] of Object.entries(filesDict)) {
       if (!path.endsWith('.tscn') || typeof source !== 'string') continue;
-      const pattern = /^\[node name="([^"]+)" type="([^"]+)"(?: parent="([^"]+)")?/gm;
-      for (const match of source.matchAll(pattern)) {
-        nodes.push({ path: `res://${path}`, name: match[1], type: match[2], parent: match[3] || null });
+      const subResources = parseSubResources(source);
+      const blockPattern = /^\[node name="([^"]+)"(?:\s+type="([^"]+)")?(?:\s+parent="([^"]+)")?[^\]]*\]([\s\S]*?)(?=^\[node |$(?![\s\S]))/gm;
+      const local = [];
+      for (const match of source.matchAll(blockPattern)) {
+        const [, name, type, parent, body] = match;
+        const transformMatch = body.match(/^transform\s*=\s*Transform3D\(([^)]*)\)/m);
+        const positionMatch = body.match(/^position\s*=\s*Vector3\(([^)]*)\)/m);
+        let localTransform = null;
+        if (transformMatch) {
+          localTransform = transformFromLiteral(parseVectorLiteral(transformMatch[1]));
+        } else if (positionMatch) {
+          const origin = parseVectorLiteral(positionMatch[1]);
+          if (origin.length >= 3) localTransform = { basis: [...IDENTITY_TRANSFORM.basis], origin: origin.slice(0, 3) };
+        }
+        const meshMatch = body.match(/^mesh\s*=\s*SubResource\("([^"]+)"\)/m);
+        const meshResource = meshMatch ? subResources.get(meshMatch[1]) : null;
+        local.push({
+          path: `res://${path}`,
+          name,
+          type: type || (body.match(/^instance=ExtResource/m) ? 'InstancedScene' : 'Node'),
+          parent: parent || null,
+          node_path: parent ? (parent === '.' ? name : `${parent}/${name}`) : '.',
+          local_transform: localTransform,
+          mesh: meshResource ? { type: meshResource.type, params: meshResource.params } : null
+        });
       }
+
+      // Resolve world transforms by walking the parent chain within this scene file.
+      const byNodePath = new Map(local.map(node => [node.node_path, node]));
+      const worldTransformOf = (node, seen = new Set()) => {
+        if (node.world_transform) return node.world_transform;
+        if (seen.has(node.node_path)) return IDENTITY_TRANSFORM;
+        seen.add(node.node_path);
+        const parentPath = node.parent;
+        const parentNode = parentPath && parentPath !== '.' ? byNodePath.get(parentPath) : (parentPath === '.' ? byNodePath.get('.') : null);
+        const parentWorld = parentNode ? worldTransformOf(parentNode, seen) : IDENTITY_TRANSFORM;
+        node.world_transform = composeTransforms(parentWorld, node.local_transform || IDENTITY_TRANSFORM);
+        return node.world_transform;
+      };
+      for (const node of local) {
+        const world = worldTransformOf(node);
+        node.world_position = [...world.origin];
+        if (node.mesh) {
+          const scale = basisScale(world.basis);
+          const half = meshHalfExtents(node.mesh.type, node.mesh.params);
+          node.aabb = {
+            center: [...world.origin],
+            half_extents: [half[0] * scale[0], half[1] * scale[1], half[2] * scale[2]]
+          };
+        }
+      }
+      nodes.push(...local);
     }
     const byType = nodes.reduce((summary, node) => {
       summary[node.type] = (summary[node.type] || 0) + 1;
       return summary;
     }, {});
     return { nodes, by_type: byType, scene_count: new Set(nodes.map(node => node.path)).size };
+  }
+
+  function findSceneNode(filesDict, nodeName) {
+    if (!nodeName) return null;
+    const leaf = String(nodeName).replace(/^.*\//, '');
+    const graph = sceneGraphFromFiles(filesDict);
+    return graph.nodes.find(node => node.name === leaf || node.node_path === nodeName) || null;
+  }
+
+  // ==========================================
+  // 6B. Camera pose resolution and world -> screen projection
+  // ==========================================
+  // Two honest sources, never a guess:
+  //  - the editor viewport camera, read through the command channel, while the Editor tab
+  //    is showing (there is no other way to know where the editor camera is);
+  //  - the scene's own active Camera3D, while the playtest tab is running, because that is
+  //    literally the camera rendering those pixels.
+  // With neither, the overlay reports `unavailable` rather than drawing a reticle over a
+  // position it cannot know.
+  function editorViewportCameraPose() {
+    const reply = EditorCommandChannel.call('camera_pose');
+    if (!reply.ok) return null;
+    return {
+      source: 'editor_viewport',
+      transform: { basis: reply.basis, origin: reply.position },
+      fov: Number(reply.fov) || 75
+    };
+  }
+
+  function sceneCameraPose(filesDict = {}) {
+    const graph = sceneGraphFromFiles(filesDict);
+    const camera = graph.nodes.find(node => node.type === 'Camera3D');
+    if (!camera || !camera.world_transform) return null;
+    let fov = 75;
+    for (const [path, source] of Object.entries(filesDict)) {
+      if (`res://${path}` !== camera.path || typeof source !== 'string') continue;
+      const block = source.slice(source.indexOf(`[node name="${camera.name}"`));
+      const fovMatch = block.match(/^fov\s*=\s*(-?[\d.]+)/m);
+      if (fovMatch) fov = Number(fovMatch[1]);
+      break;
+    }
+    return { source: 'scene_camera', transform: camera.world_transform, fov };
+  }
+
+  function resolveCameraPose(viewport = activeGodotViewport()) {
+    if (viewport === 'game') return sceneCameraPose(activeFilesDict);
+    return editorViewportCameraPose();
+  }
+
+  // Godot cameras look down -Z and `fov` is the vertical field of view (KEEP_HEIGHT).
+  function projectWorldPoint(worldPoint, pose, rect) {
+    if (!pose || !rect || !rect.width || !rect.height) return null;
+    const { basis, origin } = pose.transform;
+    const relative = [worldPoint[0] - origin[0], worldPoint[1] - origin[1], worldPoint[2] - origin[2]];
+    // The basis is orthonormal for an editor camera, so its inverse is its transpose.
+    const view = [
+      basis[0] * relative[0] + basis[1] * relative[1] + basis[2] * relative[2],
+      basis[3] * relative[0] + basis[4] * relative[1] + basis[5] * relative[2],
+      basis[6] * relative[0] + basis[7] * relative[1] + basis[8] * relative[2]
+    ];
+    const depth = -view[2];
+    const halfFovTangent = Math.tan((Number(pose.fov) || 75) * Math.PI / 360);
+    const aspect = rect.width / rect.height;
+    const behind = depth <= 0.001;
+    // Behind the camera there is no valid projection; mirror it so the edge arrow still
+    // points the shortest way round instead of inverting.
+    const usableDepth = behind ? Math.max(Math.abs(depth), 0.001) : depth;
+    let ndcX = (view[0] / usableDepth) / (halfFovTangent * aspect);
+    let ndcY = (view[1] / usableDepth) / halfFovTangent;
+    if (behind) { ndcX = -ndcX; ndcY = -ndcY; }
+    return {
+      behind,
+      distance: Math.hypot(relative[0], relative[1], relative[2]),
+      ndc: [ndcX, ndcY],
+      // CSS pixels: rect is already in CSS units, so devicePixelRatio never enters here.
+      x: rect.left + (ndcX * 0.5 + 0.5) * rect.width,
+      y: rect.top + (0.5 - ndcY * 0.5) * rect.height,
+      onScreen: !behind && Math.abs(ndcX) <= 1 && Math.abs(ndcY) <= 1,
+      halfFovTangent,
+      depth: usableDepth
+    };
+  }
+
+  function projectedRadius(halfExtents, projection, rect) {
+    if (!projection || !Array.isArray(halfExtents)) return 26;
+    const worldRadius = Math.hypot(halfExtents[0], halfExtents[1], halfExtents[2]);
+    const pixels = (worldRadius / projection.depth) / projection.halfFovTangent * (rect.height / 2);
+    return Math.max(22, Math.min(rect.height * 0.45, pixels * 1.35));
   }
 
   // ==========================================
@@ -2280,24 +3222,85 @@ func _physics_process(delta):
     return lines.join('\n') + '\n';
   }
 
-  async function liveMutateSceneFile(mutatorFn) {
+  function nowMs() {
+    return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+  }
+
+  // Two ways to land a live edit, in order of preference:
+  //
+  //  1. The editor command channel. The @tool plugin applies the change to the live scene
+  //     tree through the editor's own UndoRedo, so the agent's edit sits next to the
+  //     human's in one undo stack and the WASM process is never touched. The .tscn text is
+  //     still spliced so export, persistence, and the projection overlay stay in sync.
+  //  2. A full `restartEditorWithProject`. This tears down the pthread pool, the GL context,
+  //     and the whole project import — roughly three seconds, and it destroys camera pose,
+  //     selection, and undo history. It is the fallback, not the happy path.
+  //
+  // The returned `elapsed_ms` is measured, not asserted.
+  async function liveMutateSceneFile(mutatorFn, options = {}) {
+    const startedAt = nowMs();
     const mainScenePath = activeMainScene ? cleanProjectPath(activeMainScene) : 'main_3d.tscn';
-    let currentTscn = activeFilesDict[mainScenePath] || '';
+    const currentTscn = activeFilesDict[mainScenePath] || '';
     if (!currentTscn) {
       throw new Error(`Active main scene '${mainScenePath}' is not loaded. Create or author a scene first.`);
     }
     const updatedTscn = mutatorFn(currentTscn);
+
+    let channel = 'transaction';
+    let channelError = null;
+    const command = options.command;
+    if (command && EditorCommandChannel.available()) {
+      const reply = EditorCommandChannel.call(command.op, command.payload || {});
+      if (reply.ok) {
+        channel = 'command';
+      } else if (reply.unsupported || reply.stale) {
+        // The channel is gone or belongs to a previous editor process. Falling back to a
+        // restart is correct: the .tscn text is the authority and nothing has been applied.
+        channelError = reply.error || EditorCommandChannel.unavailableReason;
+      } else {
+        // The editor examined the operation and refused it — a duplicate node name, a
+        // missing target, a non-Node3D. Splicing the .tscn anyway and restarting would
+        // write exactly the state the editor just rejected, which is how a second
+        // MagentaPortalRing ends up in the scene. Fail instead.
+        const error = new Error(`The Godot editor rejected this operation: ${reply.error}`);
+        error.code = 'EDITOR_COMMAND_REJECTED';
+        throw error;
+      }
+    } else if (command) {
+      channelError = EditorCommandChannel.unavailableReason;
+    }
+
     activeFilesDict[mainScenePath] = updatedTscn;
     DiagnosticState.sceneRevision++;
     DiagnosticHUD.render();
     BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
-    if (typeof window !== 'undefined' && typeof restartEditorWithProject === 'function') {
+
+    let restarted = false;
+    if (channel !== 'command' && typeof window !== 'undefined' && typeof restartEditorWithProject === 'function') {
       await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
+      restarted = true;
     }
     persistActiveProjectState().catch(() => {});
     return {
       revision: DiagnosticState.sceneRevision,
-      mainScene: `res://${mainScenePath}`
+      mainScene: `res://${mainScenePath}`,
+      channel,
+      channelError,
+      restarted,
+      elapsedMs: Math.round((nowMs() - startedAt) * 100) / 100
+    };
+  }
+
+  function liveMutationResult(res, extra = {}) {
+    return {
+      success: true,
+      ...extra,
+      scene_revision: res.revision,
+      editor_channel: res.channel,
+      editor_restarted: res.restarted,
+      // Measured wall clock for this call, including the editor restart when one was needed.
+      execution_time_ms: res.elapsedMs,
+      ...(res.channelError ? { editor_channel_note: res.channelError } : {})
     };
   }
 
@@ -2320,6 +3323,13 @@ func _physics_process(delta):
           webmcp_state: DiagnosticState.webmcp,
           webmcp_registered_tools_count: DiagnosticState.webmcpRegisteredCount,
           webmcp_surface: DiagnosticState.webmcpSurface,
+          editor_command_channel: EditorCommandChannel.describe(),
+          editor_restart_count: editorRestartCount,
+          camera: {
+            auto_follow: CameraGuidance.autoFollowEnabled(),
+            active_viewport: activeGodotViewport(),
+            pose_source: resolveCameraPose()?.source || null
+          },
           session: {
             state: DiagnosticState.session,
             active_project: DiagnosticState.activeProject,
@@ -3264,23 +4274,66 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_select_node_live',
-        description: 'Requests native Godot Editor node selection. Fails explicitly when the editor command channel is unavailable; never fabricates selection success.',
-        input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, additionalProperties: false },
+        description: 'Selects a node in the live Godot Editor scene dock through the WebMCP editor command channel. Fails explicitly when the channel is unavailable; never fabricates selection success.',
+        input_schema: { type: 'object', properties: { node_path: { type: 'string' } }, required: ['node_path'], additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Node selection', 'Use godot_inspect_project_files to inspect source until a native editor plugin exposes selection acknowledgements.');
+        const reply = EditorCommandChannel.call('select', { node_path: args.node_path });
+        if (!reply.ok) {
+          unsupportedEditorOperation('Node selection', reply.unsupported
+            ? 'The WebMCP editor plugin is not loaded in this project; use godot_inspect_project_files to inspect source instead.'
+            : `The editor rejected the selection: ${reply.error}`);
+        }
+        return {
+          success: true,
+          selected_node: reply.selected,
+          node_class: reply.node_class,
+          editor_acknowledged: true,
+          editor_channel: 'command'
+        };
       }
     },
     {
       definition: {
         name: 'godot_transform_node_live',
-        description: 'Requests a native Godot node transform. Fails explicitly without editor acknowledgement; use the file transaction tool for source-backed transforms.',
-        input_schema: { type: 'object', properties: { node_path: { type: 'string' }, translation: { type: 'array' } }, additionalProperties: false },
+        description: 'Transforms a node in the live Godot Editor through the editor command channel and its UndoRedo stack. Viewport-only: it does not rewrite the .tscn text — use godot_node_transform for a transform that persists to source.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            node_path: { type: 'string' },
+            translation: { type: 'array', items: { type: 'number' }, description: 'Absolute position [X, Y, Z]' },
+            rotation: { type: 'array', items: { type: 'number' }, description: 'Rotation in degrees [Pitch, Yaw, Roll]' },
+            scale: { type: 'array', items: { type: 'number' } },
+            relative: { type: 'boolean', default: false }
+          },
+          required: ['node_path'],
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Live node transform', 'Use godot_apply_file_transaction to update the owning .tscn scene transactionally.');
+        const reply = EditorCommandChannel.call('node_transform', {
+          node_path: args.node_path,
+          position: args.translation,
+          rotation: args.rotation,
+          scale: args.scale,
+          relative: args.relative === true
+        });
+        if (!reply.ok) {
+          unsupportedEditorOperation('Live node transform', reply.unsupported
+            ? 'The WebMCP editor plugin is not loaded in this project; use godot_node_transform or godot_apply_file_transaction instead.'
+            : `The editor rejected the transform: ${reply.error}`);
+        }
+        return {
+          success: true,
+          node_path: reply.node_path,
+          position: reply.position,
+          editor_acknowledged: true,
+          editor_channel: 'command',
+          persisted_to_source: false,
+          persist_with: 'godot_node_transform'
+        };
       }
     },
     {
@@ -3319,12 +4372,24 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_inspect_property_live',
-        description: 'Requests a native Inspector property read. Fails explicitly without editor acknowledgement; project source inspection remains available.',
-        input_schema: { type: 'object', properties: { property: { type: 'string' }, value: {} }, additionalProperties: false },
-        annotations: { readOnlyHint: false, untrustedContentHint: false }
+        description: 'Reads a live Inspector property from the edited scene through the editor command channel. Omit `property` to list the editable property names of the node.',
+        input_schema: { type: 'object', properties: { node_path: { type: 'string' }, property: { type: 'string' } }, required: ['node_path'], additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Live Inspector property read', 'Use godot_inspect_project_files for authoritative source values.');
+        const reply = EditorCommandChannel.call('inspect_property', { node_path: args.node_path, property: args.property || '' });
+        if (!reply.ok) {
+          unsupportedEditorOperation('Live Inspector property read', reply.unsupported
+            ? 'The WebMCP editor plugin is not loaded in this project; use godot_inspect_project_files for authoritative source values.'
+            : `The editor rejected the read: ${reply.error}`);
+        }
+        return {
+          success: true,
+          node_path: reply.node_path,
+          ...(reply.properties ? { properties: reply.properties } : { property: reply.property, value: reply.value, type: reply.type }),
+          editor_acknowledged: true,
+          editor_channel: 'command'
+        };
       }
     },
     {
@@ -3361,12 +4426,21 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_open_scene',
-        description: 'Requests a native scene-open operation. Fails explicitly without editor acknowledgement; main-scene changes can be made transactionally.',
-        input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, additionalProperties: false },
+        description: 'Opens a res:// scene in the live Godot Editor through the editor command channel. This changes the edited scene only; use godot_apply_file_transaction to change project.godot run/main_scene.',
+        input_schema: { type: 'object', properties: { scene_path: { type: 'string' } }, required: ['scene_path'], additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Open scene', 'Use godot_apply_file_transaction to change project.godot run/main_scene, then restart the acknowledged editor session.');
+        const scenePath = normalizeResourcePath(args.scene_path, '');
+        const reply = EditorCommandChannel.call('open_scene', { scene_path: scenePath });
+        if (!reply.ok) {
+          unsupportedEditorOperation('Open scene', reply.unsupported
+            ? 'The WebMCP editor plugin is not loaded in this project; use godot_apply_file_transaction to change project.godot run/main_scene and restart the editor.'
+            : `The editor rejected the scene open: ${reply.error}`);
+        }
+        activeMainScene = reply.scene_path;
+        SceneInspector.render();
+        return { success: true, scene_path: reply.scene_path, editor_acknowledged: true, editor_channel: 'command' };
       }
     },
     {
@@ -3425,7 +4499,7 @@ func _physics_process(delta):
       definition: {
         name: 'godot_send_input',
         description: 'Dispatches a keyboard event to the game canvas and reports any subsequent project-owned telemetry without claiming unverified gameplay acknowledgement',
-        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true } }, additionalProperties: false },
+        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
@@ -3435,8 +4509,9 @@ func _physics_process(delta):
         if (durationMs > 0 && !pressed) throw new Error('duration_ms is only valid for a key press pulse.');
         const before = GameTelemetryState.latest;
         const inputId = `input_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
-        if (!canvas) throw new Error('No Godot canvas is available to receive input.');
+        const surface = resolveGodotCanvas(args.target || 'auto');
+        if (!surface) throw new Error('No Godot canvas is available to receive input.');
+        const canvas = surface.canvas;
         window.__godotWebMcpInput = { input_id: inputId, key, pressed, dispatched_at: Date.now() };
         const event = new KeyboardEvent(pressed ? 'keydown' : 'keyup', { key, code: key, bubbles: true });
         canvas.dispatchEvent(event);
@@ -3498,7 +4573,8 @@ func _physics_process(delta):
                 properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
                 required: ['at_ms', 'key', 'pressed'], additionalProperties: false
               }
-            }
+            },
+            target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." }
           },
           required: ['events'], additionalProperties: false
         },
@@ -3506,8 +4582,9 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         if (!Array.isArray(args.events) || args.events.length < 1 || args.events.length > 32) throw new Error('An input sequence requires 1–32 events.');
-        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
-        if (!canvas) throw new Error('No Godot canvas is available to receive input.');
+        const surface = resolveGodotCanvas(args.target || 'auto');
+        if (!surface) throw new Error('No Godot canvas is available to receive input.');
+        const canvas = surface.canvas;
         const sequenceId = `input_sequence_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
         const events = args.events.map((entry, index) => ({ index, at_ms: entry.at_ms, key: entry.key, pressed: entry.pressed }))
           .sort((a, b) => a.at_ms - b.at_ms || a.index - b.index);
@@ -3575,19 +4652,25 @@ func _physics_process(delta):
     {
       definition: {
         name: 'godot_capture_viewport',
-        description: 'Captures the WebGL canvas pixel buffer directly as base64 PNG data URL',
-        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        description: 'Captures the pixel buffer of the editor viewport or the running playtest canvas as a base64 PNG data URL',
+        input_schema: { type: 'object', properties: { target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } }, additionalProperties: false },
         annotations: { readOnlyHint: true, untrustedContentHint: false }
       },
-      handler: async () => {
-        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
-        if (!canvas || typeof canvas.toDataURL !== 'function') {
+      handler: async (args = {}) => {
+        const surface = resolveGodotCanvas(args.target || 'auto');
+        if (!surface || typeof surface.canvas.toDataURL !== 'function') {
           throw new Error('No canvas is available for viewport capture.');
         }
+        const canvas = surface.canvas;
+        const rect = canvas.getBoundingClientRect();
         return {
           success: true,
+          viewport: surface.viewport,
+          requested_viewport: surface.requested,
           width: canvas.width,
           height: canvas.height,
+          device_pixel_ratio: typeof window !== 'undefined' ? (window.devicePixelRatio || 1) : 1,
+          css_size: { width: rect.width, height: rect.height },
           format: 'image/png',
           data_url: canvas.toDataURL('image/png')
         };
@@ -3604,7 +4687,8 @@ func _physics_process(delta):
             x: { type: 'number', minimum: 0 },
             y: { type: 'number', minimum: 0 },
             button: { type: 'string', enum: ['left', 'middle', 'right'], default: 'left' },
-            delta_y: { type: 'number', default: 0 }
+            delta_y: { type: 'number', default: 0 },
+            target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." }
           },
           required: ['action', 'x', 'y'],
           additionalProperties: false
@@ -3612,8 +4696,9 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        const canvas = document.getElementById('game-canvas') || document.getElementById('editor-canvas');
-        if (!canvas) throw new Error('No Godot canvas is available to receive pointer input.');
+        const surface = resolveGodotCanvas(args.target || 'auto');
+        if (!surface) throw new Error('No Godot canvas is available to receive pointer input.');
+        const canvas = surface.canvas;
         if (args.x > canvas.width || args.y > canvas.height) {
           throw new Error(`Pointer coordinates exceed the ${canvas.width}x${canvas.height} canvas.`);
         }
@@ -3653,6 +4738,8 @@ func _physics_process(delta):
           client_position: { x: clientX, y: clientY },
           button: args.button || 'left',
           target: canvas.id,
+          viewport: surface.viewport,
+          requested_viewport: surface.requested,
           gameplay_acknowledged: false,
           verify_with: 'godot_get_game_telemetry'
         };
@@ -3917,8 +5004,52 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_camera_focus',
+        description: 'Transient viewport-only framing: selects a node and dispatches Godot\'s own spatial_editor/focus_selection so the editor camera eases to it with the configured navigation inertia, and anchors the on-page focus reticle to the node\'s projected screen position. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload. Yields to the user for 750 ms after any pointer, wheel, or key input on the viewport.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            node_path: { type: 'string', description: 'Node name or scene-relative path to frame' }
+          },
+          required: ['node_path'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const result = await CameraGuidance.guide({ nodeName: args.node_path, reason: 'explicit' });
+        if (result.status === 'failed') throw new Error(result.error || 'Camera focus failed.');
+        return { success: result.status !== 'failed', ...result };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_camera_follow',
+        description: 'Enables or disables automatic camera follow for this browser session. When enabled, a geometry change (node added, moved, or deleted) queues exactly one coalesced framing move; material-only changes never move the camera. The preference is stored in sessionStorage and is also exposed as the Auto follow control in the page rail.',
+        input_schema: {
+          type: 'object',
+          properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const enabled = typeof args.enabled === 'boolean'
+          ? CameraGuidance.setAutoFollow(args.enabled)
+          : CameraGuidance.autoFollowEnabled();
+        return {
+          success: true,
+          auto_follow: enabled,
+          transient: true,
+          cooldown_ms: USER_INPUT_COOLDOWN_MILLISECONDS,
+          editor_command_channel: EditorCommandChannel.describe()
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_node_spawn',
-        description: 'Instantly spawns and attaches a 3D node with coordinates [X,Y,Z], transform, and material directly into the live 3D scene in <16ms without reloading the engine',
+        description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
         input_schema: {
           type: 'object',
           properties: {
@@ -3936,7 +5067,7 @@ func _physics_process(delta):
             material: {
               type: 'object',
               properties: {
-                albedo_color: { type: 'string', description: 'Hex color (e.g. #00e5ff) or rgba string' },
+                albedo_color: { type: 'string', description: 'Hex color (e.g. #538dda) or rgba string' },
                 metallic: { type: 'number', minimum: 0, maximum: 1 },
                 roughness: { type: 'number', minimum: 0, maximum: 1 },
                 emission: { type: 'string', description: 'Hex emissive color' },
@@ -3952,6 +5083,9 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const nodeName = cleanProjectName(args.name);
+        if (findSceneNode(activeFilesDict, nodeName)) {
+          throw new Error(`A node named '${nodeName}' already exists in the active scene. Godot renames name clashes on load, so pick a unique name or delete the existing node first.`);
+        }
         const parentPath = args.parent_path || '.';
         const meshType = args.mesh_type || 'box';
         const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : [0, 0, 0];
@@ -3977,29 +5111,36 @@ func _physics_process(delta):
           }
           updated = updated + nodeBlock;
           return updated;
+        }, {
+          command: {
+            op: 'node_add',
+            payload: {
+              name: nodeName, parent_path: parentPath, mesh_type: meshType,
+              size: args.size, radius: args.radius, height: args.height,
+              inner_radius: args.inner_radius, outer_radius: args.outer_radius,
+              position: pos, rotation: rot, scale, material: mat
+            }
+          }
         });
 
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.focus(nodeName, pos, meshType, 'SPAWNED');
+          CameraGuidance.noteSceneChanged(nodeName);
         }
 
-        return {
-          success: true,
+        return liveMutationResult(res, {
           node_name: nodeName,
           type: 'MeshInstance3D',
           parent_path: parentPath,
           position: pos,
-          mesh_type: meshType,
-          scene_revision: res.revision,
-          live_streamed: true,
-          execution_time_ms: 2
-        };
+          mesh_type: meshType
+        });
       }
     },
     {
       definition: {
         name: 'godot_node_transform',
-        description: 'Instantly translates, rotates, or scales any 3D node in the live editor scene in real-time (<16ms) without reloading',
+        description: 'Translates, rotates, or scales a 3D node in the live editor scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart.',
         input_schema: {
           type: 'object',
           properties: {
@@ -4036,27 +5177,32 @@ func _physics_process(delta):
             }
           }
           return source.slice(0, nodeIdx) + nodeBlock + source.slice(blockEnd);
+        }, {
+          command: {
+            op: 'node_transform',
+            payload: {
+              node_path: args.node_path, position: args.position,
+              rotation: args.rotation, scale: args.scale, relative: args.relative === true
+            }
+          }
         });
 
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.focus(nodeName, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
+          CameraGuidance.noteSceneChanged(nodeName);
         }
 
-        return {
-          success: true,
+        return liveMutationResult(res, {
           node_path: args.node_path,
           position: pos,
-          scale,
-          scene_revision: res.revision,
-          live_streamed: true,
-          execution_time_ms: 1
-        };
+          scale
+        });
       }
     },
     {
       definition: {
         name: 'godot_node_material',
-        description: 'Instantly updates material colors, metallic, roughness, and emissive properties of a 3D node in real-time (<16ms)',
+        description: 'Updates the albedo, metallic, roughness, and emissive properties of a 3D node material. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Material changes never move the camera.',
         input_schema: {
           type: 'object',
           properties: {
@@ -4097,14 +5243,24 @@ func _physics_process(delta):
             }
           }
           return updated;
+        }, {
+          command: {
+            op: 'node_material',
+            payload: {
+              node_path: args.node_path, albedo_color: args.albedo_color,
+              metallic: args.metallic, roughness: args.roughness,
+              emission: args.emission, emission_energy: args.emission_energy
+            }
+          }
         });
 
+        // A material tweak is not a geometry change: no auto-follow, and the reticle is
+        // anchored to the node's real position rather than the origin.
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(nodeName, [0, 0, 0], 'StandardMaterial3D', 'MATERIAL UPDATED');
+          AgentFocusOverlay.focus(nodeName, null, 'StandardMaterial3D', 'MATERIAL');
         }
 
-        return {
-          success: true,
+        return liveMutationResult(res, {
           node_path: args.node_path,
           material: {
             albedo_color: args.albedo_color,
@@ -4112,17 +5268,14 @@ func _physics_process(delta):
             roughness: args.roughness,
             emission: args.emission,
             emission_energy: args.emission_energy
-          },
-          scene_revision: res.revision,
-          live_streamed: true,
-          execution_time_ms: 1
-        };
+          }
+        });
       }
     },
     {
       definition: {
         name: 'godot_node_delete',
-        description: 'Instantly deletes a 3D node from the live scene tree in real-time (<16ms) without reloading',
+        description: 'Removes a 3D node from the live scene tree. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart.',
         input_schema: {
           type: 'object',
           properties: {
@@ -4142,19 +5295,14 @@ func _physics_process(delta):
           const nextNodeIdx = source.indexOf('\n[node name="', nodeIdx + 1);
           const blockEnd = nextNodeIdx > 0 ? nextNodeIdx : source.length;
           return source.slice(0, nodeIdx) + source.slice(blockEnd);
-        });
+        }, { command: { op: 'node_delete', payload: { node_path: args.node_path } } });
 
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(nodeName, [0, 0, 0], 'Node3D', 'DELETED');
+          AgentFocusOverlay.hide('node_deleted');
+          CameraGuidance.noteSceneChanged(null);
         }
 
-        return {
-          success: true,
-          deleted_node: nodeName,
-          scene_revision: res.revision,
-          live_streamed: true,
-          execution_time_ms: 1
-        };
+        return liveMutationResult(res, { deleted_node: nodeName });
       }
     }
   ];
@@ -4171,17 +5319,32 @@ func _physics_process(delta):
   // ==========================================
   // 8. Safe Native WebMCP Registration Core
   // ==========================================
+  // The WebMCP surface is still being standardised and the drafts disagree on the
+  // registration verb: some hosts expose `registerTool`, others only
+  // `provideContext({ tools })` alongside `getTools`/`executeTool`. Demanding
+  // `registerTool` alone made every spec-shaped host look unsupported — that is the
+  // `0 Tools (UNSUPPORTED)` the deployed page reports. Accept any surface we can
+  // actually publish onto, document first, then navigator.
+  function usableModelContext(candidate) {
+    if (!candidate || typeof candidate !== 'object') return null;
+    if (typeof candidate.registerTool === 'function') return 'registerTool';
+    if (typeof candidate.provideContext === 'function') return 'provideContext';
+    if (typeof candidate.executeTool === 'function' && typeof candidate.getTools === 'function') return 'provideContext';
+    return null;
+  }
+
   function resolveNativeModelContext() {
+    const candidates = [];
     try {
-      if (typeof document !== 'undefined' && document.modelContext && typeof document.modelContext.registerTool === 'function') {
-        return { context: document.modelContext, surface: 'document.modelContext' };
-      }
+      if (typeof document !== 'undefined' && document.modelContext) candidates.push(['document.modelContext', document.modelContext]);
     } catch (e) {}
     try {
-      if (typeof navigator !== 'undefined' && navigator.modelContext && typeof navigator.modelContext.registerTool === 'function') {
-        return { context: navigator.modelContext, surface: 'navigator.modelContext' };
-      }
+      if (typeof navigator !== 'undefined' && navigator.modelContext) candidates.push(['navigator.modelContext', navigator.modelContext]);
     } catch (e) {}
+    for (const [surface, context] of candidates) {
+      const mode = usableModelContext(context);
+      if (mode) return { context, surface, mode };
+    }
     return null;
   }
 
@@ -4190,12 +5353,7 @@ func _physics_process(delta):
   // ==========================================
   const AgentObservationHUD = {
     sequence: 0,
-    banner: null,
-    feed: null,
     entries: [],
-    userExpandedPreference: typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-feed-expanded') !== 'false' : true,
-    _feedCollapseTimer: null,
-    keepExpandedUntil: 0,
 
     describe(toolName, input = {}) {
       const labels = {
@@ -4235,81 +5393,25 @@ func _physics_process(delta):
         godot_get_operation_status: `Inspecting operation: ${input.operation_id || 'active/recent'}`,
         godot_get_game_telemetry: 'Reading project-owned game telemetry',
         godot_get_logs: 'Reading engine logs',
-        godot_node_spawn: `Live 3D Spawn: ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
-        godot_node_transform: `Live 3D Transform: ${input.node_path || 'node'}`,
-        godot_node_material: `Live 3D Material: ${input.node_path || 'node'}`,
-        godot_node_delete: `Live 3D Delete: ${input.node_path || 'node'}`
+        godot_camera_focus: `Framing ${input.node_path || 'node'} in the 3D viewport`,
+        godot_camera_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} automatic camera follow`,
+        godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
+        godot_node_transform: `Transforming ${input.node_path || 'node'}`,
+        godot_node_material: `Recolouring ${input.node_path || 'node'}`,
+        godot_node_delete: `Deleting ${input.node_path || 'node'}`
       };
       return labels[toolName] || toolName.replace(/^godot_/, '').replaceAll('_', ' ');
     },
 
+    // The banner and the feed duplicated each other's top row in two different corners.
+    // Both are now one line in the bottom rail; this object keeps the entry state and the
+    // observation eventing, and the rail owns every pixel.
     ensure() {
-      if (typeof document === 'undefined' || !document.body) return false;
-      if (!this.banner) {
-        this.banner = document.createElement('div');
-        this.banner.id = 'webmcp-agent-action-banner';
-        this.banner.style.cssText = 'position:fixed;top:38px;left:50%;transform:translateX(-50%);z-index:1000000;min-width:420px;max-width:min(760px,80vw);padding:8px 18px;border:1px solid #00e5ff;border-radius:999px;background:rgba(3,18,28,.94);box-shadow:0 0 22px rgba(0,229,255,.34),inset 0 0 12px rgba(0,229,255,.08);color:#dffbff;font:600 12px/1.2 Inter,system-ui,sans-serif;letter-spacing:.02em;text-align:center;pointer-events:none;opacity:0;transition:opacity .16s ease,transform .16s ease;';
-        document.body.appendChild(this.banner);
-      }
-      if (!this.feed) {
-        this.feed = document.createElement('div');
-        this.feed.id = 'webmcp-agent-action-feed';
-        const feedBottom = document.getElementById('webmcp-recording-shelf') ? '92px' : '42px';
-        this.feed.style.cssText = `position:fixed;right:14px;bottom:${feedBottom};z-index:999999;width:min(360px,calc(100vw - 28px));max-height:min(270px,44vh);overflow:hidden;padding:10px;border:1px solid rgba(0,229,255,.35);border-radius:9px;background:rgba(5,12,20,.9);box-shadow:0 12px 32px rgba(0,0,0,.38);color:#b9d9df;font:500 10px/1.35 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;cursor:pointer;transition:max-height .18s ease,padding .18s ease,opacity .18s ease;`;
-        this.feed.setAttribute('role', 'status');
-        this.feed.setAttribute('aria-live', 'polite');
-        this.feed.setAttribute('aria-label', 'WebMCP agent activity. Click to collapse or expand.');
-        this.feed.tabIndex = 0;
-        const toggleFeed = () => {
-          this.userExpandedPreference = !this.userExpandedPreference;
-          this.keepExpandedUntil = 0;
-          if (typeof localStorage !== 'undefined') {
-            localStorage.setItem('godot-webmcp-feed-expanded', this.userExpandedPreference ? 'true' : 'false');
-          }
-          clearTimeout(this._feedCollapseTimer);
-          this.renderFeed();
-        };
-        this.feed.addEventListener('click', toggleFeed);
-        this.feed.addEventListener('keydown', event => {
-          if (event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault();
-            toggleFeed();
-          }
-        });
-        this.feed.innerHTML = `<div style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent activity · Rev #${DiagnosticState.sceneRevision}</div><div style="margin-top:5px;color:#789099">Waiting for a WebMCP action…</div>`;
-        document.body.appendChild(this.feed);
-      }
-      this.feed.style.bottom = document.getElementById('webmcp-recording-shelf') ? '92px' : '42px';
-      return true;
+      return AgentStatusRail.ensure();
     },
 
     renderFeed() {
-      if (!this.ensure()) return;
-      const isOperationActive = activeManagedMutationId !== null || [...managedOperations.values()].some(op => op.status === 'running');
-      const isExpanded = this.userExpandedPreference || isOperationActive || Date.now() < this.keepExpandedUntil;
-      const latest = this.entries[this.entries.length - 1];
-
-      if (!isExpanded) {
-        const color = latest?.status === 'succeeded' ? '#45e7a4' : latest?.status === 'failed' ? '#ff667f' : latest?.status === 'pending' ? '#ffc857' : '#4de8ff';
-        const status = latest ? this.escape(latest.status) : 'idle';
-        const label = latest ? this.escape(latest.label) : 'Waiting for a WebMCP action…';
-        this.feed.style.maxHeight = '34px';
-        this.feed.style.padding = '7px 10px';
-        this.feed.innerHTML = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap"><span style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent · Rev #${DiagnosticState.sceneRevision}</span><span style="color:${color};text-transform:uppercase">${status}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;color:#9bbbc1">${label}</span><span style="margin-left:auto;color:#789099">⌃</span></div>`;
-        return;
-      }
-
-      this.feed.style.maxHeight = 'min(270px,44vh)';
-      this.feed.style.padding = '10px';
-      const rows = this.entries.slice(-4).reverse().map((entry) => {
-        const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : entry.status === 'pending' ? '#ffc857' : '#4de8ff';
-        const detailText = entry.detail ? ` (${this.escape(entry.detail)})` : '';
-        const timeline = Array.isArray(entry.timeline) && entry.timeline.length > 0
-          ? `<div style="display:grid;gap:2px;margin:6px 0 1px;padding:5px 7px;border-left:1px solid rgba(77,232,255,.45);background:rgba(0,229,255,.035);color:#91b8bf">${entry.timeline.slice(-7).map(event => `<div><span style="color:${event.phase === entry.phase ? '#fff0a6' : '#4de8ff'}">${event.phase === entry.phase ? '●' : '·'}</span> ${this.escape(event.label)} <span style="color:#627c84">${(event.elapsed_ms / 1000).toFixed(1)}s</span></div>`).join('')}</div>`
-          : '';
-        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}${detailText}${timeline}</span></div>`;
-      }).join('');
-      this.feed.innerHTML = `<div style="display:flex;margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase"><span>Agent activity · Rev #${DiagnosticState.sceneRevision}</span><span style="margin-left:auto;color:#789099">⌄</span></div>${rows}`;
+      AgentStatusRail.render();
     },
 
     escape(value) {
@@ -4351,26 +5453,7 @@ func _physics_process(delta):
       }
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
-      if (Array.isArray(entry.timeline) && entry.timeline.length > 0) {
-        this.keepExpandedUntil = now + 9000;
-      }
-      if (this.ensure()) {
-        clearTimeout(this._feedCollapseTimer);
-        const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : status === 'pending' ? '…' : '✦';
-        this.banner.textContent = `${icon} AI Agent · ${label}${detail ? ` · ${detail}` : ''}`;
-        this.banner.style.borderColor = status === 'failed' ? '#ff667f' : status === 'succeeded' ? '#45e7a4' : '#00e5ff';
-        this.banner.style.opacity = '1';
-        this.banner.style.transform = 'translateX(-50%) translateY(0)';
-        clearTimeout(this._hideTimer);
-        this._hideTimer = setTimeout(() => { if (this.banner) this.banner.style.opacity = '0'; }, status === 'running' ? 2200 : 3200);
-        this.renderFeed();
-        const isAnyActive = activeManagedMutationId !== null || [...managedOperations.values()].some(op => op.status === 'running');
-        if (!isAnyActive && status !== 'running' && status !== 'pending' && !this.userExpandedPreference) {
-          this._feedCollapseTimer = setTimeout(() => {
-            this.renderFeed();
-          }, 9200);
-        }
-      }
+      this.renderFeed();
       const observationDetail = {
         id: entry.id,
         operation_id: entry.operationId || null,
@@ -4397,142 +5480,6 @@ func _physics_process(delta):
         } catch (_) {}
       }
       return entry;
-    }
-  };
-
-  const BuildingBlocksHUD = {
-    dock: null,
-    expanded: true,
-
-    ensure() {
-      if (typeof document === 'undefined' || !document.body) return false;
-      if (!this.dock) {
-        this.dock = document.createElement('div');
-        this.dock.id = 'webmcp-building-blocks-dock';
-        this.dock.style.cssText = 'position:fixed;left:14px;bottom:42px;z-index:999999;width:min(340px,calc(100vw - 28px));max-height:min(280px,48vh);overflow-y:auto;padding:10px 12px;border:1px solid rgba(0,229,255,.4);border-radius:10px;background:rgba(5,14,24,.94);box-shadow:0 12px 32px rgba(0,0,0,.5);color:#d1e8ee;font:500 11px/1.4 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;backdrop-filter:blur(8px);';
-
-        const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;margin-bottom:8px;font-weight:700;color:#00e5ff;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;user-select:none;';
-        header.innerHTML = '<span>🏗️ Architecture & Building Blocks</span><span id="webmcp-blocks-toggle" style="margin-left:auto;color:#789099">⌄</span>';
-        header.onclick = () => {
-          this.expanded = !this.expanded;
-          const toggle = document.getElementById('webmcp-blocks-toggle');
-          if (toggle) toggle.textContent = this.expanded ? '⌄' : '⌃';
-          const list = document.getElementById('webmcp-blocks-list');
-          if (list) list.style.display = this.expanded ? 'block' : 'none';
-        };
-        this.dock.appendChild(header);
-
-        const list = document.createElement('div');
-        list.id = 'webmcp-blocks-list';
-        this.dock.appendChild(list);
-
-        document.body.appendChild(this.dock);
-      }
-      return true;
-    },
-
-    updateFromFiles(filesDict, activeRevision) {
-      if (!this.ensure()) return;
-      const list = document.getElementById('webmcp-blocks-list');
-      if (!list) return;
-
-      const blocks = [];
-      const fileKeys = Object.keys(filesDict || {});
-      const sceneGraph = sceneGraphFromFiles(filesDict);
-
-      if (sceneGraph.nodes.length > 0) {
-        const visibleNodes = sceneGraph.nodes.filter(node => [
-          'MeshInstance3D', 'Camera3D', 'DirectionalLight3D', 'WorldEnvironment', 'CanvasLayer'
-        ].includes(node.type));
-        blocks.push({
-          icon: '◌',
-          name: `Authored scene · ${sceneGraph.nodes.length} editable nodes`,
-          files: visibleNodes.slice(0, 4).map(node => `${node.name} (${node.type})`),
-          status: `Scene rev #${activeRevision}`,
-          color: '#e7c47a'
-        });
-      }
-
-      if (fileKeys.some(f => f.includes('main_3d'))) {
-        blocks.push({
-          icon: '🛣️',
-          name: 'Track & Cyber Highway',
-          files: ['main_3d.tscn', 'main_3d.gd', 'project.godot'].filter(f => f in filesDict),
-          status: 'Compiled & Staged',
-          color: '#38bdf8'
-        });
-      }
-      if (fileKeys.some(f => f.includes('player_runner') || f.includes('player_speeder') || f.includes('player'))) {
-        blocks.push({
-          icon: '🚀',
-          name: 'Player Hovercraft Character',
-          files: fileKeys.filter(f => f.includes('player')),
-          status: 'Active 3-Lane Controller',
-          color: '#00e5ff'
-        });
-      }
-      if (fileKeys.some(f => f.includes('laser_barrier') || f.includes('laser'))) {
-        blocks.push({
-          icon: '🚨',
-          name: 'Crimson Laser Barriers',
-          files: fileKeys.filter(f => f.includes('laser')),
-          status: 'Active Hazards (25 DMG)',
-          color: '#f87171'
-        });
-      }
-      if (fileKeys.some(f => f.includes('plasma_disc') || f.includes('plasma_mine') || f.includes('plasma'))) {
-        blocks.push({
-          icon: '🔮',
-          name: 'Amethyst Plasma Mines',
-          files: fileKeys.filter(f => f.includes('plasma')),
-          status: 'Oscillating Mine Field',
-          color: '#c084fc'
-        });
-      }
-      if (fileKeys.some(f => f.includes('flux_orb') || f.includes('quantum_crystal') || f.includes('crystal') || f.includes('orb'))) {
-        blocks.push({
-          icon: '✨',
-          name: 'Quantum Flux Crystals',
-          files: fileKeys.filter(f => f.includes('flux') || f.includes('crystal') || f.includes('orb')),
-          status: 'Spinning Pickups (+100 PTS)',
-          color: '#fbbf24'
-        });
-      }
-      if (fileKeys.some(f => f.includes('nexus_gate') || f.includes('goal') || f.includes('portal'))) {
-        blocks.push({
-          icon: '🌌',
-          name: 'Quantum Nexus Goal Gate',
-          files: fileKeys.filter(f => f.includes('nexus') || f.includes('goal') || f.includes('portal')),
-          status: 'Finish Line Portal @ 800m',
-          color: '#34d399'
-        });
-      }
-      if (fileKeys.some(f => f.includes('hud_overlay') || f.includes('hud'))) {
-        blocks.push({
-          icon: '📊',
-          name: 'Cyberpunk HUD Overlay',
-          files: fileKeys.filter(f => f.includes('hud')),
-          status: 'Live Telemetry & Shields',
-          color: '#4ade80'
-        });
-      }
-
-      if (blocks.length === 0) {
-        list.innerHTML = '<div style="color:#64748b;font-size:10px;">Waiting for building blocks...</div>';
-        return;
-      }
-
-      list.innerHTML = blocks.map((b, idx) => `
-        <div style="display:flex;align-items:flex-start;gap:6px;padding:4px 2px;border-bottom:1px solid rgba(255,255,255,.05);font-size:10px;">
-          <span style="font-size:12px;">${b.icon}</span>
-          <div style="min-width:0;flex:1;">
-            <div style="font-weight:700;color:${b.color};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Block #${idx+1}: ${b.name}</div>
-            <div style="color:#94a3b8;font-size:9px;">${b.files.join(' · ')}</div>
-          </div>
-          <span style="color:#34d399;font-size:9px;white-space:nowrap;margin-left:auto;">✓ Active</span>
-        </div>
-      `).join('');
     }
   };
 
@@ -4637,13 +5584,23 @@ func _physics_process(delta):
       DiagnosticState.webmcpSurface = native.surface;
       console.log(`[WebMCP] Found native surface: ${native.surface}. Registering ${MANIFEST_TOOLS.length} tools...`);
       const controller = new AbortController();
-      for (const tool of MANIFEST_TOOLS) {
+      if (native.mode === 'provideContext' && typeof native.context.provideContext === 'function') {
         try {
-          await native.context.registerTool(nativeToolDefinition(tool), { signal: controller.signal });
-          count++;
+          await native.context.provideContext({ tools: MANIFEST_TOOLS.map(nativeToolDefinition) });
+          count = MANIFEST_TOOLS.length;
         } catch (err) {
-          console.error(`[WebMCP] Error registering tool '${tool.definition.name}' on ${native.surface}:`, err);
-          DiagnosticState.webmcpLastError = `${tool.definition.name}: ${err.message}`;
+          console.error(`[WebMCP] Bulk registration failed on ${native.surface}:`, err);
+          DiagnosticState.webmcpLastError = `provideContext: ${err.message}`;
+        }
+      } else {
+        for (const tool of MANIFEST_TOOLS) {
+          try {
+            await native.context.registerTool(nativeToolDefinition(tool), { signal: controller.signal });
+            count++;
+          } catch (err) {
+            console.error(`[WebMCP] Error registering tool '${tool.definition.name}' on ${native.surface}:`, err);
+            DiagnosticState.webmcpLastError = `${tool.definition.name}: ${err.message}`;
+          }
         }
       }
       if (DiagnosticState.webmcpLastError) {
@@ -4652,6 +5609,9 @@ func _physics_process(delta):
         DiagnosticState.webmcp = 'ready';
       }
       DiagnosticState.webmcpRegisteredCount = count;
+      // Additive, never authoritative: headless relay agents and the verification
+      // harness still need a callable path when a native surface is present.
+      installTestBridge();
     } else {
       console.warn('[WebMCP] Native ModelContext not present in browser. Enabling test discovery bridge...');
       DiagnosticState.webmcp = 'unsupported';
@@ -4662,119 +5622,723 @@ func _physics_process(delta):
   }
 
   // ==========================================
-  // 8C. Agent 3D View Focus Overlay
+  // 8C. Agent 3D Focus Overlay — anchored, eased, edge-clamped
   // ==========================================
+  // The previous version drew a reticle at a hard-coded `top:44%; left:50%`, so it sat dead
+  // centre while the node it named was off-screen. This one projects the node's real world
+  // position through the real camera and either anchors a reticle to it or, when it falls
+  // outside the frustum, clamps a direction arrow to the frame edge with a distance label.
   const AgentFocusOverlay = {
     overlay: null,
-    timer: null,
+    frame: null,
+    hideTimer: null,
+    animation: null,
+    current: null,
 
     ensure() {
       if (typeof document === 'undefined' || !document.body) return false;
       if (!this.overlay) {
         this.overlay = document.createElement('div');
         this.overlay.id = 'webmcp-3d-focus-overlay';
-        this.overlay.style.cssText = 'position:fixed;top:44%;left:50%;transform:translate(-50%,-50%);z-index:1000000;pointer-events:none;display:flex;flex-direction:column;align-items:center;opacity:0;transition:opacity .2s ease, transform .25s cubic-bezier(0.16,1,0.3,1);';
+        this.overlay.setAttribute('aria-hidden', 'true');
+        this.overlay.style.cssText = [
+          'position:fixed', 'left:0', 'top:0', 'z-index:var(--gd-z-rail, 900)',
+          'pointer-events:none', 'opacity:0', 'will-change:transform,opacity',
+          'transition:opacity .16s ease'
+        ].join(';');
         document.body.appendChild(this.overlay);
       }
       return true;
     },
 
-    focus(nodeName, pos = [0, 0, 0], type = 'Node3D', action = 'SPAWNED') {
-      if (!this.ensure()) return;
-      clearTimeout(this.timer);
-      const posStr = Array.isArray(pos) ? pos.map(n => Number(n).toFixed(1)).join(', ') : String(pos);
+    hide(reason = 'idle', publishState = true) {
+      if (this.overlay) this.overlay.style.opacity = '0';
+      if (this.animation !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.animation);
+      this.animation = null;
+      this.current = null;
+      if (publishState) this.publish({ mode: 'hidden', reason });
+    },
 
-      this.overlay.innerHTML = `
-        <div style="position:relative;width:150px;height:150px;border:1px solid rgba(0,229,255,0.5);border-radius:12px;box-shadow:0 0 30px rgba(0,229,255,0.5), inset 0 0 20px rgba(0,229,255,0.15);display:flex;align-items:center;justify-content:center;">
-          <div style="position:absolute;top:-2px;left:-2px;width:16px;height:16px;border-top:3px solid #00e5ff;border-left:3px solid #00e5ff;border-top-left-radius:6px;"></div>
-          <div style="position:absolute;top:-2px;right:-2px;width:16px;height:16px;border-top:3px solid #00e5ff;border-right:3px solid #00e5ff;border-top-right-radius:6px;"></div>
-          <div style="position:absolute;bottom:-2px;left:-2px;width:16px;height:16px;border-bottom:3px solid #00e5ff;border-left:3px solid #00e5ff;border-bottom-left-radius:6px;"></div>
-          <div style="position:absolute;bottom:-2px;right:-2px;width:16px;height:16px;border-bottom:3px solid #00e5ff;border-right:3px solid #00e5ff;border-bottom-right-radius:6px;"></div>
-          <div style="width:10px;height:10px;background:#00e5ff;border-radius:50%;box-shadow:0 0 12px #00e5ff;"></div>
-        </div>
-        <div style="margin-top:14px;display:flex;align-items:center;gap:8px;padding:6px 16px;background:rgba(3,14,24,0.96);border:1px solid #00e5ff;border-radius:8px;box-shadow:0 0 24px rgba(0,229,255,0.6);font-family:ui-monospace,SFMono-Regular,monospace;color:#fff;white-space:nowrap;">
-          <span style="font-weight:750;letter-spacing:0.08em;color:#00e5ff;font-size:11px;text-transform:uppercase;">🎯 [3D FOCUS · ${action}]</span>
-          <span style="font-weight:700;font-size:12px;color:#fff;">${nodeName}</span>
-          <span style="background:rgba(0,229,255,0.2);padding:2px 8px;border-radius:4px;font-size:11px;color:#7feaff;">XYZ: [${posStr}]</span>
-          <span style="font-size:11px;color:#ffd54f;">${type}</span>
-        </div>
-      `;
+    // Read by the verification harness (test/checklists/camera.md) so a check can assert
+    // where the reticle actually landed rather than eyeballing a screenshot.
+    publish(state) {
+      if (typeof window === 'undefined') return;
+      window.__webmcpFocusState = { ...state, at: Date.now() };
+    },
 
+    resolveTarget(nodeName, fallbackPosition) {
+      const node = findSceneNode(activeFilesDict, nodeName);
+      const worldPosition = node?.world_position
+        || (Array.isArray(fallbackPosition) && fallbackPosition.length >= 3 ? fallbackPosition.map(Number) : null);
+      return {
+        node,
+        worldPosition,
+        halfExtents: node?.aabb?.half_extents || [0.5, 0.5, 0.5]
+      };
+    },
+
+    focus(nodeName, pos = null, type = 'Node3D', action = 'SPAWNED') {
+      if (!this.ensure()) return { mode: 'hidden', reason: 'no_document' };
+      const surface = resolveGodotCanvas('auto');
+      const target = this.resolveTarget(nodeName, pos);
+      if (!surface || !target.worldPosition) {
+        this.hide('unresolved_target');
+        AgentStatusRail.setFocusNote(`${nodeName} · position unknown`);
+        return { mode: 'hidden', reason: 'unresolved_target' };
+      }
+      const pose = resolveCameraPose(surface.viewport);
+      if (!pose) {
+        // No camera we are entitled to trust. Say so in the rail instead of drawing a
+        // reticle over a screen position we cannot compute.
+        this.hide('no_camera_pose');
+        const coordinates = target.worldPosition.map(value => Number(value).toFixed(1)).join(', ');
+        AgentStatusRail.setFocusNote(`${nodeName} · [${coordinates}] · camera pose unavailable`);
+        return { mode: 'hidden', reason: 'no_camera_pose' };
+      }
+
+      const rect = surface.canvas.getBoundingClientRect();
+      // A canvas with no laid-out size cannot be projected onto. This is the normal state in
+      // a hidden or backgrounded tab, where the host pauses requestAnimationFrame and
+      // index.html's adjustCanvasDimensions never runs — report it as the environment fact
+      // it is rather than as a projection error.
+      if (!rect.width || !rect.height) {
+        this.hide('canvas_not_laid_out', false);
+        const coordinates = target.worldPosition.map(value => Number(value).toFixed(1)).join(', ');
+        AgentStatusRail.setFocusNote(`${nodeName} · [${coordinates}] · viewport not laid out`);
+        this.publish({
+          mode: 'hidden',
+          reason: 'canvas_not_laid_out',
+          nodeName,
+          world_position: target.worldPosition,
+          canvas_rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+          camera_source: pose.source
+        });
+        return { mode: 'hidden', reason: 'canvas_not_laid_out' };
+      }
+      const projection = projectWorldPoint(target.worldPosition, pose, rect);
+      if (!projection) {
+        this.hide('projection_failed', false);
+        this.publish({ mode: 'hidden', reason: 'projection_failed', nodeName, world_position: target.worldPosition });
+        return { mode: 'hidden', reason: 'projection_failed' };
+      }
+
+      const radius = projectedRadius(target.halfExtents, projection, rect);
+      const state = projection.onScreen
+        ? this.renderReticle(nodeName, type, action, target, projection, radius, rect, pose)
+        : this.renderEdgeArrow(nodeName, type, action, target, projection, rect, pose);
+
+      clearTimeout(this.hideTimer);
+      this.hideTimer = setTimeout(() => this.hide('expired'), 3200);
+      return state;
+    },
+
+    // Eased over MAX_FOCUS_FRAMES, or snapped for reduced-motion users.
+    moveTo(x, y) {
+      const reduced = typeof window !== 'undefined'
+        && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
+      const from = this.current || { x, y };
+      this.current = { x, y };
+      if (this.animation !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.animation);
+      this.animation = null;
+      if (reduced || typeof requestAnimationFrame !== 'function') {
+        this.overlay.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+        return;
+      }
+      const frames = 8;
+      let frame = 0;
+      const step = () => {
+        frame += 1;
+        const progress = frame / frames;
+        const eased = progress * progress * (3 - 2 * progress);
+        const currentX = from.x + (x - from.x) * eased;
+        const currentY = from.y + (y - from.y) * eased;
+        this.overlay.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+        if (frame < frames) this.animation = requestAnimationFrame(step);
+        else this.animation = null;
+      };
+      this.animation = requestAnimationFrame(step);
+    },
+
+    label(nodeName, type, action, detail) {
+      return `<div style="margin-top:10px;display:flex;align-items:center;gap:8px;padding:4px 10px;border:1px solid var(--gd-border,#484848);border-radius:6px;background:var(--gd-panel,#1b1b1b);color:var(--gd-text,#d0d0d0);font:600 12px/1.3 var(--gd-font-ui,Inter,system-ui,sans-serif);white-space:nowrap;transform:translateX(-50%)">`
+        + `<span style="color:var(--gd-accent,#538dda);text-transform:uppercase;letter-spacing:.06em;font-size:10px">${this.escape(action)}</span>`
+        + `<span>${this.escape(nodeName)}</span>`
+        + `<span style="color:var(--gd-text-muted,#9a9a9a);font:400 11px/1.3 var(--gd-font-mono,ui-monospace,monospace)">${this.escape(detail)}</span>`
+        + `</div>`;
+    },
+
+    escape(value) {
+      return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    },
+
+    renderReticle(nodeName, type, action, target, projection, radius, rect, pose) {
+      const size = Math.round(radius * 2);
+      const coordinates = target.worldPosition.map(value => Number(value).toFixed(1)).join(', ');
+      this.overlay.innerHTML =
+        `<div style="position:relative;width:${size}px;height:${size}px;margin-left:${-size / 2}px;margin-top:${-size / 2}px;border:1px solid var(--gd-accent,#538dda);border-radius:4px">`
+        + ['top:-1px;left:-1px;border-top:2px solid var(--gd-accent,#538dda);border-left:2px solid var(--gd-accent,#538dda)',
+           'top:-1px;right:-1px;border-top:2px solid var(--gd-accent,#538dda);border-right:2px solid var(--gd-accent,#538dda)',
+           'bottom:-1px;left:-1px;border-bottom:2px solid var(--gd-accent,#538dda);border-left:2px solid var(--gd-accent,#538dda)',
+           'bottom:-1px;right:-1px;border-bottom:2px solid var(--gd-accent,#538dda);border-right:2px solid var(--gd-accent,#538dda)']
+          .map(style => `<span style="position:absolute;width:10px;height:10px;${style}"></span>`).join('')
+        + `</div>`
+        + this.label(nodeName, type, action, `[${coordinates}]`);
       this.overlay.style.opacity = '1';
-      this.overlay.style.transform = 'translate(-50%, -50%) scale(1)';
+      this.moveTo(projection.x, projection.y);
+      const state = {
+        mode: 'reticle',
+        x: projection.x,
+        y: projection.y,
+        canvas_rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+        ndc: projection.ndc,
+        radius,
+        nodeName,
+        offscreen: false,
+        camera_source: pose.source,
+        world_position: target.worldPosition
+      };
+      this.publish(state);
+      AgentStatusRail.setFocusNote(`${nodeName} · framed`);
+      return state;
+    },
 
-      this.timer = setTimeout(() => {
-        if (this.overlay) {
-          this.overlay.style.opacity = '0';
-          this.overlay.style.transform = 'translate(-50%, -50%) scale(0.95)';
+    renderEdgeArrow(nodeName, type, action, target, projection, rect, pose) {
+      const margin = 26;
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      // Clamp the projected direction to the frame border rather than pinning it to a corner.
+      const directionX = projection.x - centerX;
+      const directionY = projection.y - centerY;
+      const magnitude = Math.hypot(directionX, directionY) || 1;
+      const limitX = (rect.width / 2) - margin;
+      const limitY = (rect.height / 2) - margin;
+      const scale = Math.min(limitX / Math.abs(directionX || 1e-6), limitY / Math.abs(directionY || 1e-6));
+      const clampedX = centerX + directionX * scale;
+      const clampedY = centerY + directionY * scale;
+      const angle = Math.atan2(directionY, directionX) * 180 / Math.PI;
+      const coordinates = target.worldPosition.map(value => Number(value).toFixed(1)).join(', ');
+      const detail = `off-screen · ${projection.distance.toFixed(1)}m · [${coordinates}]`;
+      this.overlay.innerHTML =
+        `<div style="width:0;height:0;margin-left:-9px;margin-top:-9px;border-left:14px solid var(--gd-accent,#538dda);border-top:9px solid transparent;border-bottom:9px solid transparent;transform:rotate(${angle}deg)"></div>`
+        + this.label(nodeName, type, action, detail);
+      this.overlay.style.opacity = '1';
+      this.moveTo(clampedX, clampedY);
+      const state = {
+        mode: 'arrow',
+        x: clampedX,
+        y: clampedY,
+        canvas_rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+        ndc: projection.ndc,
+        angle,
+        distance: projection.distance,
+        nodeName,
+        offscreen: true,
+        behind_camera: projection.behind,
+        camera_source: pose.source,
+        world_position: target.worldPosition
+      };
+      this.publish(state);
+      AgentStatusRail.setFocusNote(`${nodeName} · off-screen ${projection.distance.toFixed(1)}m`);
+      return state;
+    },
+
+  };
+
+  // ==========================================
+  // 8D. Camera guidance channel
+  // ==========================================
+  // Ported from the reference studio's camera module (test/camera-guidance.js). Its four
+  // rules are the reason that implementation feels good and a naive one does not:
+  //   1. Yield to the human — any pointer/wheel/key input on the canvas aborts in-flight
+  //      guidance and starts a cooldown.
+  //   2. Never fight a stale renderer — every request is fenced against the editor-boot
+  //      generation, so a request issued before a restart cannot move the camera after it.
+  //   3. Coalesce — exactly one pending follow; five rapid spawns produce one camera move.
+  //   4. Respect prefers-reduced-motion.
+  // Framing itself is transient: it never mutates the scene, advances sceneRevision, creates
+  // an undo entry, or survives a project reload.
+  const USER_INPUT_COOLDOWN_MILLISECONDS = 750;
+  const MAX_GUIDANCE_FRAMES = 8;
+  const CAMERA_AUTO_FOLLOW_PREFERENCE_KEY = 'godot-webmcp.auto-follow';
+
+  function nextFrame(timeoutMs = 64) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => { if (!settled) { settled = true; resolve(); } };
+      // A hidden or backgrounded tab never fires requestAnimationFrame, so guidance must
+      // never be able to wait on it forever.
+      const timer = setTimeout(done, timeoutMs);
+      if (typeof requestAnimationFrame === 'function') {
+        requestAnimationFrame(() => { clearTimeout(timer); done(); });
+      }
+    });
+  }
+
+  const CameraGuidance = {
+    lastInteractionAt: Number.NEGATIVE_INFINITY,
+    pending: null,
+    queued: false,
+    lastGeometrySignature: null,
+    installed: false,
+
+    autoFollowEnabled() {
+      try {
+        return sessionStorage?.getItem(CAMERA_AUTO_FOLLOW_PREFERENCE_KEY) !== 'off';
+      } catch (_) {
+        return true;
+      }
+    },
+
+    setAutoFollow(enabled) {
+      try {
+        sessionStorage?.setItem(CAMERA_AUTO_FOLLOW_PREFERENCE_KEY, enabled ? 'on' : 'off');
+      } catch (_) {}
+      if (enabled) this.lastInteractionAt = Number.NEGATIVE_INFINITY;
+      else this.pending = null;
+      CameraControls.render();
+      return this.autoFollowEnabled();
+    },
+
+    install() {
+      if (this.installed || typeof document === 'undefined') return;
+      this.installed = true;
+      const note = () => { this.lastInteractionAt = Date.now(); this.pending = null; };
+      for (const type of ['pointerdown', 'wheel', 'keydown']) {
+        document.addEventListener(type, (event) => {
+          const target = event.target;
+          if (target && (target.id === 'editor-canvas' || target.id === 'game-canvas')) note();
+        }, { capture: true, passive: true });
+      }
+    },
+
+    yieldedToUser(reason = 'user_active') {
+      return {
+        status: 'yielded',
+        reason,
+        camera_moved: false,
+        target_reached: false,
+        transient: true,
+        cooldown_remaining_ms: Math.max(0, USER_INPUT_COOLDOWN_MILLISECONDS - (Date.now() - this.lastInteractionAt)),
+        scene_revision: DiagnosticState.sceneRevision
+      };
+    },
+
+    withinCooldown() {
+      return Date.now() - this.lastInteractionAt < USER_INPUT_COOLDOWN_MILLISECONDS;
+    },
+
+    // Drives Godot's own damped fly-to via selection + `spatial_editor/focus_selection`,
+    // then polls the viewport pose for a bounded number of frames so the reticle tracks the
+    // camera while Godot eases it.
+    async guide({ nodeName, reason = 'explicit' }) {
+      this.install();
+      if (this.withinCooldown()) return this.yieldedToUser();
+      const generation = EditorCommandChannel.generation;
+      const node = findSceneNode(activeFilesDict, nodeName);
+      if (!node) {
+        return { status: 'failed', reason: 'unknown_node', error: `Node '${nodeName}' is not in the active scene.`, transient: true };
+      }
+
+      const overlayState = AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
+      // Select, let Node3DEditor's deferred selection handling run, then dispatch the
+      // framing shortcut. Sending both in one frame frames an empty selection.
+      const selected = EditorCommandChannel.call('select', { node_path: node.node_path });
+      let reply = selected;
+      if (selected.ok) {
+        await nextFrame();
+        await nextFrame();
+        reply = EditorCommandChannel.call('focus_dispatch');
+      }
+      if (!reply.ok) {
+        return {
+          status: 'overlay_only',
+          reason: reply.unsupported ? 'command_channel_unavailable' : 'focus_rejected',
+          error: reply.error,
+          camera_moved: false,
+          target_reached: false,
+          transient: true,
+          overlay: overlayState,
+          scene_revision: DiagnosticState.sceneRevision
+        };
+      }
+
+      const reduced = typeof window !== 'undefined'
+        && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
+      const frames = reduced ? 1 : MAX_GUIDANCE_FRAMES;
+      let framesPresented = 0;
+      for (let frame = 0; frame < frames; frame += 1) {
+        await nextFrame();
+        if (EditorCommandChannel.generation !== generation) {
+          return { status: 'stale', reason: 'editor_restarted', transient: true, frames_presented: framesPresented };
         }
-      }, 3000);
+        if (this.withinCooldown()) return this.yieldedToUser();
+        AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
+        framesPresented += 1;
+      }
+      return {
+        status: 'framed',
+        reason,
+        camera_moved: true,
+        target_reached: true,
+        transient: true,
+        frames_presented: framesPresented,
+        mechanism: reply.mechanism || 'spatial_editor/focus_selection',
+        node_path: node.node_path,
+        scene_revision: DiagnosticState.sceneRevision,
+        overlay: overlayState
+      };
+    },
+
+    // One pending follow at a time: a burst of spawns collapses to a single camera move.
+    queueFollow(nodeName, reason = 'geometry_change') {
+      if (!this.autoFollowEnabled()) return;
+      this.pending = { nodeName, reason };
+      if (this.queued) return;
+      this.queued = true;
+      Promise.resolve().then(async () => {
+        this.queued = false;
+        const request = this.pending;
+        this.pending = null;
+        if (!request || !this.autoFollowEnabled()) return;
+        try {
+          await this.guide(request);
+        } catch (_) {
+          // Auto-follow is best-effort; it must never fail an accepted scene mutation.
+        }
+      });
+    },
+
+    // Geometry only. A material tweak must not yank the camera.
+    geometrySignature(filesDict = activeFilesDict) {
+      const graph = sceneGraphFromFiles(filesDict);
+      return JSON.stringify(graph.nodes
+        .filter(node => node.mesh || node.local_transform)
+        .map(node => [node.node_path, node.world_position, node.mesh?.type || null, node.aabb?.half_extents || null]));
+    },
+
+    noteSceneChanged(nodeName) {
+      const signature = this.geometrySignature();
+      const changed = signature !== this.lastGeometrySignature;
+      this.lastGeometrySignature = signature;
+      if (changed && nodeName) this.queueFollow(nodeName);
+      return changed;
     }
   };
 
   // ==========================================
-  // 9. Persistent 3-State Diagnostic Readiness HUD
+  // 8E. Agent surfaces — one bottom rail, three controls
   // ==========================================
-  const DiagnosticHUD = {
-    container: null,
+  // Godot owns all four screen corners with its own docks. The agent layer previously put
+  // five fixed overlays into three of those corners plus the centre, in four different
+  // greens and four different reds. It is now a single bottom rail: camera controls left,
+  // status strip centre, scene inspector right. Everything is pointer-events:none except
+  // the three interactive controls, so the Godot canvas stops losing clicks.
+  const RAIL_TOKENS = {
+    surface: 'var(--gd-surface, #141414)',
+    panel: 'var(--gd-panel, #1b1b1b)',
+    raised: 'var(--gd-panel-raised, #262626)',
+    border: 'var(--gd-border, #484848)',
+    text: 'var(--gd-text, #d0d0d0)',
+    muted: 'var(--gd-text-muted, #9a9a9a)',
+    accent: 'var(--gd-accent, #538dda)',
+    ok: 'var(--gd-ok, #6a9955)',
+    warn: 'var(--gd-warn, #d7a355)',
+    error: 'var(--gd-error, #d16969)',
+    running: 'var(--gd-running, #5c9fd6)',
+    ui: 'var(--gd-font-ui, Inter, system-ui, sans-serif)',
+    mono: 'var(--gd-font-mono, ui-monospace, SFMono-Regular, monospace)'
+  };
 
-    init() {
-      if (typeof document === 'undefined') return;
-      if (this.container) return;
+  const PANEL_STYLE = `border:1px solid ${RAIL_TOKENS.border};border-radius:6px;background:${RAIL_TOKENS.panel};box-shadow:0 8px 24px rgba(0,0,0,.45);color:${RAIL_TOKENS.text};pointer-events:auto`;
+  const BUTTON_STYLE = `appearance:none;border:1px solid ${RAIL_TOKENS.border};border-radius:4px;background:${RAIL_TOKENS.raised};color:${RAIL_TOKENS.text};font:500 12px/1 ${RAIL_TOKENS.ui};padding:5px 9px;cursor:pointer`;
 
-      this.container = document.createElement('div');
-      this.container.id = 'webmcp-diagnostic-hud';
-      this.container.style.cssText = `
-        position: fixed;
-        bottom: 12px;
-        right: 12px;
-        z-index: 99999;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        background: rgba(13, 17, 23, 0.94);
-        border: 1px solid rgba(56, 139, 253, 0.4);
-        border-radius: 8px;
-        padding: 6px 12px;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
-        font-size: 11px;
-        color: #c9d1d9;
-        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
-        backdrop-filter: blur(8px);
-        user-select: none;
-      `;
+  function statusColor(status) {
+    if (status === 'succeeded' || status === 'ready') return RAIL_TOKENS.ok;
+    if (status === 'failed') return RAIL_TOKENS.error;
+    if (status === 'pending') return RAIL_TOKENS.warn;
+    return RAIL_TOKENS.running;
+  }
 
-      document.body.appendChild(this.container);
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+  }
+
+  // Godot's own docks already fill a narrow screen, so below this width the rail folds to a
+  // single full-width status strip and the camera controls and scene list move inside its
+  // expanded panel. Three side-by-side panels at 493px overlap each other and the docks.
+  const RAIL_STACK_BREAKPOINT = 760;
+
+  function isNarrowRail() {
+    return typeof window !== 'undefined' && window.innerWidth < RAIL_STACK_BREAKPOINT;
+  }
+
+  function cameraControlsMarkup() {
+    const following = CameraGuidance.autoFollowEnabled();
+    const available = EditorCommandChannel.available();
+    return `<button type="button" data-follow="1" aria-pressed="${following}" style="${BUTTON_STYLE};border-color:${following ? RAIL_TOKENS.accent : RAIL_TOKENS.border};color:${following ? RAIL_TOKENS.accent : RAIL_TOKENS.muted}">`
+      + `<span aria-hidden="true" style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;background:${following ? RAIL_TOKENS.accent : RAIL_TOKENS.muted}"></span>Auto follow</button>`
+      + `<span aria-hidden="true" style="width:1px;height:18px;background:${RAIL_TOKENS.border}"></span>`
+      + ['perspective', 'front', 'top'].map(preset =>
+        `<button type="button" data-preset="${preset}" ${available ? '' : 'disabled'} title="${available ? `Switch the 3D viewport to the ${preset} view` : 'Requires the editor command plugin'}" style="${BUTTON_STYLE};text-transform:capitalize;${available ? '' : `opacity:.45;cursor:not-allowed;color:${RAIL_TOKENS.muted}`}">${preset}</button>`).join('');
+  }
+
+  function wireCameraControls(root) {
+    if (!root) return;
+    const follow = root.querySelector('[data-follow]');
+    if (follow) {
+      follow.onclick = (event) => {
+        event.stopPropagation();
+        CameraGuidance.setAutoFollow(!CameraGuidance.autoFollowEnabled());
+        AgentStatusRail.render();
+      };
+    }
+    for (const button of root.querySelectorAll('[data-preset]')) {
+      button.onclick = (event) => {
+        event.stopPropagation();
+        CameraControls.applyPreset(button.dataset.preset);
+      };
+    }
+  }
+
+  function sceneRowsMarkup(limit = 40) {
+    const graph = sceneGraphFromFiles(activeFilesDict);
+    const rows = graph.nodes.slice(0, limit).map(node => {
+      const position = Array.isArray(node.world_position)
+        ? node.world_position.map(value => Number(value).toFixed(1)).join(', ')
+        : '—';
+      return `<div style="display:grid;grid-template-columns:1fr auto;gap:8px;padding:2px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(node.name)} <span style="color:${RAIL_TOKENS.muted}">${escapeHtml(node.type)}</span></span>`
+        + `<span style="color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.mono}">${escapeHtml(position)}</span></div>`;
+    }).join('');
+    const overflow = graph.nodes.length > limit
+      ? `<div style="padding-top:3px;color:${RAIL_TOKENS.muted}">+${graph.nodes.length - limit} more</div>` : '';
+    return { rows, overflow, count: graph.nodes.length };
+  }
+
+  const AgentRail = {
+    root: null,
+    resizeBound: false,
+
+    ensure() {
+      if (typeof document === 'undefined' || !document.body) return false;
+      if (this.root && document.body.contains(this.root)) return true;
+      this.root = document.createElement('div');
+      this.root.id = 'webmcp-agent-rail';
+      this.root.style.cssText = `position:fixed;left:0;right:0;bottom:0;z-index:var(--gd-z-rail, 900);display:flex;align-items:flex-end;gap:8px;padding:8px 10px;pointer-events:none;font:500 12px/1.35 ${RAIL_TOKENS.ui}`;
+      document.body.appendChild(this.root);
+      if (!this.resizeBound && typeof window !== 'undefined') {
+        this.resizeBound = true;
+        window.addEventListener('resize', () => {
+          this.applyLayout();
+          AgentStatusRail.render();
+        });
+      }
+      this.applyLayout();
+      return true;
+    },
+
+    applyLayout() {
+      if (!this.root) return;
+      const narrow = isNarrowRail();
+      for (const [id, hideWhenNarrow] of [['webmcp-camera-slot', true], ['webmcp-status-slot', false], ['webmcp-inspector-slot', true]]) {
+        const slot = document.getElementById(id);
+        if (slot) slot.style.display = narrow && hideWhenNarrow ? 'none' : 'flex';
+      }
+      const strip = document.getElementById('webmcp-agent-status-strip');
+      if (strip) strip.style.maxWidth = narrow ? 'calc(100vw - 20px)' : 'min(620px, calc(100vw - 32px))';
+    },
+
+    slot(id, alignment) {
+      if (!this.ensure()) return null;
+      let element = document.getElementById(id);
+      if (!element) {
+        element = document.createElement('div');
+        element.id = id;
+        element.style.cssText = `display:flex;justify-content:${alignment};min-width:0;flex:1 1 0;pointer-events:none`;
+        this.root.appendChild(element);
+      }
+      return element;
+    }
+  };
+
+  const CameraControls = {
+    node: null,
+
+    ensure() {
+      const slot = AgentRail.slot('webmcp-camera-slot', 'flex-start');
+      if (!slot) return false;
+      if (!this.node) {
+        this.node = document.createElement('div');
+        this.node.id = 'webmcp-camera-controls';
+        this.node.style.cssText = `${PANEL_STYLE};display:flex;align-items:center;gap:6px;padding:6px 8px`;
+        this.node.setAttribute('aria-label', 'Agent camera controls');
+        slot.appendChild(this.node);
+        this.render();
+      }
+      return true;
+    },
+
+    async applyPreset(preset) {
+      // Presets are transient viewport moves; they never touch the scene.
+      const reply = EditorCommandChannel.call('view_preset', { preset });
+      if (!reply.ok) {
+        AgentStatusRail.setFocusNote(reply.unsupported
+          ? 'Camera presets need the editor command plugin'
+          : `Camera preset failed: ${reply.error}`);
+      }
       this.render();
     },
 
     render() {
-      if (!this.container) return;
-
-      const engineColor = DiagnosticState.engine === 'ready' ? '#3fb950' : (DiagnosticState.engine === 'loading' ? '#d29922' : '#f85149');
-      const webmcpColor = DiagnosticState.webmcp === 'ready' ? '#3fb950' : (DiagnosticState.webmcp === 'unsupported' ? '#58a6ff' : '#f85149');
-      const sessionColor = DiagnosticState.session === 'playtesting' ? '#a371f7' : (DiagnosticState.session === 'restore_failed' ? '#f85149' : '#3fb950');
-
-      this.container.innerHTML = `
-        <div style="display:flex; align-items:center; gap:5px;">
-          <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${engineColor};"></span>
-          <span style="font-weight:600;">Engine:</span>
-          <span>${DiagnosticState.engine.toUpperCase()}</span>
-        </div>
-        <span style="color:#30363d;">|</span>
-        <div style="display:flex; align-items:center; gap:5px;">
-          <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${webmcpColor};"></span>
-          <span style="font-weight:600;">WebMCP:</span>
-          <span>${DiagnosticState.webmcpRegisteredCount} Tools (${DiagnosticState.webmcp.toUpperCase()})</span>
-        </div>
-        <span style="color:#30363d;">|</span>
-        <div style="display:flex; align-items:center; gap:5px;">
-          <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:${sessionColor};"></span>
-          <span style="font-weight:600;">Session:</span>
-          <span>Rev #${DiagnosticState.sceneRevision} (${DiagnosticState.session})</span>
-        </div>
-      `;
+      if (!this.node) return;
+      this.node.innerHTML = cameraControlsMarkup();
+      wireCameraControls(this.node);
     }
+  };
+
+  const AgentStatusRail = {
+    node: null,
+    expanded: false,
+    focusNote: '',
+
+    ensure() {
+      const slot = AgentRail.slot('webmcp-status-slot', 'center');
+      if (!slot) return false;
+      if (!this.node) {
+        this.node = document.createElement('div');
+        this.node.id = 'webmcp-agent-status-strip';
+        this.node.style.cssText = `${PANEL_STYLE};max-width:min(620px, calc(100vw - 32px));min-width:0;padding:6px 10px;cursor:pointer`;
+        this.node.tabIndex = 0;
+        this.node.setAttribute('role', 'status');
+        this.node.setAttribute('aria-live', 'polite');
+        this.node.setAttribute('aria-label', 'Agent activity. Enter or Space toggles the operation timeline.');
+        const toggle = () => { this.expanded = !this.expanded; this.render(); };
+        this.node.addEventListener('click', toggle);
+        this.node.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
+        });
+        slot.appendChild(this.node);
+      }
+      return true;
+    },
+
+    setFocusNote(text) {
+      this.focusNote = text || '';
+      this.render();
+    },
+
+    // The old DiagnosticHUD was a separate widget 2px from the feed. It is now a three-dot
+    // readiness cluster inside the strip.
+    readinessDots() {
+      const engine = DiagnosticState.engine === 'ready' ? RAIL_TOKENS.ok : DiagnosticState.engine === 'loading' ? RAIL_TOKENS.warn : RAIL_TOKENS.error;
+      const webmcp = DiagnosticState.webmcp === 'ready' ? RAIL_TOKENS.ok : DiagnosticState.webmcp === 'unsupported' ? RAIL_TOKENS.muted : RAIL_TOKENS.error;
+      const session = DiagnosticState.session === 'playtesting' ? RAIL_TOKENS.running : DiagnosticState.session === 'restore_failed' || DiagnosticState.session === 'failed' ? RAIL_TOKENS.error : RAIL_TOKENS.ok;
+      const dot = (color, label) => `<span title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${color}"></span>`;
+      return `<span style="display:inline-flex;align-items:center;gap:4px;flex:0 0 auto">`
+        + dot(engine, `Engine: ${DiagnosticState.engine}`)
+        + dot(webmcp, `WebMCP: ${DiagnosticState.webmcpRegisteredCount} tools (${DiagnosticState.webmcp})`)
+        + dot(session, `Session: ${DiagnosticState.session}`)
+        + `</span>`;
+    },
+
+    render() {
+      if (!this.ensure()) return;
+      const entries = AgentObservationHUD.entries;
+      const latest = entries[entries.length - 1] || null;
+      const elapsed = latest ? ((latest.completedAt || Date.now()) - latest.startedAt) / 1000 : 0;
+      const color = latest ? statusColor(latest.status) : RAIL_TOKENS.muted;
+      const label = latest ? latest.label : 'Waiting for a WebMCP action';
+      const detail = latest?.detail ? ` · ${latest.detail}` : '';
+      const note = this.focusNote ? ` · ${this.focusNote}` : '';
+      const head = `<div style="display:flex;align-items:center;gap:8px;min-width:0;white-space:nowrap">`
+        + this.readinessDots()
+        + `<span style="width:6px;height:6px;border-radius:50%;background:${color};flex:0 0 auto"></span>`
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(label)}${escapeHtml(detail)}${escapeHtml(note)}</span>`
+        + `<span style="flex:0 0 auto;color:${RAIL_TOKENS.muted};font:400 11px/1 ${RAIL_TOKENS.mono}">${latest ? `${elapsed.toFixed(1)}s · ` : ''}Rev #${DiagnosticState.sceneRevision}</span>`
+        + `<span aria-hidden="true" style="flex:0 0 auto;color:${RAIL_TOKENS.muted}">${this.expanded ? '⌄' : '⌃'}</span>`
+        + `</div>`;
+      if (!this.expanded) {
+        this.node.innerHTML = head;
+        return;
+      }
+      const timeline = (latest?.timeline || []).slice(-7).map(event =>
+        `<div style="display:flex;gap:8px;color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.mono}">`
+        + `<span style="color:${event.phase === latest.phase ? RAIL_TOKENS.accent : RAIL_TOKENS.muted}">${event.phase === latest.phase ? '●' : '·'}</span>`
+        + `<span style="color:${RAIL_TOKENS.text}">${escapeHtml(event.label)}</span>`
+        + `<span style="margin-left:auto">${(event.elapsed_ms / 1000).toFixed(1)}s</span></div>`).join('');
+      const rows = entries.slice(-5).reverse().map(entry =>
+        `<div style="display:grid;grid-template-columns:64px 1fr;gap:8px;padding:3px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
+        + `<span style="color:${statusColor(entry.status)};text-transform:uppercase;font:500 10px/1.6 ${RAIL_TOKENS.ui}">${escapeHtml(entry.status)}</span>`
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(entry.label)}${entry.detail ? ` <span style="color:${RAIL_TOKENS.muted}">${escapeHtml(entry.detail)}</span>` : ''}</span></div>`).join('');
+      const narrow = isNarrowRail();
+      const folded = narrow
+        ? `<div data-folded-camera style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px;padding-top:6px;border-top:1px solid ${RAIL_TOKENS.border}">${cameraControlsMarkup()}</div>`
+          + (() => {
+            const scene = sceneRowsMarkup(12);
+            return `<div style="margin-top:6px;padding-top:6px;border-top:1px solid ${RAIL_TOKENS.border}">`
+              + `<div style="display:flex;gap:8px;color:${RAIL_TOKENS.muted};text-transform:uppercase;letter-spacing:.06em;font-size:10px"><span>Scene details</span><span style="margin-left:auto">${scene.count} nodes</span></div>`
+              + `${scene.rows}${scene.overflow}</div>`;
+          })()
+        : '';
+      this.node.innerHTML = `${head}<div style="margin-top:6px;max-height:min(40vh,240px);overflow-y:auto">${timeline}${rows}${folded}</div>`;
+      if (narrow) wireCameraControls(this.node.querySelector('[data-folded-camera]'));
+    }
+  };
+
+  const SceneInspector = {
+    node: null,
+    expanded: false,
+
+    ensure() {
+      const slot = AgentRail.slot('webmcp-inspector-slot', 'flex-end');
+      if (!slot) return false;
+      if (!this.node) {
+        this.node = document.createElement('div');
+        this.node.id = 'webmcp-scene-inspector';
+        this.node.style.cssText = `${PANEL_STYLE};width:min(320px, calc(100vw - 32px));padding:6px 10px;cursor:pointer`;
+        this.node.tabIndex = 0;
+        this.node.setAttribute('aria-label', 'Scene details. Enter or Space expands the node list.');
+        const toggle = () => { this.expanded = !this.expanded; this.render(); };
+        this.node.addEventListener('click', toggle);
+        this.node.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
+        });
+        slot.appendChild(this.node);
+      }
+      return true;
+    },
+
+    // Reads only what is actually in the parsed scene. The version this replaces invented
+    // gameplay facts ("Active Hazards (25 DMG)", "Finish Line Portal @ 800m") from filename
+    // substrings, for every project — re-committing the exact TRUTH-02 defect the gap log
+    // records as fixed.
+    render() {
+      if (!this.ensure()) return;
+      const graph = sceneGraphFromFiles(activeFilesDict);
+      const head = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">`
+        + `<span style="color:${RAIL_TOKENS.muted};text-transform:uppercase;letter-spacing:.06em;font-size:10px">Scene details</span>`
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(activeMainScene)}</span>`
+        + `<span style="margin-left:auto;color:${RAIL_TOKENS.muted};font:400 11px/1 ${RAIL_TOKENS.mono}">${graph.nodes.length} nodes</span>`
+        + `<span aria-hidden="true" style="color:${RAIL_TOKENS.muted}">${this.expanded ? '⌄' : '⌃'}</span></div>`;
+      if (!this.expanded) {
+        this.node.innerHTML = head;
+        return;
+      }
+      const scene = sceneRowsMarkup(40);
+      this.node.innerHTML = `${head}<div style="margin-top:5px;max-height:min(40vh,240px);overflow-y:auto">${scene.rows}${scene.overflow}</div>`;
+    }
+  };
+
+  // Back-compat shims: `DiagnosticHUD.render()` and `BuildingBlocksHUD.updateFromFiles()`
+  // are called from ~30 places across the tool handlers. They now drive the rail.
+  const DiagnosticHUD = {
+    init() { AgentStatusRail.ensure(); CameraControls.ensure(); SceneInspector.ensure(); this.render(); },
+    render() { AgentRail.applyLayout(); AgentStatusRail.render(); CameraControls.render(); }
+  };
+
+  const BuildingBlocksHUD = {
+    ensure() { return SceneInspector.ensure(); },
+    updateFromFiles() { SceneInspector.render(); }
   };
 
   // ==========================================
@@ -4791,6 +6355,9 @@ func _physics_process(delta):
     window.addEventListener('godot-engine-ready', () => {
       DiagnosticState.engine = 'ready';
       DiagnosticState.engineError = null;
+      // `replaceCanvas` recreated the canvas element, so any anchored reticle is now
+      // pointing at geometry from the previous editor process.
+      AgentFocusOverlay.hide('editor_restarted');
       DiagnosticHUD.render();
     });
     window.addEventListener('godot-engine-failed', (event) => {
@@ -4874,6 +6441,8 @@ func _physics_process(delta):
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
     BuildingBlocksHUD.ensure();
+    CameraGuidance.install();
+    CameraGuidance.lastGeometrySignature = CameraGuidance.geometrySignature();
     projectHydrationPromise.then(() => {
       DiagnosticHUD.render();
       AgentObservationHUD.renderFeed();

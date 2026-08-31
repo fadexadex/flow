@@ -27,6 +27,28 @@
 		<link rel="preload" href="inter-bold.woff2" as="font" crossorigin="anonymous">
 		<title>Godot Engine Web Editor (4.7.2.stable.official)</title>
 		<style>
+:root {
+	/* Design tokens sampled from Godot's own editor chrome. Consumed as var(--gd-*)
+	   by mcp_bridge.js as well, so keep these names stable. */
+	--gd-surface: #141414;
+	--gd-panel: #1b1b1b;
+	--gd-panel-raised: #262626;
+	--gd-border: #484848;
+	--gd-text: #d0d0d0;
+	--gd-text-muted: #9a9a9a;
+	--gd-accent: #538dda;
+	--gd-ok: #6a9955;
+	--gd-warn: #d7a355;
+	--gd-error: #d16969;
+	--gd-running: #5c9fd6;
+	--gd-font-ui: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+	--gd-font-mono: ui-monospace, SFMono-Regular, monospace;
+	--gd-z-rail: 900;
+	--gd-z-frame-hold: 950;
+	--gd-z-boot: 960;
+	--gd-z-return: 1000;
+}
+
 /* Use Inter in the same configuration as used in the editor (e.g. alternate lowercase `l`). */
 @font-face {
 	font-family: "Inter";
@@ -49,14 +71,14 @@ body,
 button,
 input {
 	/* Apply a modern sans-serif font stack in case the Inter font fails to load. */
-	font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+	font-family: var(--gd-font-ui);
 	font-size: 14px;
 	font-feature-settings: "calt" 0, "ss04" 1, "tnum" 1;
 }
 
 *:focus-visible {
 	/* More visible outline for better keyboard navigation. */
-	outline: 0.1875rem solid #538dda;
+	outline: 0.1875rem solid var(--gd-accent);
 	/* Make the outline always appear above other elements. */
 	/* Otherwise, one of its sides can be hidden by tabs in the Download and More layouts. */
 	position: relative;
@@ -69,7 +91,7 @@ body {
 	padding: 0;
 	font-size: 14px;
 	text-align: center;
-	background-color: #262626;
+	background-color: var(--gd-panel-raised);
 	overflow: hidden;
 }
 
@@ -78,8 +100,8 @@ h2 {
 }
 
 a {
-	color: hsl(205, 100%, 75%);
-	text-decoration-color: hsla(205, 100%, 75%, 0.3);
+	color: var(--gd-accent);
+	text-decoration-color: color-mix(in srgb, var(--gd-accent) 30%, transparent);
 	text-decoration-thickness: 0.125rem;
 }
 
@@ -109,7 +131,7 @@ a:active {
 }
 
 .welcome-modal-content {
-	background-color: #262626;
+	background-color: var(--gd-panel-raised);
 	box-shadow: 0 0.25rem 0.25rem hsla(0, 0%, 0%, 0.5);
 	line-height: 1.5;
 	max-width: 38rem;
@@ -124,12 +146,12 @@ a:active {
 	font-size: 0;
 
 	/* Match the default background color of the editor window for a seamless appearance. */
-	background-color: #141414;
+	background-color: var(--gd-surface);
 }
 
 #tab-game {
 	/* Match the default background color of the editor window for a seamless appearance. */
-	background-color: #141414;
+	background-color: var(--gd-surface);
 	/* Make the background span the entire page height. */
 	min-height: 100vh;
 	display: flex;
@@ -154,23 +176,22 @@ a:active {
 	position: fixed;
 	top: 14px;
 	right: 18px;
-	z-index: 1000002;
-	border: 1px solid rgba(77, 232, 255, .75);
+	z-index: var(--gd-z-return);
+	border: 1px solid var(--gd-border);
 	border-radius: 999px;
 	padding: 9px 15px;
-	background: rgba(5, 12, 20, .92);
-	box-shadow: 0 0 18px rgba(0, 229, 255, .28);
-	color: #e8fdff;
-	font: 700 12px/1 Inter, system-ui, sans-serif;
+	background: var(--gd-panel);
+	box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+	color: var(--gd-text);
+	font: 700 12px/1 var(--gd-font-ui);
 	letter-spacing: .03em;
 	cursor: pointer;
 }
 
 #game-return-to-editor:hover,
 #game-return-to-editor:focus-visible {
-	background: rgba(0, 229, 255, .18);
-	outline: 2px solid rgba(255, 200, 87, .85);
-	outline-offset: 2px;
+	background: var(--gd-panel-raised);
+	border-color: var(--gd-accent);
 }
 
 /* Don't show distracting focus outlines for the main tabs' contents. */
@@ -182,11 +203,10 @@ a:active {
 }
 
 .godot {
-	color: #d0d0d0;
-	background-color: #1b1b1b;
+	color: var(--gd-text);
+	background-color: var(--gd-panel);
 	background-image: linear-gradient(to bottom, #403e48, #35333c);
-	border: 1px solid #484848;
-	box-shadow: 0 0 1px 1px #141414;
+	border: 1px solid var(--gd-border);
 }
 
 .btn {
@@ -248,78 +268,111 @@ a:active {
 	font-weight: 700;
 }
 
-/* Status display */
+/* Boot overlay (#tab-status) */
 
-#status {
-	position: absolute;
-	left: 0;
-	top: 0;
-	right: 0;
-	bottom: 0;
-	display: flex;
-	justify-content: center;
+#tab-status {
+	position: fixed;
+	inset: 0;
+	background: var(--gd-surface);
+	z-index: var(--gd-z-boot);
+	flex-direction: column;
 	align-items: center;
-	/* don't consume click events - make children visible explicitly */
-	visibility: hidden;
+	justify-content: center;
+	gap: 20px;
+	font-family: var(--gd-font-ui);
+	padding: 24px;
+	box-sizing: border-box;
+	text-align: center;
+}
+
+#tab-status .gd-boot-logo {
+	width: 90px;
+	height: 90px;
+	max-width: 40vw;
+	animation: mcp-pulse 1.8s infinite ease-in-out;
+}
+
+@keyframes mcp-pulse {
+	0%, 100% { opacity: 0.85; transform: scale(1); }
+	50% { opacity: 1; transform: scale(1.04); }
+}
+
+#tab-status .gd-boot-title {
+	font-size: 22px;
+	font-weight: 700;
+	color: var(--gd-text);
+	letter-spacing: 0.5px;
+}
+
+#tab-status .gd-boot-title span {
+	color: var(--gd-accent);
+}
+
+#status-loader-text {
+	font-size: 14px;
+	color: var(--gd-text-muted);
+	font-weight: 500;
+	font-family: var(--gd-font-mono);
+	min-height: 1.2em;
+	max-width: min(480px, 90vw);
 }
 
 #status-progress {
-	width: 366px;
-	height: 7px;
-	background-color: #38363A;
-	border: 1px solid #444246;
-	padding: 1px;
-	box-shadow: 0 0 2px 1px #1B1C22;
-	border-radius: 2px;
-	visibility: visible;
-}
-
-@media only screen and (orientation:portrait) {
-	#status-progress {
-		width: 61.8%;
-	}
+	display: none;
+	width: min(320px, 80vw);
+	height: 6px;
+	background-color: var(--gd-panel);
+	border: 1px solid var(--gd-border);
+	border-radius: 6px;
+	overflow: hidden;
+	box-sizing: border-box;
 }
 
 #status-progress-inner {
 	height: 100%;
 	width: 0;
 	box-sizing: border-box;
-	transition: width 0.5s linear;
-	background-color: #202020;
-	border: 1px solid #222223;
-	box-shadow: 0 0 1px 1px #27282E;
-	border-radius: 3px;
+	transition: width 0.3s ease;
+	background-color: var(--gd-accent);
+	border-radius: 6px;
 }
 
 #status-indeterminate {
-	visibility: visible;
+	display: none;
 	position: relative;
+	width: min(320px, 80vw);
+	height: 6px;
+	background-color: var(--gd-panel);
+	border: 1px solid var(--gd-border);
+	border-radius: 6px;
+	overflow: hidden;
+	box-sizing: border-box;
 }
 
-#status-indeterminate > div {
-	width: 4.5px;
-	height: 0;
-	border-style: solid;
-	border-width: 9px 3px 0 3px;
-	border-color: #2b2b2b transparent transparent transparent;
-	transform-origin: center 21px;
+#status-indeterminate-bar {
 	position: absolute;
+	top: 0;
+	left: -40%;
+	width: 40%;
+	height: 100%;
+	background-color: var(--gd-accent);
+	border-radius: 6px;
+	animation: gd-indeterminate-slide 1.4s ease-in-out infinite;
 }
 
-#status-indeterminate > div:nth-child(1) { transform: rotate( 22.5deg); }
-#status-indeterminate > div:nth-child(2) { transform: rotate( 67.5deg); }
-#status-indeterminate > div:nth-child(3) { transform: rotate(112.5deg); }
-#status-indeterminate > div:nth-child(4) { transform: rotate(157.5deg); }
-#status-indeterminate > div:nth-child(5) { transform: rotate(202.5deg); }
-#status-indeterminate > div:nth-child(6) { transform: rotate(247.5deg); }
-#status-indeterminate > div:nth-child(7) { transform: rotate(292.5deg); }
-#status-indeterminate > div:nth-child(8) { transform: rotate(337.5deg); }
+@keyframes gd-indeterminate-slide {
+	0% { left: -40%; }
+	100% { left: 100%; }
+}
 
 #status-notice {
-	margin: 0 100px;
+	display: none;
+	margin: 0;
+	max-width: min(480px, 90vw);
 	line-height: 1.3;
-	visibility: visible;
-	padding: 4px 6px;
+	padding: 8px 14px;
+	color: var(--gd-error);
+	box-sizing: border-box;
 }
 		</style>
 	</head>
@@ -421,15 +474,17 @@ a:active {
 					Please try updating or use a different browser.
 				</canvas>
 			</div>
-			<div id="tab-status" style="display: none; position: fixed; inset: 0; background: radial-gradient(circle at center, #1b263b 0%, #0d131f 100%); z-index: 9999; flex-direction: column; align-items: center; justify-content: center; gap: 20px; font-family: Inter, sans-serif;">
-				<img src="logo.svg" alt="Godot Logo" style="width: 90px; height: 90px; filter: drop-shadow(0 0 25px rgba(0, 229, 255, 0.6)); animation: mcp-pulse 1.8s infinite ease-in-out;" />
-				<div style="font-size: 22px; font-weight: 700; color: #ffffff; letter-spacing: 0.5px;">Godot Web Editor <span style="color: #00e5ff;">MCP</span></div>
-				<div id="status-loader-text" style="font-size: 14px; color: #94a3b8; font-weight: 500;">Initializing Multi-threaded WebAssembly Engine & Virtual Filesystem...</div>
-				<div id="status-progress" style="width: 320px; height: 6px; background: rgba(255,255,255,0.1); border-radius: 6px; overflow: hidden; border: 1px solid rgba(0,229,255,0.3);">
-					<div id="status-progress-inner" style="width: 60%; height: 100%; background: linear-gradient(90deg, #00e5ff, #38bdf8); border-radius: 6px; transition: width 0.3s ease;"></div>
+			<div id="tab-status" style="display: none;">
+				<img src="logo.svg" alt="Godot Logo" class="gd-boot-logo" />
+				<div class="gd-boot-title">Godot Web Editor <span>MCP</span></div>
+				<div id="status-loader-text">Initializing…</div>
+				<div id="status-progress">
+					<div id="status-progress-inner"></div>
 				</div>
-				<div id="status-indeterminate" style="display: none;"></div>
-				<div id="status-notice" class="godot" style="display: none; color: #f87171;"></div>
+				<div id="status-indeterminate">
+					<div id="status-indeterminate-bar"></div>
+				</div>
+				<div id="status-notice" class="godot"></div>
 			</div>
 		</div>
 		<script>
@@ -606,7 +661,6 @@ function closeEditor() { // eslint-disable-line no-unused-vars
 }
 
 function startEditor(zip, customArgs) {
-	const INDETERMINATE_STATUS_STEP_MS = 100;
 	const persistentPaths = ['/home/web_user'];
 
 	let editorCanvas = document.getElementById('editor-canvas');
@@ -615,10 +669,53 @@ function startEditor(zip, customArgs) {
 	const statusProgressInner = document.getElementById('status-progress-inner');
 	const statusIndeterminate = document.getElementById('status-indeterminate');
 	const statusNotice = document.getElementById('status-notice');
+	const statusLoaderText = document.getElementById('status-loader-text');
 	const headerDiv = document.getElementById('tabs-buttons');
 
 	let initializing = true;
 	let statusMode = 'hidden';
+
+	// Boot progress ticker: keeps #status-loader-text honest during the long
+	// (documented 30-43s) cold boot instead of leaving static text on screen.
+	const bootStartTime = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+	let bootPhaseLabel = 'Downloading engine';
+	let bootProgressPct = null; // null while only elapsed time (indeterminate) is known
+	let bootTicker = null;
+
+	function bootElapsedSeconds() {
+		const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+		return ((now - bootStartTime) / 1000).toFixed(1);
+	}
+
+	function renderBootStatusText() {
+		if (!statusLoaderText) return;
+		const elapsed = bootElapsedSeconds();
+		statusLoaderText.textContent = (bootProgressPct !== null)
+			? `${bootPhaseLabel}… ${bootProgressPct}% (${elapsed}s)`
+			: `${bootPhaseLabel}… (${elapsed}s)`;
+	}
+
+	function setBootPhase(label) {
+		bootPhaseLabel = label;
+		bootProgressPct = null;
+		renderBootStatusText();
+	}
+
+	function stopBootTicker() {
+		if (bootTicker !== null) {
+			clearInterval(bootTicker);
+			bootTicker = null;
+		}
+	}
+
+	renderBootStatusText();
+	bootTicker = setInterval(function () {
+		if (!initializing) {
+			stopBootTicker();
+			return;
+		}
+		renderBootStatusText();
+	}, 250);
 
 	showTab('status');
 
@@ -659,18 +756,6 @@ function startEditor(zip, customArgs) {
 		return out;
 	}
 
-	function animateStatusIndeterminate(ms) {
-		if (!statusIndeterminate || !statusIndeterminate.children || statusIndeterminate.children.length === 0) return;
-		const i = Math.floor((ms / INDETERMINATE_STATUS_STEP_MS) % statusIndeterminate.children.length);
-		const child = statusIndeterminate.children[i];
-		if (child && child.style && child.style.borderTopColor === '') {
-			Array.prototype.slice.call(statusIndeterminate.children).forEach((c) => {
-				if (c && c.style) c.style.borderTopColor = '';
-			});
-			if (child && child.style) child.style.borderTopColor = '#dfdfdf';
-		}
-	}
-
 	setStatusMode = function (mode) {
 		if (statusMode === mode || !initializing) {
 			return;
@@ -678,21 +763,21 @@ function startEditor(zip, customArgs) {
 		[statusProgress, statusIndeterminate, statusNotice].forEach((elem) => {
 			if (elem && elem.style) elem.style.display = 'none';
 		});
-		animationCallbacks = animationCallbacks.filter(function (value) {
-			return (value !== animateStatusIndeterminate);
-		});
 		switch (mode) {
 		case 'progress':
 			if (statusProgress && statusProgress.style) statusProgress.style.display = 'block';
 			break;
 		case 'indeterminate':
+			// The indeterminate bar animates via CSS (@keyframes gd-indeterminate-slide);
+			// no per-frame JS driving is needed.
 			if (statusIndeterminate && statusIndeterminate.style) statusIndeterminate.style.display = 'block';
-			animationCallbacks.push(animateStatusIndeterminate);
 			break;
 		case 'notice':
 			if (statusNotice && statusNotice.style) statusNotice.style.display = 'block';
+			stopBootTicker();
 			break;
 		case 'hidden':
+			stopBootTicker();
 			break;
 		default:
 			break;
@@ -822,16 +907,22 @@ function startEditor(zip, customArgs) {
 				if (total > 0) {
 					statusProgressInner.style.width = `${(current / total) * 100}%`;
 					setStatusMode('progress');
+					bootPhaseLabel = 'Downloading engine';
+					bootProgressPct = Math.round((current / total) * 100);
+					renderBootStatusText();
 					if (current === total) {
 						setTimeout(() => {
 							setStatusMode('indeterminate');
+							setBootPhase('Starting engine');
 						}, 100);
 					}
 				} else {
 					setStatusMode('indeterminate');
+					setBootPhase('Starting engine');
 				}
 			} else {
 				setStatusMode('indeterminate');
+				setBootPhase('Starting engine');
 			}
 		},
 		'canvas': editorCanvas,
@@ -869,7 +960,9 @@ function startEditor(zip, customArgs) {
 		displayFailureNotice('WebGL not available');
 	} else {
 		setStatusMode('indeterminate');
+		setBootPhase('Starting engine');
 		editor.init('godot.editor').then(function () {
+			setBootPhase('Mounting virtual filesystem');
 			if (window._mcpProjectFiles) {
 				const encoder = new TextEncoder();
 				const projName = window._mcpProjectName || 'astro_dodger';
@@ -895,10 +988,12 @@ function startEditor(zip, customArgs) {
 			}
 			showTab('editor');
 			setLoaderEnabled(false);
+			setBootPhase('Opening project');
 			const args = customArgs || (zip ? ['--path', '/home/web_user/preload', '--editor'] : ['--project-manager', '--single-window']);
 			editor.start({ 'args': args, 'persistentDrops': true }).then(function () {
 				setStatusMode('hidden');
 				initializing = false;
+				stopBootTicker();
 				window.dispatchEvent(new Event('godot-engine-ready'));
 			});
 		}).catch(displayFailureNotice);
