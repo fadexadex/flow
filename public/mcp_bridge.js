@@ -410,6 +410,26 @@
     if (typeof files['project.godot'] !== 'string') throw new Error('project.godot is required and must be text.');
     const sceneFiles = entries.filter(([filePath]) => filePath.endsWith('.tscn'));
     if (sceneFiles.length === 0) throw new Error('At least one .tscn scene is required.');
+    const configuredMainScene = files['project.godot'].match(/run\/main_scene\s*=\s*"res:\/\/([^"\r\n]+)"/)?.[1];
+    if (configuredMainScene && !(cleanProjectPath(configuredMainScene) in files)) {
+      throw new Error(`Configured main scene does not exist in the project: res://${configuredMainScene}`);
+    }
+    for (const [filePath, content] of entries) {
+      if (typeof content !== 'string') continue;
+      const references = [];
+      if (filePath.endsWith('.tscn') || filePath.endsWith('.tres')) {
+        for (const match of content.matchAll(/\bpath\s*=\s*"res:\/\/([^"\r\n]+)"/g)) references.push(match[1]);
+      }
+      if (filePath.endsWith('.gd')) {
+        for (const match of content.matchAll(/\b(?:preload|load)\(\s*"res:\/\/([^"\r\n]+)"\s*\)/g)) references.push(match[1]);
+      }
+      for (const reference of references) {
+        const referencedPath = cleanProjectPath(reference);
+        if (!(referencedPath in files)) {
+          throw new Error(`Missing referenced resource: res://${referencedPath} (from res://${filePath})`);
+        }
+      }
+    }
     return { fileCount: entries.length, totalBytes };
   }
 
