@@ -189,6 +189,35 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
+    name: 'godot_apply_text_patch',
+    description: 'Applies exact revision-checked search/replace patches and validates them through the acknowledged editor/runtime transaction path',
+    input_schema: {
+      type: 'object',
+      properties: {
+        expected_revision: { type: 'integer', minimum: 1 },
+        label: { type: 'string' },
+        patches: {
+          type: 'array', minItems: 1, maxItems: 32,
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' },
+              find: { type: 'string', minLength: 1 },
+              replace: { type: 'string' },
+              expected_occurrences: { type: 'integer', minimum: 1, maximum: 100, default: 1 }
+            },
+            required: ['path', 'find', 'replace'],
+            additionalProperties: false
+          }
+        },
+        idempotency_key: { type: 'string' }
+      },
+      required: ['expected_revision', 'patches'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_undo_transaction',
     description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction',
     input_schema: { type: 'object', properties: { undo_id: { type: 'string' } }, additionalProperties: false },

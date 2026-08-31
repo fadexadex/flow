@@ -2333,7 +2333,7 @@ func _physics_process(delta):
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const fingerprint = mutationFingerprint('godot_apply_file_transaction', args);
+        const fingerprint = args._mutation_fingerprint || mutationFingerprint('godot_apply_file_transaction', args);
         const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
         if (replay) return replay;
         if (args.expected_revision !== DiagnosticState.sceneRevision) {
@@ -2402,6 +2402,72 @@ func _physics_process(delta):
           result.persisted = await persistActiveProjectState();
           return result;
         }, 10000, { key: args.idempotency_key, fingerprint });
+      }
+    },
+    {
+      definition: {
+        name: 'godot_apply_text_patch',
+        description: 'Applies exact revision-checked search/replace patches to project text files, then delegates to the same acknowledged editor/runtime transaction and undo path',
+        input_schema: {
+          type: 'object',
+          properties: {
+            expected_revision: { type: 'integer', minimum: 1 },
+            label: { type: 'string' },
+            patches: {
+              type: 'array', minItems: 1, maxItems: 32,
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  find: { type: 'string', minLength: 1 },
+                  replace: { type: 'string' },
+                  expected_occurrences: { type: 'integer', minimum: 1, maximum: 100, default: 1 }
+                },
+                required: ['path', 'find', 'replace'],
+                additionalProperties: false
+              }
+            },
+            idempotency_key: { type: 'string' }
+          },
+          required: ['expected_revision', 'patches'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const fingerprint = mutationFingerprint('godot_apply_text_patch', args);
+        const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
+        if (replay) return replay;
+        if (args.expected_revision !== DiagnosticState.sceneRevision) {
+          throw new Error(`Revision conflict: expected ${args.expected_revision}, current ${DiagnosticState.sceneRevision}. Inspect before patching.`);
+        }
+        if (!Array.isArray(args.patches) || args.patches.length === 0) throw new Error('At least one exact text patch is required.');
+        const stagedText = new Map();
+        const patchSummary = [];
+        for (const patch of args.patches) {
+          const filePath = cleanProjectPath(patch.path);
+          const current = stagedText.has(filePath) ? stagedText.get(filePath) : activeFilesDict[filePath];
+          if (typeof current !== 'string') throw new Error(`Text patch requires an existing text file: res://${filePath}`);
+          if (typeof patch.find !== 'string' || patch.find.length === 0) throw new Error(`Text patch find value must be non-empty: res://${filePath}`);
+          if (typeof patch.replace !== 'string') throw new Error(`Text patch replacement must be text: res://${filePath}`);
+          const expected = Number.isInteger(patch.expected_occurrences) ? patch.expected_occurrences : 1;
+          const occurrences = current.split(patch.find).length - 1;
+          if (occurrences !== expected) {
+            throw new Error(`Patch occurrence mismatch in res://${filePath}: expected ${expected}, found ${occurrences}. No files were changed.`);
+          }
+          stagedText.set(filePath, current.split(patch.find).join(patch.replace));
+          patchSummary.push({ path: `res://${filePath}`, occurrences });
+        }
+        const fileTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_apply_file_transaction');
+        if (!fileTool) throw new Error('Acknowledged file transaction handler is unavailable.');
+        const result = await fileTool.handler({
+          expected_revision: args.expected_revision,
+          label: args.label || 'Exact text patch',
+          operations: [...stagedText.entries()].map(([path, content]) => ({ kind: 'write', path, content })),
+          idempotency_key: args.idempotency_key,
+          _mutation_fingerprint: fingerprint
+        });
+        return { ...result, patch_summary: patchSummary };
       }
     },
     {
@@ -3172,6 +3238,7 @@ func _physics_process(delta):
         godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
         godot_inspect_project_files: 'Inspecting authoritative project files',
         godot_apply_file_transaction: `Applying file transaction: ${input.label || 'Project update'}`,
+        godot_apply_text_patch: `Applying exact text patch: ${input.label || 'Project update'}`,
         godot_undo_transaction: `Undoing transaction: ${input.undo_id || 'latest'}`,
         godot_run_game: 'Launching game viewport',
         godot_stop_game: 'Stopping game session',
