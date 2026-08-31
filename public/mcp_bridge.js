@@ -1840,13 +1840,7 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const upload = projectUploads.get(args.upload_id);
-        if (!upload) {
-          const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
-          if (receipt?.metadata?.source_upload_id === args.upload_id || receipt?.result?.upload_receipt_id === args.upload_id) {
-            return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
-          }
-          throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
-        }
+        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
         const filePath = cleanProjectPath(args.path);
         const encoding = args.encoding || 'utf8';
         const bytes = decodeUploadChunk(args.content, encoding);
@@ -1877,7 +1871,13 @@ func _physics_process(delta):
       },
       handler: async (args = {}) => {
         const upload = projectUploads.get(args.upload_id);
-        if (!upload) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        if (!upload) {
+          const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
+          if (receipt?.metadata?.source_upload_id === args.upload_id || receipt?.result?.upload_receipt_id === args.upload_id) {
+            return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
+          }
+          throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        }
         return { success: true, status: 'staging', ...publicProjectUpload(upload) };
       }
     },
