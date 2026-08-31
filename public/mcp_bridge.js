@@ -641,6 +641,9 @@
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
+    // A running game owns the same virtual project filesystem. Replacing the
+    // editor first can race its shutdown and leave the new --path unmounted.
+    await stopGameRuntime(10000);
     const closeEditorButton = document.getElementById('btn-close-editor');
     if (closeEditorButton && !closeEditorButton.disabled) {
       if (typeof window.closeEditor !== 'function') throw new Error('The existing editor cannot be closed safely.');
@@ -674,6 +677,11 @@
     window.removeEventListener('godot-engine-failed', onFailed);
     if (failureMessage) throw new Error(failureMessage);
     if (!ready) throw new Error(`Godot editor did not confirm project readiness within ${Math.round(timeoutMs / 1000)} seconds.`);
+    await new Promise(resolve => setTimeout(resolve, 450));
+    const bootErrors = recentGodotErrors(bootStartedAt);
+    if (bootErrors.length > 0) {
+      throw new Error(`Godot rejected the project during editor boot: ${bootErrors[0].msg}`);
+    }
     DiagnosticState.engine = 'ready';
     DiagnosticState.session = 'editor-ready';
     DiagnosticHUD.render();
@@ -718,7 +726,7 @@
     // The web editor emits platform-level `ERROR:` diagnostics for unsupported
     // debugger sockets and Emscripten blocking warnings even when a project is
     // healthy. Treat only project-load/runtime failures as transaction blockers.
-    const patterns = /SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)|Game (?:start|initialization) failed|Invalid get index|Invalid call|Nonexistent function/i;
+    const patterns = /SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)|Game (?:start|initialization) failed|Invalid project path specified|Invalid get index|Invalid call|Nonexistent function/i;
     return activeLogs.filter(entry => entry.time >= sinceTime && entry.level === 'error' && patterns.test(entry.msg));
   }
 
