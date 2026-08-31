@@ -751,11 +751,15 @@
     const wasRunning = Boolean(closeGameButton && !closeGameButton.disabled);
     if (!wasRunning) return false;
     if (typeof window.closeGame !== 'function') throw new Error('Game is running, but the runtime quit control is unavailable.');
-    const stoppedEvent = waitForRuntimeEvent('godot-game-stopped', null, timeoutMs, `Godot did not emit a stopped event within ${Math.round(timeoutMs / 1000)} seconds.`);
+    let stoppedEventObserved = false;
+    const onStopped = () => { stoppedEventObserved = true; };
+    window.addEventListener('godot-game-stopped', onStopped, { once: true });
     window.closeGame();
-    await stoppedEvent;
-    const controlsStopped = await waitFor(() => closeGameButton.disabled, 2000);
-    if (!controlsStopped) throw new Error('Godot emitted a stopped event, but the game controls still report a running runtime.');
+    const stopped = await waitFor(() => stoppedEventObserved || closeGameButton.disabled, timeoutMs);
+    window.removeEventListener('godot-game-stopped', onStopped);
+    if (!stopped) throw new Error(`Godot did not confirm the game stopped within ${Math.round(timeoutMs / 1000)} seconds.`);
+    const controlsStopped = closeGameButton.disabled || await waitFor(() => closeGameButton.disabled, 2000);
+    if (!controlsStopped) throw new Error('Godot reported a stopped runtime, but its controls still report a running process.');
     return true;
   }
 
