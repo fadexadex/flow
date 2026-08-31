@@ -1640,6 +1640,11 @@ func _physics_process(delta):
             undo_stack_depth: undoStack.length,
             active_operation_id: activeManagedMutationId
           },
+          runtime: {
+            state: typeof window !== 'undefined' ? window.__godotGameState || 'unknown' : 'unavailable',
+            game_tab_enabled: typeof document !== 'undefined' && !document.getElementById('btn-tab-game')?.disabled,
+            close_control_enabled: typeof document !== 'undefined' && !document.getElementById('btn-close-game')?.disabled
+          },
           persistence: {
             hydrated: projectStateHydrated,
             project_available: persistedProjectAvailable,

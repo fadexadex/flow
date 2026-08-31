@@ -674,6 +674,7 @@ function startEditor(zip, customArgs) {
 			showTab('editor');
 			game = null;
 			window.__godotGameState = 'stopped';
+			console.log('[Runtime lifecycle] stopped');
 			window.dispatchEvent(new Event('godot-game-stopped'));
 		},
 	};
@@ -688,6 +689,7 @@ function startEditor(zip, customArgs) {
 		showTab('editor');
 		game = null;
 		window.__godotGameState = 'failed';
+		console.error('[Runtime lifecycle] failed and cleaned up');
 	};
 
 	let OnEditorExit = function () {
@@ -710,15 +712,19 @@ function startEditor(zip, customArgs) {
 			}
 			setGameTabEnabled(true);
 			window.__godotGameState = 'initializing';
+			console.log('[Runtime lifecycle] initializing');
 			game = new Engine(gameConfig);
 			showTab('game');
 			game.init().then(function () {
+				console.log('[Runtime lifecycle] initialized');
 				let launchStarted = false;
 				const launchGame = function () {
 					if (launchStarted || !game) return;
 					launchStarted = true;
+					console.log('[Runtime lifecycle] starting game');
 					const gameRun = game.start({ 'args': args, 'canvas': gameCanvas });
 					window.__godotGameState = 'running';
+					console.log('[Runtime lifecycle] running');
 					gameCanvas.focus();
 					window.dispatchEvent(new Event('godot-game-launched'));
 					gameRun.then(function () {
