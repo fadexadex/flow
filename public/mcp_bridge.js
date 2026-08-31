@@ -168,10 +168,8 @@
     RecordingState.captureContext = context;
     const paint = () => {
       if (!RecordingState.captureCanvas || !RecordingState.captureContext) return;
-      const currentCanvas = document.getElementById('game-canvas');
-      // During an acknowledged scene rebuild the game canvas is replaced. Keep
-      // the prior compositor frame until the new runtime is actually running.
-      if (window.__godotGameState === 'running' && currentCanvas?.width && currentCanvas?.height) {
+      const currentCanvas = (window.__godotGameState === 'running' ? document.getElementById('game-canvas') : null) || document.getElementById('editor-canvas') || document.getElementById('game-canvas');
+      if (currentCanvas?.width && currentCanvas?.height) {
         try { context.drawImage(currentCanvas, 0, 0, surface.width, surface.height); } catch (_) {}
       }
       RecordingState.captureRaf = requestAnimationFrame(paint);
@@ -261,7 +259,7 @@
 
   function holdRuntimeFrame() {
     if (typeof document === 'undefined') return false;
-    const canvas = document.getElementById('game-canvas');
+    const canvas = (window.__godotGameState === 'running' ? document.getElementById('game-canvas') : null) || document.getElementById('editor-canvas') || document.getElementById('game-canvas');
     if (!canvas || !canvas.width || !canvas.height || typeof canvas.toDataURL !== 'function') return false;
     let frame;
     try { frame = canvas.toDataURL('image/png'); } catch (_) { return false; }
@@ -1130,6 +1128,10 @@
 
   async function validateProjectRuntimeBoot(operation = null) {
     if (operation) await advancePhase(operation, 'validating_runtime');
+    if (typeof window !== 'undefined' && window.__godotGameState !== 'running') {
+      if (typeof window.showTab === 'function') window.showTab('editor');
+      return true;
+    }
     try {
       await startGameRuntime({ visible: false, timeoutMs: 60000 });
       await stopGameRuntime(15000);
@@ -3587,8 +3589,8 @@ func _physics_process(delta):
       handler: async (args = {}) => {
         if (RecordingState.recorder?.state === 'recording') throw new Error('A viewport recording is already active.');
         if (typeof MediaRecorder === 'undefined') throw new Error('MediaRecorder is unavailable in this browser.');
-        const canvas = document.getElementById('game-canvas');
-        if (!canvas || typeof canvas.captureStream !== 'function') throw new Error('The visible game canvas does not support stream capture. Run the game first.');
+        const canvas = (window.__godotGameState === 'running' ? document.getElementById('game-canvas') : null) || document.getElementById('editor-canvas') || document.getElementById('game-canvas');
+        if (!canvas || typeof canvas.captureStream !== 'function') throw new Error('No visible Godot canvas is available for stream capture. Run the editor or game first.');
         const fps = Math.max(10, Math.min(Number(args.fps) || 30, 60));
         const recordingSurface = createRecordingSurface(canvas);
         if (!recordingSurface || typeof recordingSurface.captureStream !== 'function') {
