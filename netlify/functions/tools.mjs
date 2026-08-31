@@ -92,6 +92,29 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
+    name: 'godot_upload_project_chunk_batch',
+    description: 'Atomically appends up to four transport-safe project chunks in one call',
+    input_schema: {
+      type: 'object',
+      properties: {
+        upload_id: { type: 'string' },
+        chunks: {
+          type: 'array', minItems: 1, maxItems: 4,
+          items: {
+            type: 'object',
+            properties: {
+              path: { type: 'string' }, encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+              offset: { type: 'integer', minimum: 0 }, content: { type: 'string', maxLength: 700000 }, final: { type: 'boolean', default: false }
+            },
+            required: ['path', 'offset', 'content'], additionalProperties: false
+          }
+        }
+      },
+      required: ['upload_id', 'chunks'], additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_get_project_upload_status',
     description: 'Inspects staged project upload progress without returning uploaded contents',
     input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },

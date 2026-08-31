@@ -451,6 +451,34 @@
     }
   }
 
+  function cloneStagedProjectUpload(upload) {
+    return {
+      ...upload,
+      files: new Map([...upload.files.entries()].map(([path, file]) => [path, { ...file, chunks: [...file.chunks] }]))
+    };
+  }
+
+  async function persistProjectUploadBatch(upload, appendedChunks) {
+    const database = await openRecordingDatabase();
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(['uploads', 'upload_chunks'], 'readwrite');
+      transaction.objectStore('uploads').put(projectUploadMetadata(upload));
+      const chunkStore = transaction.objectStore('upload_chunks');
+      for (const appended of appendedChunks) {
+        chunkStore.put({
+          key: `${upload.id}\u0000${appended.path}\u0000${appended.index}`,
+          upload_id: upload.id,
+          path: appended.path,
+          index: appended.index,
+          bytes: appended.bytes
+        });
+      }
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to persist staged project chunk batch.'));
+    });
+    database.close();
+  }
+
   async function migrateLegacyProjectUpload(upload) {
     const database = await openRecordingDatabase();
     await new Promise((resolve, reject) => {
@@ -1975,6 +2003,69 @@ func _physics_process(delta):
     },
     {
       definition: {
+        name: 'godot_upload_project_chunk_batch',
+        description: 'Atomically appends up to four transport-safe project chunks in one call, with a 2 MiB decoded batch limit',
+        input_schema: {
+          type: 'object',
+          properties: {
+            upload_id: { type: 'string' },
+            chunks: {
+              type: 'array', minItems: 1, maxItems: 4,
+              items: {
+                type: 'object',
+                properties: {
+                  path: { type: 'string' },
+                  encoding: { type: 'string', enum: ['utf8', 'base64'], default: 'utf8' },
+                  offset: { type: 'integer', minimum: 0 },
+                  content: { type: 'string', maxLength: 700000 },
+                  final: { type: 'boolean', default: false }
+                },
+                required: ['path', 'offset', 'content'], additionalProperties: false
+              }
+            }
+          },
+          required: ['upload_id', 'chunks'], additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const current = projectUploads.get(args.upload_id);
+        if (!current) throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
+        if (!Array.isArray(args.chunks) || args.chunks.length < 1 || args.chunks.length > 4) throw new Error('A chunk batch requires 1–4 chunks.');
+        const staged = cloneStagedProjectUpload(current);
+        const appended = [];
+        let batchBytes = 0;
+        for (const chunk of args.chunks) {
+          const filePath = cleanProjectPath(chunk.path);
+          const encoding = chunk.encoding || 'utf8';
+          const bytes = decodeUploadChunk(chunk.content, encoding);
+          batchBytes += bytes.byteLength;
+          if (batchBytes > PROJECT_UPLOAD_CHUNK_BYTES * 4) throw new Error('Project upload batches may contain at most 2 MiB decoded data.');
+          let file = staged.files.get(filePath);
+          const expectedOffset = file?.receivedBytes || 0;
+          if (file?.complete) throw new Error(`Project upload file is already complete: res://${filePath}`);
+          if (file && file.encoding !== encoding) throw new Error(`Project upload encoding changed for res://${filePath}.`);
+          if (chunk.offset !== expectedOffset) throw new Error(`Project upload offset mismatch for res://${filePath}: expected ${expectedOffset}, received ${chunk.offset}.`);
+          if (staged.totalBytes + bytes.byteLength > PROJECT_UPLOAD_TOTAL_BYTES) throw new Error('Staged project exceeds the 25 MB authoring limit.');
+          if (!file) {
+            file = { encoding, chunks: [], receivedBytes: 0, complete: false };
+            staged.files.set(filePath, file);
+          }
+          const index = file.chunks.length;
+          file.chunks.push(bytes);
+          file.receivedBytes += bytes.byteLength;
+          file.complete = chunk.final === true;
+          staged.totalBytes += bytes.byteLength;
+          appended.push({ path: filePath, index, bytes });
+        }
+        staged.updatedAt = Date.now();
+        await persistProjectUploadBatch(staged, appended);
+        projectUploads.set(staged.id, staged);
+        return { success: true, status: 'batch_accepted', chunks_accepted: appended.length, batch_bytes: batchBytes, persisted: true, ...publicProjectUpload(staged) };
+      }
+    },
+    {
+      definition: {
         name: 'godot_get_project_upload_status',
         description: 'Inspects staged project upload progress without returning uploaded contents',
         input_schema: { type: 'object', properties: { upload_id: { type: 'string' } }, required: ['upload_id'], additionalProperties: false },
@@ -2897,6 +2988,7 @@ func _physics_process(delta):
         godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
         godot_begin_project_upload: `Beginning staged project: ${input.project_name || 'Untitled'}`,
         godot_upload_project_file_chunk: `Uploading chunk: ${input.path || 'project file'}`,
+        godot_upload_project_chunk_batch: `Uploading chunk batch: ${input.chunks?.length || 0} chunks`,
         godot_get_project_upload_status: `Inspecting staged upload: ${input.upload_id || 'unknown'}`,
         godot_abort_project_upload: `Aborting staged upload: ${input.upload_id || 'unknown'}`,
         godot_commit_project_upload: `Committing staged upload: ${input.upload_id || 'unknown'}`,
