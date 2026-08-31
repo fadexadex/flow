@@ -16,7 +16,11 @@ export const MCP_TOOL_CATALOG = [
     description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
     input_schema: {
       type: 'object',
-      properties: { operation_id: { type: 'string' } },
+      properties: {
+        operation_id: { type: 'string', description: 'Specific operation ID; omit to inspect the active and recent operations' },
+        after_sequence: { type: 'integer', description: 'Return immediately if operation sequence is newer than this value' },
+        wait_ms: { type: 'integer', minimum: 0, maximum: 15000, default: 5000, description: 'Max ms to wait for a change before returning' }
+      },
       additionalProperties: false
     },
     annotations: { readOnlyHint: true, untrustedContentHint: false }

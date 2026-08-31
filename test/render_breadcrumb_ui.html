@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Godot WebMCP - Live Entity Breadcrumb Design (Clean Layout)</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: #141414;
+    color: #e0e0e0;
+    overflow: hidden;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Top Navigation & Breadcrumb Header */
+  #top-bar {
+    height: 48px;
+    background: #1b1d22;
+    border-bottom: 1px solid #2d3139;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 16px;
+    z-index: 100;
+  }
+
+  .logo-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 14px;
+    color: #478cbf;
+    letter-spacing: 0.02em;
+  }
+
+  /* Live Entity Breadcrumb Component */
+  #entity-breadcrumb-bar {
+    display: flex;
+    align-items: center;
+    background: rgba(8, 20, 32, 0.85);
+    border: 1px solid rgba(0, 229, 255, 0.35);
+    border-radius: 8px;
+    padding: 4px 12px;
+    gap: 8px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4), inset 0 0 8px rgba(0, 229, 255, 0.08);
+  }
+
+  .crumb-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #94a3b8;
+  }
+
+  .crumb-item.project { color: #38bdf8; font-weight: 600; }
+  .crumb-item.scene { color: #cbd5e1; }
+  .crumb-item.container { color: #f59e0b; }
+  
+  .crumb-separator {
+    color: #475569;
+    font-size: 11px;
+  }
+
+  .crumb-active-entity {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: linear-gradient(90deg, rgba(255, 0, 68, 0.25), rgba(255, 60, 0, 0.12));
+    border: 1px solid #ff0044;
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: #ffffff;
+    font-weight: 700;
+    box-shadow: 0 0 12px rgba(255, 0, 68, 0.35);
+    animation: crumb-glow 2s infinite ease-in-out;
+  }
+
+  .pulse-dot {
+    width: 7px;
+    height: 7px;
+    background-color: #ff0044;
+    border-radius: 50%;
+    box-shadow: 0 0 8px #ff0044;
+    display: inline-block;
+  }
+
+  .entity-coords-badge {
+    font-size: 10px;
+    color: #ff88a3;
+    background: rgba(255, 0, 68, 0.15);
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 0, 68, 0.3);
+  }
+
+  @keyframes crumb-glow {
+    0%, 100% { border-color: #ff0044; box-shadow: 0 0 12px rgba(255, 0, 68, 0.35); }
+    50% { border-color: #00e5ff; box-shadow: 0 0 16px rgba(0, 229, 255, 0.45); }
+  }
+
+  /* Tabs Buttons */
+  #tabs-buttons {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+    align-items: center;
+  }
+
+  .tab-btn {
+    background: #242831;
+    border: 1px solid #333842;
+    color: #94a3b8;
+    padding: 5px 12px;
+    font-size: 12px;
+    border-radius: 4px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+
+  .tab-btn.active {
+    background: #478cbf;
+    border-color: #5c9fd4;
+    color: #ffffff;
+    font-weight: 600;
+  }
+
+  .status-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: #34d399;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+  }
+
+  /* Main Workspace Layout */
+  #workspace {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 260px 1fr 280px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* Left Panel - Scene Hierarchy & Building Blocks */
+  #left-panel {
+    background: #181a1f;
+    border-right: 1px solid #2d3139;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .panel-header {
+    padding: 8px 12px;
+    background: #20232a;
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-bottom: 1px solid #2d3139;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .tree-container {
+    padding: 8px 4px;
+    overflow-y: auto;
+    font-size: 12px;
+    font-family: -apple-system, sans-serif;
+    flex: 1;
+  }
+
+  .tree-node {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    color: #cbd5e1;
+    cursor: pointer;
+  }
+
+  .tree-node.depth-1 { padding-left: 20px; }
+  .tree-node.depth-2 { padding-left: 36px; }
+
+  .tree-node.active-target {
+    background: rgba(255, 0, 68, 0.15);
+    border: 1px solid rgba(255, 0, 68, 0.5);
+    color: #ff3366;
+    font-weight: 600;
+  }
+
+  /* Left Sidebar Building Blocks Integration */
+  .blocks-sidebar {
+    background: #14171d;
+    border-top: 1px solid #2d3139;
+    padding: 8px 10px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+  }
+
+  .block-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px;
+    border-radius: 4px;
+    margin-bottom: 2px;
+  }
+
+  .block-row.active {
+    background: rgba(255, 0, 68, 0.12);
+    border: 1px solid rgba(255, 0, 68, 0.3);
+  }
+
+  /* Center - 3D Viewport */
+  #center-viewport {
+    position: relative;
+    background: radial-gradient(circle at center, #1b0a2a 0%, #080314 70%, #030108 100%);
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .viewport-overlay-grid {
+    position: absolute;
+    inset: 0;
+    background-image: 
+      linear-gradient(rgba(0, 229, 255, 0.1) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 229, 255, 0.1) 1px, transparent 1px);
+    background-size: 40px 40px;
+    transform: perspective(600px) rotateX(65deg) translateY(120px);
+    opacity: 0.65;
+  }
+
+  .simulated-road {
+    position: absolute;
+    width: 320px;
+    height: 800px;
+    background: linear-gradient(180deg, #090e1c 0%, #151b2d 100%);
+    transform: perspective(500px) rotateX(68deg) translateY(60px);
+    border-left: 4px solid #ff8800;
+    border-right: 4px solid #ff8800;
+    box-shadow: 0 0 25px rgba(255, 136, 0, 0.4);
+  }
+
+  .simulated-lane-left {
+    position: absolute;
+    left: 100px;
+    width: 3px;
+    height: 100%;
+    background: repeating-linear-gradient(180deg, #00e5ff 0, #00e5ff 40px, transparent 40px, transparent 70px);
+    box-shadow: 0 0 8px #00e5ff;
+  }
+
+  .simulated-lane-right {
+    position: absolute;
+    right: 100px;
+    width: 3px;
+    height: 100%;
+    background: repeating-linear-gradient(180deg, #00e5ff 0, #00e5ff 40px, transparent 40px, transparent 70px);
+    box-shadow: 0 0 8px #00e5ff;
+  }
+
+  .simulated-laser-target {
+    position: absolute;
+    top: 42%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    z-index: 10;
+  }
+
+  .laser-beam-visual {
+    width: 190px;
+    height: 8px;
+    background: #ff0044;
+    border-radius: 4px;
+    box-shadow: 0 0 24px #ff0044, 0 0 45px #ff0044;
+  }
+
+  .laser-bounding-box {
+    position: absolute;
+    inset: -14px -18px;
+    border: 1.5px dashed #ff0044;
+    border-radius: 6px;
+    pointer-events: none;
+    box-shadow: 0 0 15px rgba(255, 0, 68, 0.4);
+  }
+
+  .laser-hud-tag {
+    position: absolute;
+    top: -30px;
+    background: rgba(3, 14, 24, 0.92);
+    border: 1px solid #ff0044;
+    color: #ff3366;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: ui-monospace, monospace;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+  }
+
+  /* SINGLE UNIFIED FLOATING STATUS PILL (No overlapping cards!) */
+  #unified-agent-pill {
+    position: absolute;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(8, 16, 26, 0.92);
+    border: 1px solid rgba(0, 229, 255, 0.45);
+    border-radius: 999px;
+    padding: 8px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6), inset 0 0 10px rgba(0, 229, 255, 0.08);
+    backdrop-filter: blur(10px);
+    z-index: 1000;
+  }
+
+  .pill-agent-icon { color: #00e5ff; font-weight: 700; }
+  .pill-action { color: #ffffff; font-weight: 600; }
+  .pill-detail { color: #94a3b8; }
+  .pill-meta {
+    background: rgba(0, 229, 255, 0.15);
+    border: 1px solid rgba(0, 229, 255, 0.3);
+    color: #38bdf8;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 10px;
+  }
+
+  /* Right Panel - Properties Inspector */
+  #right-panel {
+    background: #181a1f;
+    border-left: 1px solid #2d3139;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .inspector-section {
+    padding: 12px;
+    border-bottom: 1px solid #2d3139;
+  }
+
+  .inspector-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #94a3b8;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .prop-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    margin-bottom: 6px;
+  }
+
+  .prop-label { color: #94a3b8; }
+  .prop-value { color: #f1f5f9; font-family: ui-monospace, monospace; font-size: 11px; }
+</style>
+</head>
+<body>
+
+  <!-- Top Bar with Live Entity Breadcrumb -->
+  <div id="top-bar">
+    <div class="logo-title">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="#478cbf"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9v-2h2v2zm0-4H9V7h2v5zm4 4h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg>
+      <span>Godot Web Editor</span>
+    </div>
+
+    <!-- The Live Entity Breadcrumb Component -->
+    <div id="entity-breadcrumb-bar">
+      <div class="crumb-item project">
+        <span>🎮 Neon Horizon 3D</span>
+      </div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item scene">
+        <span>🎬 main_3d.tscn</span>
+      </div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item container">
+        <span>📦 LaserHazardsContainer</span>
+      </div>
+      <span class="crumb-separator">/</span>
+      <!-- Active Staged Entity with Pulse & Coordinates -->
+      <div class="crumb-active-entity">
+        <span class="pulse-dot"></span>
+        <span>✦ Laser1 [Active Staging]</span>
+        <span class="entity-coords-badge">X: -3.6, Y: 0.4, Z: -90.0m</span>
+      </div>
+    </div>
+
+    <!-- Tabs & Diagnostics -->
+    <div id="tabs-buttons">
+      <div class="status-badge">
+        <span style="color:#34d399;">●</span> WebMCP: 40 Tools Active
+      </div>
+      <button class="tab-btn">Loader</button>
+      <button class="tab-btn active">Editor</button>
+      <button class="tab-btn">Game</button>
+    </div>
+  </div>
+
+  <!-- Main 3-Pane Workspace -->
+  <div id="workspace">
+    
+    <!-- Left: Scene Tree Hierarchy & Building Blocks Dock -->
+    <div id="left-panel">
+      <div class="panel-header">
+        <span>Scene Hierarchy</span>
+        <span style="color:#478cbf;">Rev #3</span>
+      </div>
+      <div class="tree-container">
+        <div class="tree-node">🌍 Main3D</div>
+        <div class="tree-node depth-1">🌌 WorldEnvironment</div>
+        <div class="tree-node depth-1">☀️ DirectionalLight3D</div>
+        <div class="tree-node depth-1">🛣️ SkyrailHighway</div>
+        <div class="tree-node depth-1">🚀 PlayerRunner</div>
+        <div class="tree-node depth-1" style="color:#f59e0b;font-weight:600;">🚨 LaserHazardsContainer</div>
+        <div class="tree-node depth-2 active-target">
+          <span style="color:#ff0044;">✦</span> Laser1 (Area3D)
+        </div>
+        <div class="tree-node depth-2">🚨 Laser2 (Area3D)</div>
+        <div class="tree-node depth-2">🚨 Laser3 (Area3D)</div>
+        <div class="tree-node depth-1">📊 HUDOverlay</div>
+      </div>
+
+      <!-- Clean Sidebar Integration for Building Blocks -->
+      <div class="panel-header">
+        <span>Building Blocks</span>
+        <span style="color:#34d399;">✓ Active</span>
+      </div>
+      <div class="blocks-sidebar">
+        <div class="block-row" style="color:#38bdf8;">🛣️ #1 Highway & Sky <span style="margin-left:auto;color:#34d399;font-size:9px;">✓</span></div>
+        <div class="block-row" style="color:#00e5ff;">🚀 #2 Player Speeder <span style="margin-left:auto;color:#34d399;font-size:9px;">✓</span></div>
+        <div class="block-row active" style="color:#ff3366;font-weight:700;">🚨 #3 Laser Barriers <span style="margin-left:auto;color:#ff3366;font-size:9px;">✦ Active</span></div>
+      </div>
+    </div>
+
+    <!-- Center: 3D Viewport with Single Unified Status Pill -->
+    <div id="center-viewport">
+      <div class="viewport-overlay-grid"></div>
+      <div class="simulated-road">
+        <div class="simulated-lane-left"></div>
+        <div class="simulated-lane-right"></div>
+      </div>
+
+      <!-- Focused Obstacle with Bounding Box & Floating Tag -->
+      <div class="simulated-laser-target">
+        <div class="laser-hud-tag">
+          ✦ Laser1 (Area3D) · Collision Damage: 25 HP
+        </div>
+        <div class="laser-beam-visual"></div>
+        <div class="laser-bounding-box"></div>
+      </div>
+
+      <!-- SINGLE, CLEAN, UNIFIED FLOATING STATUS PILL -->
+      <div id="unified-agent-pill">
+        <span class="pill-agent-icon">✦ AI Agent</span>
+        <span class="pill-action">Staging Crimson Laser Barriers</span>
+        <span class="pill-detail">res://laser_barrier.tscn (Area3D)</span>
+        <span class="pill-meta">Rev #3 · 240ms</span>
+      </div>
+    </div>
+
+    <!-- Right: Property Inspector -->
+    <div id="right-panel">
+      <div class="panel-header">
+        <span>Inspector</span>
+        <span style="color:#ff3366;">Laser1</span>
+      </div>
+
+      <div class="inspector-section">
+        <div class="inspector-title">Transform 3D</div>
+        <div class="prop-row"><span class="prop-label">Position X</span><span class="prop-value">-3.60 m</span></div>
+        <div class="prop-row"><span class="prop-label">Position Y</span><span class="prop-value">0.40 m</span></div>
+        <div class="prop-row"><span class="prop-label">Position Z</span><span class="prop-value">-90.00 m</span></div>
+      </div>
+
+      <div class="inspector-section">
+        <div class="inspector-title">Laser Parameters</div>
+        <div class="prop-row"><span class="prop-label">Script</span><span class="prop-value">res://laser_barrier.gd</span></div>
+        <div class="prop-row"><span class="prop-label">Damage</span><span class="prop-value" style="color:#ff3366;font-weight:700;">25 HP</span></div>
+        <div class="prop-row"><span class="prop-label">Laser Color</span><span class="prop-value" style="color:#ff0044;">#FF0044</span></div>
+        <div class="prop-row"><span class="prop-label">Emission</span><span class="prop-value">4.50 Energy</span></div>
+      </div>
+
+      <div class="inspector-section">
+        <div class="inspector-title">Collision Layer</div>
+        <div class="prop-row"><span class="prop-label">Layer</span><span class="prop-value">2 (Hazards)</span></div>
+        <div class="prop-row"><span class="prop-label">Mask</span><span class="prop-value">1 (Player)</span></div>
+      </div>
+    </div>
+
+  </div>
+
+</body>
+</html>

@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node verify_catalog_parity.mjs",
+    "test": "node verify_catalog_parity.mjs && node --test test/operation_state_machine.test.mjs",
     "verify:catalog": "node verify_catalog_parity.mjs"
   },
   "keywords": [],
@@ -14,5 +14,8 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.9.0"
   }
 }

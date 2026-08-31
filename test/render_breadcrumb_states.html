@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Live Entity Breadcrumb States</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    background-color: #0d1117;
+    color: #e2e8f0;
+    padding: 32px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  h2 {
+    font-size: 18px;
+    font-weight: 700;
+    color: #38bdf8;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  p.subtitle {
+    font-size: 13px;
+    color: #94a3b8;
+    margin-bottom: 16px;
+  }
+
+  .state-card {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    padding: 16px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+
+  .state-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #64748b;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .state-label span.phase {
+    color: #38bdf8;
+    font-family: ui-monospace, monospace;
+  }
+
+  /* Breadcrumb Component */
+  .entity-breadcrumb-bar {
+    display: flex;
+    align-items: center;
+    background: rgba(8, 20, 32, 0.9);
+    border: 1px solid rgba(0, 229, 255, 0.35);
+    border-radius: 8px;
+    padding: 8px 14px;
+    gap: 10px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.5), inset 0 0 10px rgba(0, 229, 255, 0.06);
+    width: 100%;
+    overflow-x: auto;
+  }
+
+  .crumb-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+
+  .crumb-item.project { color: #38bdf8; font-weight: 600; }
+  .crumb-item.scene { color: #cbd5e1; }
+  .crumb-item.container { color: #f59e0b; }
+
+  .crumb-separator {
+    color: #475569;
+    font-size: 12px;
+  }
+
+  .crumb-active-entity {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: linear-gradient(90deg, rgba(0, 229, 255, 0.22), rgba(0, 150, 255, 0.1));
+    border: 1px solid #00e5ff;
+    border-radius: 6px;
+    padding: 4px 10px;
+    color: #ffffff;
+    font-weight: 700;
+    box-shadow: 0 0 12px rgba(0, 229, 255, 0.35);
+    white-space: nowrap;
+  }
+
+  .crumb-active-entity.hazard {
+    background: linear-gradient(90deg, rgba(255, 0, 68, 0.25), rgba(255, 60, 0, 0.12));
+    border-color: #ff0044;
+    box-shadow: 0 0 14px rgba(255, 0, 68, 0.4);
+  }
+
+  .crumb-active-entity.crystal {
+    background: linear-gradient(90deg, rgba(251, 191, 36, 0.25), rgba(245, 158, 11, 0.12));
+    border-color: #fbbf24;
+    box-shadow: 0 0 14px rgba(251, 191, 36, 0.4);
+  }
+
+  .crumb-active-entity.audio {
+    background: linear-gradient(90deg, rgba(168, 85, 247, 0.25), rgba(139, 92, 246, 0.12));
+    border-color: #c084fc;
+    box-shadow: 0 0 14px rgba(168, 85, 247, 0.4);
+  }
+
+  .pulse-dot {
+    width: 8px;
+    height: 8px;
+    background-color: #00e5ff;
+    border-radius: 50%;
+    box-shadow: 0 0 8px #00e5ff;
+    display: inline-block;
+  }
+
+  .pulse-dot.hazard { background-color: #ff0044; box-shadow: 0 0 8px #ff0044; }
+  .pulse-dot.crystal { background-color: #fbbf24; box-shadow: 0 0 8px #fbbf24; }
+  .pulse-dot.audio { background-color: #c084fc; box-shadow: 0 0 8px #c084fc; }
+
+  .entity-coords-badge {
+    font-size: 10px;
+    color: #94a3b8;
+    background: rgba(255, 255, 255, 0.08);
+    padding: 2px 7px;
+    border-radius: 4px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+  }
+
+  .action-tag {
+    margin-left: auto;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.3);
+  }
+</style>
+</head>
+<body>
+
+  <div>
+    <h2>Godot WebMCP: Live Entity Breadcrumb State Progression</h2>
+    <p class="subtitle">Real-time contextual visual feedback reflecting active agent operations, target nodes, 3D coordinates, and subsystems.</p>
+  </div>
+
+  <!-- State 1: Staging Player Speeder -->
+  <div class="state-card">
+    <div class="state-label">
+      <span>State 1: Character Authoring & Thruster Setup</span>
+      <span class="phase">Phase: staging_files (Rev #2)</span>
+    </div>
+    <div class="entity-breadcrumb-bar">
+      <div class="crumb-item project"><span>🎮 Neon Horizon 3D</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item scene"><span>🎬 player_speeder.tscn</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item container"><span>🚀 PlayerRunner (CharacterBody3D)</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-active-entity">
+        <span class="pulse-dot"></span>
+        <span>✦ ThrusterLight (OmniLight3D)</span>
+        <span class="entity-coords-badge">Z: 1.5m · Cyan Flare (4.0 Energy)</span>
+      </div>
+      <div class="action-tag">Staging Node</div>
+    </div>
+  </div>
+
+  <!-- State 2: Placing Laser Hazard -->
+  <div class="state-card">
+    <div class="state-label">
+      <span>State 2: Procedural Obstacle Placement</span>
+      <span class="phase">Phase: validating_runtime (Rev #3)</span>
+    </div>
+    <div class="entity-breadcrumb-bar">
+      <div class="crumb-item project"><span>🎮 Neon Horizon 3D</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item scene"><span>🎬 main_3d.tscn</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item container"><span>📦 LaserHazardsContainer</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-active-entity hazard">
+        <span class="pulse-dot hazard"></span>
+        <span>✦ Laser1 (Area3D)</span>
+        <span class="entity-coords-badge">X: -3.6, Y: 0.4, Z: -90.0m · 25 DMG</span>
+      </div>
+      <div class="action-tag" style="background:rgba(255,0,68,0.15);color:#ff3366;border-color:rgba(255,0,68,0.3);">Framing in Viewport</div>
+    </div>
+  </div>
+
+  <!-- State 3: Placing Quantum Collectible -->
+  <div class="state-card">
+    <div class="state-label">
+      <span>State 3: Collectibles & Score Triggers</span>
+      <span class="phase">Phase: staging_files (Rev #4)</span>
+    </div>
+    <div class="entity-breadcrumb-bar">
+      <div class="crumb-item project"><span>🎮 Neon Horizon 3D</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item scene"><span>🎬 main_3d.tscn</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item container"><span>✨ CrystalsContainer</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-active-entity crystal">
+        <span class="pulse-dot crystal"></span>
+        <span>✦ Crystal2 (Area3D)</span>
+        <span class="entity-coords-badge">X: 3.6, Y: 0.9, Z: -125.0m · +100 PTS</span>
+      </div>
+      <div class="action-tag" style="background:rgba(251,191,36,0.15);color:#fbbf24;border-color:rgba(251,191,36,0.3);">Rotating Octahedron</div>
+    </div>
+  </div>
+
+  <!-- State 4: Synthesizing Audio -->
+  <div class="state-card">
+    <div class="state-label">
+      <span>State 4: Dynamic Audio Synthesis</span>
+      <span class="phase">Phase: synthesizing_audio (Rev #5)</span>
+    </div>
+    <div class="entity-breadcrumb-bar">
+      <div class="crumb-item project"><span>🎮 Neon Horizon 3D</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item scene"><span>🔊 audio_suite.json</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-item container"><span>🎵 SoundFX Track #3</span></div>
+      <span class="crumb-separator">/</span>
+      <div class="crumb-active-entity audio">
+        <span class="pulse-dot audio"></span>
+        <span>✦ crystal_pickup_chime.wav</span>
+        <span class="entity-coords-badge">44.1kHz · 16-bit PCM · High Res</span>
+      </div>
+      <div class="action-tag" style="background:rgba(168,85,247,0.15);color:#c084fc;border-color:rgba(168,85,247,0.3);">Synthesized (8/8)</div>
+    </div>
+  </div>
+
+</body>
+</html>

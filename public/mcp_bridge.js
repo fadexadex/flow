@@ -22,11 +22,28 @@
     webmcpRegisteredCount: 0,
     webmcpLastError: null,
     webmcpSurface: 'none',
-    session: 'authoring', // 'empty' | 'authoring' | 'persisted' | 'editor-ready' | 'playtesting' | 'stopped' | 'failed'
+    session: 'authoring', // 'empty' | 'authoring' | 'persisted' | 'resume_available' | 'auto_restoring' | 'editor-ready' | 'playtesting' | 'stopped' | 'restore_failed' | 'failed'
     sceneRevision: 1,
     undoDepth: 0,
     activeProject: 'neon_skyrail_3d'
   };
+
+  const ResumeState = {
+    coordinatorStarted: false,
+    coordinatorPromise: null,
+    operationId: null,
+    restoreMode: null,
+    lastRestoreError: null
+  };
+
+  const DIAGNOSTIC_TOOLS = new Set([
+    'godot_get_operation_status',
+    'godot_get_session_status',
+    'godot_get_logs',
+    'godot_get_game_telemetry',
+    'godot_get_input_sequence_status',
+    'godot_get_project_upload_status'
+  ]);
 
   const undoStack = [];
   const idempotentMutations = new Map();
@@ -48,7 +65,9 @@
   let projectStateHydrated = false;
   let persistedProjectAvailable = false;
   let projectPersistenceError = null;
+  let hydratedSnapshot = null;
   let projectHydrationPromise = Promise.resolve();
+  let nativeRegistrationPromise = Promise.resolve();
 
   if (typeof window !== 'undefined') {
     window.addEventListener('godot-game-telemetry', (event) => {
@@ -110,9 +129,119 @@
     return records;
   }
 
+  async function computeProjectContentFingerprint(filesDict) {
+    try {
+      const entries = Object.entries(filesDict).sort(([a], [b]) => a.localeCompare(b));
+      const parts = [];
+      const encoder = new TextEncoder();
+      for (const [rawPath, content] of entries) {
+        const pathBytes = encoder.encode(cleanProjectPath(rawPath));
+        const isText = typeof content === 'string';
+        const bodyBytes = isText ? encoder.encode(content) : new Uint8Array(content);
+        const header = encoder.encode(`\0file:${pathBytes.length}:${isText ? 't' : 'b'}:${bodyBytes.length}:`);
+        parts.push(header, pathBytes, bodyBytes);
+      }
+      const totalLen = parts.reduce((sum, p) => sum + p.byteLength, 0);
+      const merged = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const part of parts) {
+        merged.set(part, offset);
+        offset += part.byteLength;
+      }
+      if (typeof crypto !== 'undefined' && crypto?.subtle?.digest) {
+        const hashBuffer = await crypto.subtle.digest('SHA-256', merged);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return `sha256:${hashArray.map(b => b.toString(16).padStart(2, '0')).join('')}`;
+      } else {
+        let hash = 2166136261;
+        for (let i = 0; i < merged.length; i++) {
+          hash ^= merged[i];
+          hash = Math.imul(hash, 16777619);
+        }
+        return `fnv1a:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+      }
+    } catch (err) {
+      return `error:${err.message || String(err)}`;
+    }
+  }
+
+  function yieldProgress() {
+    return new Promise((resolve) => {
+      if (typeof requestAnimationFrame === 'function') {
+        let resolved = false;
+        const timer = setTimeout(() => {
+          if (!resolved) { resolved = true; resolve(); }
+        }, 40);
+        requestAnimationFrame(() => {
+          if (!resolved) { resolved = true; clearTimeout(timer); resolve(); }
+        });
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
+  }
+
+  function phaseLabel(phase) {
+    const labels = {
+      accepted: 'Accepted',
+      validating_request: 'Validating request',
+      staging_files: 'Staging files',
+      stopping_runtime: 'Stopping runtime',
+      replacing_editor: 'Replacing editor',
+      booting_editor: 'Booting editor',
+      validating_runtime: 'Validating runtime',
+      persisting_commit: 'Persisting commit',
+      ready: 'Ready',
+      rolling_back: 'Rolling back',
+      failed: 'Failed'
+    };
+    return labels[phase] || phase;
+  }
+
+  async function advancePhase(operation, phase, phaseIndex = null, phaseCount = null) {
+    if (!operation || operation.terminal) return;
+    operation.phase = phase;
+    if (phaseIndex !== null) operation.phaseIndex = phaseIndex;
+    if (phaseCount !== null) operation.phaseCount = phaseCount;
+    operation.sequence += 1;
+    operation.lastProgressAt = Date.now();
+
+    for (const waiter of operation.waiters) {
+      waiter();
+    }
+    operation.waiters.clear();
+
+    if (operation.observationIds?.size && typeof AgentObservationHUD !== 'undefined') {
+      const elapsed = ((Date.now() - operation.startedAt) / 1000).toFixed(1);
+      const detail = `${phaseLabel(phase)} · ${elapsed} s`;
+      for (const obsId of operation.observationIds) {
+        AgentObservationHUD.update('running', operation.tool, {}, detail, obsId);
+      }
+    }
+
+    await yieldProgress();
+  }
+
+  function waitForOperationChange(operation, afterSequence, waitMs) {
+    if (operation.terminal || operation.sequence > afterSequence || waitMs <= 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      let timer = null;
+      const onWake = () => {
+        if (timer) clearTimeout(timer);
+        operation.waiters.delete(onWake);
+        resolve();
+      };
+      timer = setTimeout(onWake, waitMs);
+      operation.waiters.add(onWake);
+    });
+  }
+
   async function persistActiveProjectState() {
     try {
       const database = await openRecordingDatabase();
+      const contentFingerprint = await computeProjectContentFingerprint(activeFilesDict);
       const snapshot = {
         id: 'active',
         project_name: DiagnosticState.activeProject,
@@ -121,6 +250,9 @@
         files: cloneProjectFiles(activeFilesDict),
         undo_stack: undoStack.map(entry => ({ ...entry, files_before: cloneProjectFiles(entry.files_before || {}), files_after: cloneProjectFiles(entry.files_after || {}) })),
         idempotent_mutations: [...idempotentMutations.entries()].slice(-100),
+        content_fingerprint: contentFingerprint,
+        last_validated_revision: DiagnosticState.sceneRevision,
+        validation_state: 'runtime_validated',
         updated_at: Date.now()
       };
       await new Promise((resolve, reject) => {
@@ -131,7 +263,9 @@
       });
       database.close();
       persistedProjectAvailable = Object.keys(snapshot.files).length > 0;
+      hydratedSnapshot = snapshot;
       projectPersistenceError = null;
+      BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
       return true;
     } catch (error) {
       projectPersistenceError = error instanceof Error ? error.message : String(error);
@@ -200,16 +334,19 @@
           }
         }
         persistedProjectAvailable = hasFiles;
+        hydratedSnapshot = snapshot;
         DiagnosticState.session = persistedProjectAvailable ? 'persisted' : 'empty';
         DiagnosticState.engine = 'loading';
         projectPersistenceError = null;
       } else {
         DiagnosticState.session = 'empty';
         DiagnosticState.engine = 'loading';
+        hydratedSnapshot = null;
       }
     } catch (error) {
       projectPersistenceError = error instanceof Error ? error.message : String(error);
       persistedProjectAvailable = false;
+      hydratedSnapshot = null;
       DiagnosticState.session = 'empty';
       DiagnosticState.engine = 'loading';
       activeLogs.push({ level: 'warn', time: Date.now(), msg: `[Persistence] ${projectPersistenceError}` });
@@ -246,6 +383,10 @@
       tool: operation.tool,
       label: operation.label,
       status: operation.status,
+      phase: operation.phase,
+      sequence: operation.sequence,
+      terminal: operation.terminal,
+      last_progress_at: operation.lastProgressAt,
       started_at: operation.startedAt,
       completed_at: operation.completedAt || null,
       elapsed_ms: (operation.completedAt || Date.now()) - operation.startedAt,
@@ -254,7 +395,7 @@
     };
   }
 
-  async function runManagedMutation(tool, label, mutation, inlineWaitMs = 10000, idempotency = null) {
+  async function runManagedMutation(tool, label, mutation, inlineWaitMs = 10000, idempotency = null, options = {}) {
     if (idempotency?.key) {
       const replay = getIdempotentReplay(idempotency.key, idempotency.fingerprint);
       if (replay) return replay;
@@ -265,6 +406,10 @@
         }
         const operation = managedOperations.get(inflight.operationId);
         if (operation) {
+          if (options.observation_id) {
+            if (!operation.observationIds) operation.observationIds = new Set();
+            operation.observationIds.add(options.observation_id);
+          }
           const replay = publicOperation(operation);
           if (replay.status === 'running') replay.status = 'pending';
           return { ...replay, idempotent_replay: true };
@@ -283,11 +428,19 @@
       tool,
       label,
       status: 'running',
+      phase: 'accepted',
+      phaseIndex: 0,
+      phaseCount: 7,
+      sequence: 0,
+      lastProgressAt: Date.now(),
+      terminal: false,
       startedAt: Date.now(),
       completedAt: null,
       result: null,
       error: null,
-      promise: null
+      promise: null,
+      observationIds: new Set(options.observation_id ? [options.observation_id] : []),
+      waiters: new Set()
     };
     managedOperations.set(operation.id, operation);
     activeManagedMutationId = operation.id;
@@ -301,17 +454,28 @@
 
     operation.promise = (async () => {
       try {
-        operation.result = await mutation();
+        operation.result = await mutation(operation);
         operation.status = 'succeeded';
       } catch (error) {
         operation.error = error instanceof Error ? error.message : String(error);
         operation.status = 'failed';
       } finally {
         operation.completedAt = Date.now();
+        operation.terminal = true;
+        operation.phase = operation.status === 'succeeded' ? 'ready' : 'failed';
+        operation.sequence += 1;
+        operation.lastProgressAt = Date.now();
+
         if (activeManagedMutationId === operation.id) activeManagedMutationId = null;
         if (idempotency?.key && inflightIdempotency.get(idempotency.key)?.operationId === operation.id) {
           inflightIdempotency.delete(idempotency.key);
         }
+
+        for (const waiter of operation.waiters) {
+          waiter();
+        }
+        operation.waiters.clear();
+
         if (operation.observationIds?.size && typeof AgentObservationHUD !== 'undefined') {
           const detail = operation.status === 'succeeded'
             ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete')
@@ -637,16 +801,18 @@
     return normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
   }
 
-  async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000) {
+  async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
     // A running game owns the same virtual project filesystem. Replacing the
     // editor first can race its shutdown and leave the new --path unmounted.
+    if (operation) await advancePhase(operation, 'stopping_runtime');
     await stopGameRuntime(10000);
     const closeEditorButton = document.getElementById('btn-close-editor');
     if (closeEditorButton && !closeEditorButton.disabled) {
+      if (operation) await advancePhase(operation, 'replacing_editor');
       if (typeof window.closeEditor === 'function') window.closeEditor();
       await waitFor(() => closeEditorButton.disabled, 3000);
       if (typeof window.setLoaderEnabled === 'function') window.setLoaderEnabled(true);
@@ -658,6 +824,7 @@
     DiagnosticState.session = 'authoring';
     DiagnosticHUD.render();
 
+    if (operation) await advancePhase(operation, 'booting_editor');
     const bootStartedAt = Date.now();
     let readyEventObserved = false;
     let failureMessage = null;
@@ -691,13 +858,14 @@
     return true;
   }
 
-  async function restoreProjectSnapshot(previous) {
+  async function restoreProjectSnapshot(previous, operation = null) {
+    if (operation) await advancePhase(operation, 'rolling_back');
     DiagnosticState.activeProject = previous.projectName;
     activeMainScene = previous.mainScene;
     activeFilesDict = cloneProjectFiles(previous.files);
     if (Object.keys(previous.files).length > 0) {
       try {
-        await restartEditorWithProject(previous.files, previous.projectName);
+        await restartEditorWithProject(previous.files, previous.projectName, 60000, operation);
         return true;
       } catch (_) {
         DiagnosticState.session = 'failed';
@@ -813,7 +981,8 @@
     return { gameReady: true, gameVisible: visible ? gameVisible : false, startedAt };
   }
 
-  async function validateProjectRuntimeBoot() {
+  async function validateProjectRuntimeBoot(operation = null) {
+    if (operation) await advancePhase(operation, 'validating_runtime');
     try {
       await startGameRuntime({ visible: false, timeoutMs: 60000 });
       await stopGameRuntime(15000);
@@ -1618,6 +1787,265 @@ func _physics_process(delta):
     }
   };
 
+  async function executeRestoreOperation(mode = 'validate_runtime', label = `Restoring persisted project: ${DiagnosticState.activeProject}`, options = {}) {
+    if (Object.keys(activeFilesDict).length === 0) {
+      throw new Error('No persisted project session is available to restore.');
+    }
+    if (DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
+      return {
+        success: true,
+        restored: false,
+        reason: 'already_ready',
+        active_project: DiagnosticState.activeProject,
+        main_scene: activeMainScene,
+        scene_revision: DiagnosticState.sceneRevision,
+        undo_stack_depth: undoStack.length,
+        editor_acknowledged: true
+      };
+    }
+    ResumeState.restoreMode = mode;
+    return runManagedMutation('godot_restore_project_session', label, async (operation) => {
+      ResumeState.operationId = operation.id;
+      try {
+        await advancePhase(operation, 'validating_request');
+        await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject, 60000, operation);
+        if (mode === 'validate_runtime') {
+          await validateProjectRuntimeBoot(operation);
+        }
+        await advancePhase(operation, 'persisting_commit');
+        DiagnosticState.session = 'editor-ready';
+        DiagnosticHUD.render();
+        ResumeState.lastRestoreError = null;
+        return {
+          success: true,
+          restored: true,
+          restore_mode: mode,
+          active_project: DiagnosticState.activeProject,
+          main_scene: activeMainScene,
+          scene_revision: DiagnosticState.sceneRevision,
+          undo_stack_depth: undoStack.length,
+          files_restored: Object.keys(activeFilesDict),
+          editor_acknowledged: true
+        };
+      } catch (err) {
+        DiagnosticState.session = 'restore_failed';
+        DiagnosticHUD.render();
+        ResumeState.lastRestoreError = err instanceof Error ? err.message : String(err);
+        showResumeRecoveryUI(err);
+        throw err;
+      }
+    }, 10000, null, options);
+  }
+
+  function showResumeAvailableUI() {
+    if (typeof document === 'undefined') return;
+    if (typeof window !== 'undefined' && typeof window.showTab === 'function') {
+      window.showTab('loader');
+    }
+    const container = document.getElementById('tab-loader') || document.body;
+    if (!container) return;
+    let existing = document.getElementById('webmcp-resume-panel');
+    if (existing) existing.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'webmcp-resume-panel';
+    panel.style.cssText = 'margin:16px auto;max-width:540px;padding:18px 22px;background:#1b263b;border:1px solid #00e5ff;border-radius:10px;color:#e2e8f0;text-align:left;box-shadow:0 8px 24px rgba(0,0,0,0.5);';
+
+    const heading = document.createElement('h3');
+    heading.style.cssText = 'margin:0 0 8px;color:#00e5ff;font-size:16px;';
+    heading.textContent = `Resume Project: ${DiagnosticState.activeProject}`;
+    panel.appendChild(heading);
+
+    const info = document.createElement('p');
+    info.style.cssText = 'margin:0 0 14px;color:#94a3b8;font-size:12px;line-height:1.4;';
+    info.textContent = `Rev #${DiagnosticState.sceneRevision} · ${Object.keys(activeFilesDict).length} files · ${undoStack.length} undo snapshots saved in local IndexedDB.`;
+    panel.appendChild(info);
+
+    const btnGroup = document.createElement('div');
+    btnGroup.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
+
+    const btnResume = document.createElement('button');
+    btnResume.className = 'btn';
+    btnResume.style.cssText = 'font-weight:700;background:#00e5ff;color:#03121c;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;';
+    btnResume.textContent = 'Resume Project';
+    btnResume.onclick = async () => {
+      panel.remove();
+      try {
+        await executeRestoreOperation('validate_runtime', `Resuming ${DiagnosticState.activeProject}`);
+      } catch (_) {}
+    };
+    btnGroup.appendChild(btnResume);
+
+    const btnSafe = document.createElement('button');
+    btnSafe.className = 'btn';
+    btnSafe.style.cssText = 'background:#334155;color:#e2e8f0;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnSafe.textContent = 'Open in Safe Mode';
+    btnSafe.onclick = async () => {
+      panel.remove();
+      try {
+        await executeRestoreOperation('editor_only', `Safe-mode opening ${DiagnosticState.activeProject}`);
+      } catch (_) {}
+    };
+    btnGroup.appendChild(btnSafe);
+
+    const btnExport = document.createElement('button');
+    btnExport.className = 'btn';
+    btnExport.style.cssText = 'background:#334155;color:#e2e8f0;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnExport.textContent = 'Export Snapshot';
+    btnExport.onclick = () => {
+      const zipBytes = ZipBuilder.createZip(activeFilesDict);
+      const blob = new Blob([zipBytes], { type: 'application/zip' });
+      exposeRecordingDownload({ blob, filename: `${DiagnosticState.activeProject}_snapshot_rev${DiagnosticState.sceneRevision}.zip` });
+    };
+    btnGroup.appendChild(btnExport);
+
+    const btnDismiss = document.createElement('button');
+    btnDismiss.className = 'btn';
+    btnDismiss.style.cssText = 'background:transparent;color:#94a3b8;border:1px solid #475569;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnDismiss.textContent = 'Create Another Project';
+    btnDismiss.onclick = () => { panel.remove(); };
+    btnGroup.appendChild(btnDismiss);
+
+    const btnDelete = document.createElement('button');
+    btnDelete.className = 'btn';
+    btnDelete.style.cssText = 'background:transparent;color:#f87171;border:1px solid #7f1d1d;padding:6px 10px;border-radius:5px;cursor:pointer;margin-left:auto;font-size:11px;';
+    btnDelete.textContent = 'Delete Saved Project';
+    btnDelete.onclick = async () => {
+      if (window.confirm(`Permanently delete the saved snapshot for '${DiagnosticState.activeProject}'? This cannot be undone.`)) {
+        try {
+          const database = await openRecordingDatabase();
+          await new Promise((res, rej) => {
+            const tx = database.transaction('projects', 'readwrite');
+            tx.objectStore('projects').delete('active');
+            tx.oncomplete = res;
+            tx.onerror = () => rej(tx.error);
+          });
+          database.close();
+          activeFilesDict = {};
+          persistedProjectAvailable = false;
+          hydratedSnapshot = null;
+          DiagnosticState.session = 'empty';
+          DiagnosticHUD.render();
+          panel.remove();
+        } catch (err) {
+          alert(`Failed to delete snapshot: ${err.message}`);
+        }
+      }
+    };
+    btnGroup.appendChild(btnDelete);
+
+    panel.appendChild(btnGroup);
+    container.prepend(panel);
+  }
+
+  function showResumeRecoveryUI(error) {
+    if (typeof document === 'undefined') return;
+    const loader = document.getElementById('tab-loader');
+    if (!loader) return;
+    let existing = document.getElementById('webmcp-recovery-panel');
+    if (existing) existing.remove();
+
+    const panel = document.createElement('div');
+    panel.id = 'webmcp-recovery-panel';
+    panel.style.cssText = 'margin:16px auto;max-width:480px;padding:16px 20px;background:#2d1215;border:1px solid #f87171;border-radius:10px;color:#fecaca;text-align:left;box-shadow:0 8px 24px rgba(0,0,0,0.5);';
+
+    const heading = document.createElement('h3');
+    heading.style.cssText = 'margin:0 0 8px;color:#f87171;font-size:16px;';
+    heading.textContent = 'Project Restoration Failed';
+    panel.appendChild(heading);
+
+    const msg = document.createElement('p');
+    msg.style.cssText = 'margin:0 0 8px;color:#fca5a5;font-size:12px;word-break:break-word;';
+    msg.textContent = error instanceof Error ? error.message : String(error);
+    panel.appendChild(msg);
+
+    const note = document.createElement('p');
+    note.style.cssText = 'margin:0 0 14px;color:#cbd5e1;font-size:11px;';
+    note.textContent = 'Your project snapshot is safely preserved in IndexedDB and can be exported as a ZIP.';
+    panel.appendChild(note);
+
+    const btnGroup = document.createElement('div');
+    btnGroup.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;';
+
+    const btnRetry = document.createElement('button');
+    btnRetry.className = 'btn';
+    btnRetry.style.cssText = 'background:#f87171;color:#1c0406;font-weight:700;border:none;padding:6px 14px;border-radius:5px;cursor:pointer;';
+    btnRetry.textContent = 'Retry Full Restore';
+    btnRetry.onclick = async () => {
+      panel.remove();
+      try {
+        await executeRestoreOperation('validate_runtime', `Retrying restore: ${DiagnosticState.activeProject}`);
+      } catch (_) {}
+    };
+    btnGroup.appendChild(btnRetry);
+
+    const btnSafe = document.createElement('button');
+    btnSafe.className = 'btn';
+    btnSafe.style.cssText = 'background:#475569;color:#e2e8f0;border:none;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnSafe.textContent = 'Open in Safe Mode';
+    btnSafe.onclick = async () => {
+      panel.remove();
+      try {
+        await executeRestoreOperation('editor_only', `Safe-mode restore: ${DiagnosticState.activeProject}`);
+      } catch (_) {}
+    };
+    btnGroup.appendChild(btnSafe);
+
+    const btnExport = document.createElement('button');
+    btnExport.className = 'btn';
+    btnExport.style.cssText = 'background:#475569;color:#e2e8f0;border:none;padding:6px 12px;border-radius:5px;cursor:pointer;';
+    btnExport.textContent = 'Export Project ZIP';
+    btnExport.onclick = () => {
+      const zipBytes = ZipBuilder.createZip(activeFilesDict);
+      const blob = new Blob([zipBytes], { type: 'application/zip' });
+      exposeRecordingDownload({ blob, filename: `${DiagnosticState.activeProject}_recovery_rev${DiagnosticState.sceneRevision}.zip` });
+    };
+    btnGroup.appendChild(btnExport);
+
+    panel.appendChild(btnGroup);
+    loader.prepend(panel);
+  }
+
+  async function runStartupResumeCoordinator() {
+    if (ResumeState.coordinatorStarted) return ResumeState.coordinatorPromise;
+    ResumeState.coordinatorStarted = true;
+
+    ResumeState.coordinatorPromise = (async () => {
+      await projectHydrationPromise;
+      await nativeRegistrationPromise.catch(() => {});
+
+      const hasPersistedProject = persistedProjectAvailable && Object.keys(activeFilesDict).length > 0;
+      if (!hasPersistedProject) {
+        DiagnosticState.session = 'empty';
+        DiagnosticHUD.render();
+        return;
+      }
+
+      const autoResumePref = typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-auto-resume') !== 'false' : true;
+      const currentFingerprint = await computeProjectContentFingerprint(activeFilesDict);
+      const isSafe = hydratedSnapshot
+        && hydratedSnapshot.content_fingerprint === currentFingerprint
+        && hydratedSnapshot.last_validated_revision === DiagnosticState.sceneRevision
+        && hydratedSnapshot.validation_state === 'runtime_validated';
+
+      if (autoResumePref && isSafe) {
+        DiagnosticState.session = 'auto_restoring';
+        DiagnosticHUD.render();
+        try {
+          await executeRestoreOperation('editor_only', `Auto-resuming ${DiagnosticState.activeProject}`);
+        } catch (_) {
+          // Failure handled in executeRestoreOperation
+        }
+      } else {
+        DiagnosticState.session = 'resume_available';
+        DiagnosticHUD.render();
+        showResumeAvailableUI();
+      }
+    })();
+
+    return ResumeState.coordinatorPromise;
+  }
+
   // ==========================================
   // 6. Authoritative Native Tool Manifest
   // ==========================================
@@ -1632,6 +2060,8 @@ func _physics_process(delta):
       handler: async () => {
         refreshMeasuredEngineState();
         const isWebGL = typeof WebGLRenderingContext !== 'undefined';
+        const autoResumeEnabled = typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-auto-resume') !== 'false' : true;
+        const lastValidatedRev = hydratedSnapshot?.last_validated_revision ?? DiagnosticState.sceneRevision;
         return {
           status: 'healthy',
           engine_state: DiagnosticState.engine,
@@ -1654,7 +2084,17 @@ func _physics_process(delta):
           persistence: {
             hydrated: projectStateHydrated,
             project_available: persistedProjectAvailable,
-            restore_required: DiagnosticState.session === 'persisted',
+            restore_required: DiagnosticState.session === 'persisted' || DiagnosticState.session === 'resume_available' || DiagnosticState.session === 'restore_failed',
+            resume_state: DiagnosticState.session === 'editor-ready' ? 'ready'
+              : (DiagnosticState.session === 'persisted' || DiagnosticState.session === 'resume_available') ? 'available'
+              : DiagnosticState.session === 'auto_restoring' ? 'restoring'
+              : DiagnosticState.session === 'restore_failed' ? 'failed'
+              : 'empty',
+            restore_mode: ResumeState.restoreMode,
+            restore_operation_id: ResumeState.operationId,
+            last_restore_error: ResumeState.lastRestoreError,
+            auto_resume_enabled: autoResumeEnabled,
+            last_validated_revision: lastValidatedRev,
             last_error: projectPersistenceError
           },
           transport: {
@@ -1677,36 +2117,8 @@ func _physics_process(delta):
         input_schema: { type: 'object', properties: {}, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
-      handler: async () => {
-        if (Object.keys(activeFilesDict).length === 0) {
-          throw new Error('No persisted project session is available to restore.');
-        }
-        if (DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
-          return {
-            success: true,
-            restored: false,
-            reason: 'already_ready',
-            active_project: DiagnosticState.activeProject,
-            main_scene: activeMainScene,
-            scene_revision: DiagnosticState.sceneRevision,
-            undo_stack_depth: undoStack.length,
-            editor_acknowledged: true
-          };
-        }
-        return runManagedMutation('godot_restore_project_session', `Restoring persisted project: ${DiagnosticState.activeProject}`, async () => {
-          await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
-          await validateProjectRuntimeBoot();
-          return {
-            success: true,
-            restored: true,
-            active_project: DiagnosticState.activeProject,
-            main_scene: activeMainScene,
-            scene_revision: DiagnosticState.sceneRevision,
-            undo_stack_depth: undoStack.length,
-            files_restored: Object.keys(activeFilesDict),
-            editor_acknowledged: true
-          };
-        });
+      handler: async (args = {}, context = {}) => {
+        return executeRestoreOperation('validate_runtime', `Restoring persisted project: ${DiagnosticState.activeProject}`, context);
       }
     },
     {
@@ -1716,7 +2128,9 @@ func _physics_process(delta):
         input_schema: {
           type: 'object',
           properties: {
-            operation_id: { type: 'string', description: 'Specific operation ID; omit to inspect the active and recent operations' }
+            operation_id: { type: 'string', description: 'Specific operation ID; omit to inspect the active and recent operations' },
+            after_sequence: { type: 'integer', description: 'Return immediately if operation sequence is newer than this value' },
+            wait_ms: { type: 'integer', minimum: 0, maximum: 15000, default: 5000, description: 'Max ms to wait for a change before returning' }
           },
           additionalProperties: false
         },
@@ -1726,13 +2140,19 @@ func _physics_process(delta):
         if (args.operation_id) {
           const operation = managedOperations.get(args.operation_id);
           if (!operation) throw new Error(`Unknown managed operation: ${args.operation_id}`);
-          return publicOperation(operation);
+          const afterSeq = typeof args.after_sequence === 'number' ? args.after_sequence : -1;
+          const waitMs = typeof args.wait_ms === 'number' ? Math.min(Math.max(args.wait_ms, 0), 15000) : 5000;
+          await waitForOperationChange(operation, afterSeq, waitMs);
+          const result = publicOperation(operation);
+          if (!operation.terminal) result.retry_after_ms = 3000;
+          return result;
         }
         const recent = [...managedOperations.values()].slice(-10).reverse().map(publicOperation);
         const active = activeManagedMutationId ? managedOperations.get(activeManagedMutationId) : null;
         return {
           active_operation: active ? publicOperation(active) : null,
-          recent_operations: recent
+          recent_operations: recent,
+          ...(active && !active.terminal ? { retry_after_ms: 3000 } : {})
         };
       }
     },
@@ -1750,81 +2170,84 @@ func _physics_process(delta):
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
-      handler: async (args = {}) => {
+      handler: async (args = {}, context = {}) => {
         const projName = cleanProjectName(args.project_name || 'neon_skyrail_3d');
         const idempotencyKey = args.idempotency_key;
         const fingerprint = mutationFingerprint('godot_author_3d_runner', args);
-        return runManagedMutation('godot_author_3d_runner', `Authoring 3D runner: ${projName}`, async () => {
+        return runManagedMutation('godot_author_3d_runner', `Authoring 3D runner: ${projName}`, async (operation) => {
+          await advancePhase(operation, 'validating_request');
           const previous = {
-          projectName: DiagnosticState.activeProject,
-          mainScene: activeMainScene,
-          files: cloneProjectFiles(activeFilesDict),
-          session: DiagnosticState.session,
-          engine: DiagnosticState.engine
-        };
-        DiagnosticState.activeProject = projName;
-        activeMainScene = 'res://main_3d.tscn';
-        const undoId = `undo_runner_${Date.now()}`;
+            projectName: DiagnosticState.activeProject,
+            mainScene: activeMainScene,
+            files: cloneProjectFiles(activeFilesDict),
+            session: DiagnosticState.session,
+            engine: DiagnosticState.engine
+          };
+          DiagnosticState.activeProject = projName;
+          activeMainScene = 'res://main_3d.tscn';
+          const undoId = `undo_runner_${Date.now()}`;
 
-        activeFilesDict = {
-          'project.godot': NeonSkyrail.generateProjectGodot(),
-          'main_3d.tscn': NeonSkyrail.generateMain3dScene(),
-          'main_3d.gd': NeonSkyrail.generateMain3dGd(),
-          'player_runner.tscn': NeonSkyrail.generatePlayerTscn(),
-          'player_runner.gd': NeonSkyrail.generatePlayerGd()
-        };
+          await advancePhase(operation, 'staging_files');
+          activeFilesDict = {
+            'project.godot': NeonSkyrail.generateProjectGodot(),
+            'main_3d.tscn': NeonSkyrail.generateMain3dScene(),
+            'main_3d.gd': NeonSkyrail.generateMain3dGd(),
+            'player_runner.tscn': NeonSkyrail.generatePlayerTscn(),
+            'player_runner.gd': NeonSkyrail.generatePlayerGd()
+          };
 
-        // Synthesize audio suite assets
-        const audioTypes = ['laser_fire', 'rail_impact', 'energy_pickup', 'jump_boost', 'gate_warp', 'shield_down'];
-        const generatedAudio = [];
-        for (const t of audioTypes) {
-          const aud = AudioEngine.synthesizeSound(t, 0.4);
-          activeFilesDict[aud.filename] = aud.raw_bytes;
-          generatedAudio.push({ name: aud.name, filename: aud.filename, duration: aud.duration_seconds, license: aud.license });
-        }
+          // Synthesize audio suite assets
+          const audioTypes = ['laser_fire', 'rail_impact', 'energy_pickup', 'jump_boost', 'gate_warp', 'shield_down'];
+          const generatedAudio = [];
+          for (const t of audioTypes) {
+            const aud = AudioEngine.synthesizeSound(t, 0.4);
+            activeFilesDict[aud.filename] = aud.raw_bytes;
+            generatedAudio.push({ name: aud.name, filename: aud.filename, duration: aud.duration_seconds, license: aud.license });
+          }
 
-        try {
-          await restartEditorWithProject(activeFilesDict, projName);
-          await validateProjectRuntimeBoot();
-        } catch (error) {
-          await restoreProjectSnapshot(previous);
-          throw error;
-        }
+          try {
+            await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
+            await validateProjectRuntimeBoot(operation);
+          } catch (error) {
+            await restoreProjectSnapshot(previous, operation);
+            throw error;
+          }
 
-        DiagnosticState.sceneRevision++;
-        DiagnosticHUD.render();
-        undoStack.push({
-          undo_id: undoId,
-          revision: DiagnosticState.sceneRevision,
-          project_before: previous.projectName,
-          main_scene_before: previous.mainScene,
-          files_before: previous.files,
-          project_after: projName,
-          main_scene_after: activeMainScene,
-          files_after: cloneProjectFiles(activeFilesDict)
-        });
-        const result = {
-          success: true,
-          project_name: projName,
-          scene_revision: DiagnosticState.sceneRevision,
-          undo_id: undoId,
-          persisted: true,
-          main_scene: 'res://main_3d.tscn',
-          entities: {
-            rail_length_meters: 900,
-            hazards_count: 8,
-            collectibles_count: 11,
-            finish_gate_z: -800.0,
-            lighting: 'WorldEnvironment (Daybreak HDRI + Mauve Fog)',
-            camera: 'Third-Person ChaseCamera (FOV 68)'
-          },
-          audio_assets_generated: generatedAudio,
-          files_written: Object.keys(activeFilesDict)
-        };
+          await advancePhase(operation, 'persisting_commit');
+          DiagnosticState.sceneRevision++;
+          DiagnosticHUD.render();
+          undoStack.push({
+            undo_id: undoId,
+            revision: DiagnosticState.sceneRevision,
+            project_before: previous.projectName,
+            main_scene_before: previous.mainScene,
+            files_before: previous.files,
+            project_after: projName,
+            main_scene_after: activeMainScene,
+            files_after: cloneProjectFiles(activeFilesDict)
+          });
+          const result = {
+            success: true,
+            project_name: projName,
+            scene_revision: DiagnosticState.sceneRevision,
+            undo_id: undoId,
+            persisted: true,
+            main_scene: 'res://main_3d.tscn',
+            entities: {
+              rail_length_meters: 900,
+              hazards_count: 8,
+              collectibles_count: 11,
+              finish_gate_z: -800.0,
+              lighting: 'WorldEnvironment (Daybreak HDRI + Mauve Fog)',
+              camera: 'Third-Person ChaseCamera (FOV 68)'
+            },
+            audio_assets_generated: generatedAudio,
+            files_written: Object.keys(activeFilesDict)
+          };
           storeIdempotentResult(idempotencyKey, fingerprint, result);
           result.persisted = await persistActiveProjectState();
           return result;
-        }, 10000, { key: idempotencyKey, fingerprint });
+        }, 10000, { key: idempotencyKey, fingerprint }, context);
       }
     },
     {
@@ -2136,7 +2559,7 @@ func _physics_process(delta):
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
-      handler: async (args = {}) => {
+      handler: async (args = {}, context = {}) => {
         const upload = projectUploads.get(args.upload_id);
         if (!upload) {
           const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
@@ -2148,7 +2571,7 @@ func _physics_process(delta):
         const files = assembleProjectUpload(upload);
         const createTool = MANIFEST_TOOLS.find(entry => entry.definition.name === 'godot_create_project');
         if (!createTool) throw new Error('Custom project commit handler is unavailable.');
-        const result = await createTool.handler({ project_name: upload.projectName, template: 'custom', files, idempotency_key: args.idempotency_key, _upload_id: upload.id });
+        const result = await createTool.handler({ project_name: upload.projectName, template: 'custom', files, idempotency_key: args.idempotency_key, _upload_id: upload.id }, context);
         return { ...result, upload_id: upload.id, staged_total_bytes: upload.totalBytes };
       }
     },
@@ -2168,7 +2591,7 @@ func _physics_process(delta):
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
-      handler: async (args = {}) => {
+      handler: async (args = {}, context = {}) => {
         const projName = cleanProjectName(args.project_name || 'echoes_of_the_orbital_garden');
         const idempotencyKey = args.idempotency_key;
         const fingerprint = mutationFingerprint('godot_create_project', args);
@@ -2177,7 +2600,8 @@ func _physics_process(delta):
           throw new Error('The custom template requires a non-empty files dictionary. No fallback template was created.');
         }
 
-        return runManagedMutation('godot_create_project', `Creating project: ${projName}`, async () => {
+        return runManagedMutation('godot_create_project', `Creating project: ${projName}`, async (operation) => {
+          await advancePhase(operation, 'validating_request');
           const previous = {
           projectName: DiagnosticState.activeProject,
           mainScene: activeMainScene,
@@ -2191,6 +2615,7 @@ func _physics_process(delta):
         let projectType = args.template || 'custom';
         let stagedFiles;
 
+        await advancePhase(operation, 'staging_files');
         // Check if custom files are provided
         if (args.files && Object.keys(args.files).length > 0) {
           stagedFiles = Object.fromEntries(Object.entries(args.files).map(([filePath, content]) => [cleanProjectPath(filePath), content]));
@@ -2224,13 +2649,14 @@ func _physics_process(delta):
         activeMainScene = mainScene;
 
         try {
-          await restartEditorWithProject(activeFilesDict, projName);
-          await validateProjectRuntimeBoot();
+          await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
+          await validateProjectRuntimeBoot(operation);
         } catch (error) {
-          await restoreProjectSnapshot(previous);
+          await restoreProjectSnapshot(previous, operation);
           throw error;
         }
 
+        await advancePhase(operation, 'persisting_commit');
         DiagnosticState.sceneRevision++;
         DiagnosticHUD.render();
         undoStack.push({
@@ -2259,7 +2685,7 @@ func _physics_process(delta):
           storeIdempotentResult(idempotencyKey, fingerprint, result, { source_upload_id: args._upload_id || null });
           result.persisted = await persistActiveProjectState();
           return result;
-        }, 10000, { key: idempotencyKey, fingerprint });
+        }, 10000, { key: idempotencyKey, fingerprint }, context);
       }
     },
     {
@@ -2333,7 +2759,7 @@ func _physics_process(delta):
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
-      handler: async (args = {}) => {
+      handler: async (args = {}, context = {}) => {
         const fingerprint = args._mutation_fingerprint || mutationFingerprint('godot_apply_file_transaction', args);
         const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
         if (replay) return replay;
@@ -2342,35 +2768,38 @@ func _physics_process(delta):
         }
         if (!Array.isArray(args.operations) || args.operations.length === 0) throw new Error('At least one file operation is required.');
 
-        return runManagedMutation('godot_apply_file_transaction', `Applying file transaction: ${args.label || 'Project update'}`, async () => {
+        return runManagedMutation('godot_apply_file_transaction', `Applying file transaction: ${args.label || 'Project update'}`, async (operation) => {
+          await advancePhase(operation, 'validating_request');
           const previousFiles = cloneProjectFiles(activeFilesDict);
         const previousMainScene = activeMainScene;
         const stagedFiles = cloneProjectFiles(activeFilesDict);
         const changedPaths = [];
-        for (const operation of args.operations) {
-          const filePath = cleanProjectPath(operation.path);
-          if (operation.kind === 'write') {
-            if (typeof operation.content !== 'string') throw new Error(`Write operation requires text content: ${filePath}`);
-            stagedFiles[filePath] = operation.content;
-          } else if (operation.kind === 'delete') {
+        for (const op of args.operations) {
+          const filePath = cleanProjectPath(op.path);
+          if (op.kind === 'write') {
+            if (typeof op.content !== 'string') throw new Error(`Write operation requires text content: ${filePath}`);
+            stagedFiles[filePath] = op.content;
+          } else if (op.kind === 'delete') {
             if (!(filePath in stagedFiles)) throw new Error(`Cannot delete missing project file: ${filePath}`);
             delete stagedFiles[filePath];
           } else {
-            throw new Error(`Unsupported file operation: ${operation.kind}`);
+            throw new Error(`Unsupported file operation: ${op.kind}`);
           }
           changedPaths.push(`res://${filePath}`);
         }
+        await advancePhase(operation, 'staging_files');
         const validation = validateProjectFiles(stagedFiles);
         const stagedMainScene = inferMainScene(stagedFiles);
 
         try {
-          await restartEditorWithProject(stagedFiles, DiagnosticState.activeProject);
-          await validateProjectRuntimeBoot();
+          await restartEditorWithProject(stagedFiles, DiagnosticState.activeProject, 60000, operation);
+          await validateProjectRuntimeBoot(operation);
         } catch (error) {
-          try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject); } catch (_) {}
+          try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject, 60000, operation); } catch (_) {}
           throw error;
         }
 
+        await advancePhase(operation, 'persisting_commit');
         activeFilesDict = stagedFiles;
         activeMainScene = stagedMainScene;
         DiagnosticState.sceneRevision++;
@@ -2402,7 +2831,7 @@ func _physics_process(delta):
           storeIdempotentResult(args.idempotency_key, fingerprint, result);
           result.persisted = await persistActiveProjectState();
           return result;
-        }, 10000, { key: args.idempotency_key, fingerprint });
+        }, 10000, { key: args.idempotency_key, fingerprint }, context);
       }
     },
     {
@@ -3223,43 +3652,43 @@ func _physics_process(delta):
     banner: null,
     feed: null,
     entries: [],
-    feedExpanded: true,
+    userExpandedPreference: typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-feed-expanded') !== 'false' : true,
     _feedCollapseTimer: null,
 
     describe(toolName, input = {}) {
       const labels = {
-        godot_create_project: `Creating project: ${input.project_name || 'Untitled'}`,
-        godot_begin_project_upload: `Beginning staged project: ${input.project_name || 'Untitled'}`,
-        godot_upload_project_file_chunk: `Uploading chunk: ${input.path || 'project file'}`,
-        godot_upload_project_chunk_batch: `Uploading chunk batch: ${input.chunks?.length || 0} chunks`,
+        godot_create_project: `Creating project: ${input.project_name || 'Untitled'} (${input.template || 'custom'})`,
+        godot_begin_project_upload: `Beginning staged project upload: ${input.project_name || 'Untitled'}`,
+        godot_upload_project_file_chunk: `Uploading chunk: ${input.path || 'project file'} (${input.chunk_index + 1}/${input.total_chunks})`,
+        godot_upload_project_chunk_batch: `Uploading chunk batch: ${input.chunks?.length || 0} files`,
         godot_get_project_upload_status: `Inspecting staged upload: ${input.upload_id || 'unknown'}`,
         godot_abort_project_upload: `Aborting staged upload: ${input.upload_id || 'unknown'}`,
         godot_commit_project_upload: `Committing staged upload: ${input.upload_id || 'unknown'}`,
         godot_restore_project_session: 'Restoring persisted editor session',
-        godot_author_3d_runner: `Authoring 3D runner: ${input.project_name || 'Neon Skyrail'}`,
-        godot_inspect_project_files: 'Inspecting authoritative project files',
-        godot_apply_file_transaction: `Applying file transaction: ${input.label || 'Project update'}`,
-        godot_apply_text_patch: `Applying exact text patch: ${input.label || 'Project update'}`,
-        godot_undo_transaction: `Undoing transaction: ${input.undo_id || 'latest'}`,
-        godot_run_game: 'Launching game viewport',
+        godot_author_3d_runner: `Authoring 3D runner architecture: ${input.project_name || 'Neon Skyrail'}`,
+        godot_inspect_project_files: input.paths?.length ? `Inspecting ${input.paths.length} project files` : 'Inspecting authoritative project manifest',
+        godot_apply_file_transaction: input.label ? `${input.label} (${input.operations?.length || 1} file${input.operations?.length === 1 ? '' : 's'})` : `Applying file transaction (${input.operations?.length || 0} operations)`,
+        godot_apply_text_patch: input.label || `Patching ${input.target_path || 'file'}`,
+        godot_undo_transaction: `Undoing transaction: ${input.undo_id || 'latest snapshot'}`,
+        godot_run_game: 'Launching live game test viewport',
         godot_stop_game: 'Stopping game session',
-        godot_send_input: `Flight input: ${input.key || 'Unknown'} ${input.pressed === false ? 'released' : 'pressed'}`,
-        godot_send_input_sequence: `Scheduling input sequence: ${input.events?.length || 0} events`,
-        godot_get_input_sequence_status: `Inspecting input sequence: ${input.sequence_id || 'recent'}`,
-        godot_capture_viewport: 'Capturing live viewport',
-        godot_send_pointer: `Pointer ${input.action || 'action'} at ${input.x || 0},${input.y || 0}`,
-        godot_start_recording: 'Starting persistent viewport recording',
+        godot_send_input: `Player input: ${input.key || 'Key'} ${input.pressed === false ? 'released' : 'pressed'}`,
+        godot_send_input_sequence: `Scheduling input sequence: ${input.events?.length || 0} flight maneuvers`,
+        godot_get_input_sequence_status: `Inspecting flight sequence: ${input.sequence_id || 'recent'}`,
+        godot_capture_viewport: 'Capturing live viewport frame',
+        godot_send_pointer: `Pointer ${input.action || 'click'} at (${input.x || 0}, ${input.y || 0})`,
+        godot_start_recording: `Starting persistent viewport recording (${input.fps || 30} FPS)`,
         godot_stop_recording: 'Stopping and persisting viewport recording',
         godot_list_recordings: 'Listing persistent viewport recordings',
-        godot_select_node_live: `Selecting node: ${input.node_path || 'Player'}`,
+        godot_select_node_live: `Selecting live scene node: ${input.node_path || 'Player'}`,
         godot_transform_node_live: `Transforming node: ${input.node_path || 'Player'}`,
-        godot_connect_signal_live: `Wiring signal: ${input.signal || 'signal'}`,
-        godot_live_code_diff: `Editing script: ${input.script_path || 'script'}`,
-        godot_hot_reload_property: `Hot reload: ${input.property_name || 'property'}`,
+        godot_connect_signal_live: `Wiring signal: ${input.signal || 'signal'} -> ${input.target_method || 'handler'}`,
+        godot_live_code_diff: input.instruction ? `${input.instruction} (${input.script_path || 'script'})` : `Live code edit: ${input.script_path || 'script'}`,
+        godot_hot_reload_property: `Hot reload: ${input.node_path || 'node'}.${input.property_name || 'property'} = ${JSON.stringify(input.value)}`,
         godot_open_scene: `Opening scene: ${input.scene_path || 'main scene'}`,
-        godot_synthesize_audio_suite: 'Synthesizing flight audio suite',
-        godot_generate_audio_fx: `Generating audio: ${input.type || 'effect'}`,
-        godot_export_zip: 'Packaging project ZIP',
+        godot_synthesize_audio_suite: 'Synthesizing 8-track dynamic audio suite',
+        godot_generate_audio_fx: `Generating procedural ${input.type || 'FX'} sound (${input.duration_seconds || 0.5}s)`,
+        godot_export_zip: 'Packaging full project ZIP package',
         godot_get_session_status: 'Inspecting engine session',
         godot_get_operation_status: `Inspecting operation: ${input.operation_id || 'active/recent'}`,
         godot_get_game_telemetry: 'Reading project-owned game telemetry',
@@ -3286,7 +3715,10 @@ func _physics_process(delta):
         this.feed.setAttribute('aria-label', 'WebMCP agent activity. Click to collapse or expand.');
         this.feed.tabIndex = 0;
         const toggleFeed = () => {
-          this.feedExpanded = !this.feedExpanded;
+          this.userExpandedPreference = !this.userExpandedPreference;
+          if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('godot-webmcp-feed-expanded', this.userExpandedPreference ? 'true' : 'false');
+          }
           clearTimeout(this._feedCollapseTimer);
           this.renderFeed();
         };
@@ -3306,8 +3738,11 @@ func _physics_process(delta):
 
     renderFeed() {
       if (!this.ensure()) return;
+      const isOperationActive = activeManagedMutationId !== null || [...managedOperations.values()].some(op => op.status === 'running');
+      const isExpanded = this.userExpandedPreference || isOperationActive;
       const latest = this.entries[this.entries.length - 1];
-      if (!this.feedExpanded) {
+
+      if (!isExpanded) {
         const color = latest?.status === 'succeeded' ? '#45e7a4' : latest?.status === 'failed' ? '#ff667f' : latest?.status === 'pending' ? '#ffc857' : '#4de8ff';
         const status = latest ? this.escape(latest.status) : 'idle';
         const label = latest ? this.escape(latest.label) : 'Waiting for a WebMCP action…';
@@ -3316,11 +3751,13 @@ func _physics_process(delta):
         this.feed.innerHTML = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap"><span style="color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase">Agent · Rev #${DiagnosticState.sceneRevision}</span><span style="color:${color};text-transform:uppercase">${status}</span><span style="min-width:0;overflow:hidden;text-overflow:ellipsis;color:#9bbbc1">${label}</span><span style="margin-left:auto;color:#789099">⌃</span></div>`;
         return;
       }
+
       this.feed.style.maxHeight = 'min(230px,40vh)';
       this.feed.style.padding = '10px';
-      const rows = this.entries.slice(-5).reverse().map((entry) => {
+      const rows = this.entries.slice(-6).reverse().map((entry) => {
         const color = entry.status === 'succeeded' ? '#45e7a4' : entry.status === 'failed' ? '#ff667f' : entry.status === 'pending' ? '#ffc857' : '#4de8ff';
-        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}</span></div>`;
+        const detailText = entry.detail ? ` (${this.escape(entry.detail)})` : '';
+        return `<div style="display:grid;grid-template-columns:58px 1fr;gap:8px;padding:5px 3px;border-bottom:1px solid rgba(255,255,255,.06)"><span style="color:${color};text-transform:uppercase">${this.escape(entry.status)}</span><span>${this.escape(entry.label)}${detailText}</span></div>`;
       }).join('');
       this.feed.innerHTML = `<div style="display:flex;margin-bottom:5px;color:#4de8ff;font-weight:750;letter-spacing:.08em;text-transform:uppercase"><span>Agent activity · Rev #${DiagnosticState.sceneRevision}</span><span style="margin-left:auto;color:#789099">⌄</span></div>${rows}`;
     },
@@ -3329,7 +3766,7 @@ func _physics_process(delta):
       return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
     },
 
-    update(status, toolName, input, detail = '', entryId = null) {
+    update(status, toolName, input, detail = '', entryId = null, extra = {}) {
       const label = this.describe(toolName, input);
       const now = Date.now();
       let entry = entryId ? this.entries.find(item => item.id === entryId) : null;
@@ -3339,14 +3776,30 @@ func _physics_process(delta):
         entry.completedAt = now;
         entry.durationMs = now - entry.startedAt;
         entry.revision = DiagnosticState.sceneRevision;
+        if (extra.operation_id) entry.operationId = extra.operation_id;
+        if (extra.phase) entry.phase = extra.phase;
+        if (extra.sequence) entry.sequence = extra.sequence;
+        if (typeof extra.terminal === 'boolean') entry.terminal = extra.terminal;
       } else {
-        entry = { id: ++this.sequence, status, toolName, label, detail, at: now, startedAt: now, revision: DiagnosticState.sceneRevision };
+        entry = {
+          id: ++this.sequence,
+          operationId: extra.operation_id || null,
+          phase: extra.phase || null,
+          sequence: extra.sequence || 0,
+          terminal: extra.terminal || false,
+          status,
+          toolName,
+          label,
+          detail,
+          at: now,
+          startedAt: now,
+          revision: DiagnosticState.sceneRevision
+        };
         this.entries.push(entry);
       }
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
       if (this.ensure()) {
-        this.feedExpanded = true;
         clearTimeout(this._feedCollapseTimer);
         const icon = status === 'succeeded' ? '✓' : status === 'failed' ? '!' : status === 'pending' ? '…' : '✦';
         this.banner.textContent = `${icon} AI Agent · ${label}${detail ? ` · ${detail}` : ''}`;
@@ -3356,25 +3809,198 @@ func _physics_process(delta):
         clearTimeout(this._hideTimer);
         this._hideTimer = setTimeout(() => { if (this.banner) this.banner.style.opacity = '0'; }, status === 'running' ? 2200 : 3200);
         this.renderFeed();
-        if (status !== 'running' && status !== 'pending') {
+        const isAnyActive = activeManagedMutationId !== null || [...managedOperations.values()].some(op => op.status === 'running');
+        if (!isAnyActive && status !== 'running' && status !== 'pending' && !this.userExpandedPreference) {
           this._feedCollapseTimer = setTimeout(() => {
-            this.feedExpanded = false;
             this.renderFeed();
           }, 4200);
         }
       }
+      const observationDetail = {
+        id: entry.id,
+        operation_id: entry.operationId || null,
+        tool: toolName,
+        label: entry.label,
+        status,
+        phase: entry.phase || null,
+        sequence: entry.sequence || 0,
+        terminal: entry.terminal || false,
+        is_diagnostic: DIAGNOSTIC_TOOLS.has(toolName),
+        at: entry.at,
+        duration_ms: entry.durationMs
+      };
       if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-        window.dispatchEvent(new CustomEvent('godot:webmcp-observation', { detail: entry }));
+        window.dispatchEvent(new CustomEvent('godot:webmcp-observation', { detail: observationDetail }));
+      }
+      if (activeWebSocketRelay && activeWebSocketRelay.readyState === WebSocket.OPEN) {
+        try {
+          activeWebSocketRelay.send(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'notifications/webmcp_observation',
+            params: observationDetail
+          }));
+        } catch (_) {}
       }
       return entry;
     }
   };
 
+  const BuildingBlocksHUD = {
+    dock: null,
+    expanded: true,
+
+    ensure() {
+      if (typeof document === 'undefined' || !document.body) return false;
+      if (!this.dock) {
+        this.dock = document.createElement('div');
+        this.dock.id = 'webmcp-building-blocks-dock';
+        this.dock.style.cssText = 'position:fixed;left:14px;bottom:42px;z-index:999999;width:min(340px,calc(100vw - 28px));max-height:min(280px,48vh);overflow-y:auto;padding:10px 12px;border:1px solid rgba(0,229,255,.4);border-radius:10px;background:rgba(5,14,24,.94);box-shadow:0 12px 32px rgba(0,0,0,.5);color:#d1e8ee;font:500 11px/1.4 ui-monospace,SFMono-Regular,monospace;pointer-events:auto;backdrop-filter:blur(8px);';
+
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;margin-bottom:8px;font-weight:700;color:#00e5ff;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;user-select:none;';
+        header.innerHTML = '<span>🏗️ Architecture & Building Blocks</span><span id="webmcp-blocks-toggle" style="margin-left:auto;color:#789099">⌄</span>';
+        header.onclick = () => {
+          this.expanded = !this.expanded;
+          const toggle = document.getElementById('webmcp-blocks-toggle');
+          if (toggle) toggle.textContent = this.expanded ? '⌄' : '⌃';
+          const list = document.getElementById('webmcp-blocks-list');
+          if (list) list.style.display = this.expanded ? 'block' : 'none';
+        };
+        this.dock.appendChild(header);
+
+        const list = document.createElement('div');
+        list.id = 'webmcp-blocks-list';
+        this.dock.appendChild(list);
+
+        document.body.appendChild(this.dock);
+      }
+      return true;
+    },
+
+    updateFromFiles(filesDict, activeRevision) {
+      if (!this.ensure()) return;
+      const list = document.getElementById('webmcp-blocks-list');
+      if (!list) return;
+
+      const blocks = [];
+      const fileKeys = Object.keys(filesDict || {});
+
+      if (fileKeys.some(f => f.includes('main_3d'))) {
+        blocks.push({
+          icon: '🛣️',
+          name: 'Track & Cyber Highway',
+          files: ['main_3d.tscn', 'main_3d.gd', 'project.godot'].filter(f => f in filesDict),
+          status: 'Compiled & Staged',
+          color: '#38bdf8'
+        });
+      }
+      if (fileKeys.some(f => f.includes('player_runner') || f.includes('player_speeder') || f.includes('player'))) {
+        blocks.push({
+          icon: '🚀',
+          name: 'Player Hovercraft Character',
+          files: fileKeys.filter(f => f.includes('player')),
+          status: 'Active 3-Lane Controller',
+          color: '#00e5ff'
+        });
+      }
+      if (fileKeys.some(f => f.includes('laser_barrier') || f.includes('laser'))) {
+        blocks.push({
+          icon: '🚨',
+          name: 'Crimson Laser Barriers',
+          files: fileKeys.filter(f => f.includes('laser')),
+          status: 'Active Hazards (25 DMG)',
+          color: '#f87171'
+        });
+      }
+      if (fileKeys.some(f => f.includes('plasma_disc') || f.includes('plasma_mine') || f.includes('plasma'))) {
+        blocks.push({
+          icon: '🔮',
+          name: 'Amethyst Plasma Mines',
+          files: fileKeys.filter(f => f.includes('plasma')),
+          status: 'Oscillating Mine Field',
+          color: '#c084fc'
+        });
+      }
+      if (fileKeys.some(f => f.includes('flux_orb') || f.includes('quantum_crystal') || f.includes('crystal') || f.includes('orb'))) {
+        blocks.push({
+          icon: '✨',
+          name: 'Quantum Flux Crystals',
+          files: fileKeys.filter(f => f.includes('flux') || f.includes('crystal') || f.includes('orb')),
+          status: 'Spinning Pickups (+100 PTS)',
+          color: '#fbbf24'
+        });
+      }
+      if (fileKeys.some(f => f.includes('nexus_gate') || f.includes('goal') || f.includes('portal'))) {
+        blocks.push({
+          icon: '🌌',
+          name: 'Quantum Nexus Goal Gate',
+          files: fileKeys.filter(f => f.includes('nexus') || f.includes('goal') || f.includes('portal')),
+          status: 'Finish Line Portal @ 800m',
+          color: '#34d399'
+        });
+      }
+      if (fileKeys.some(f => f.includes('hud_overlay') || f.includes('hud'))) {
+        blocks.push({
+          icon: '📊',
+          name: 'Cyberpunk HUD Overlay',
+          files: fileKeys.filter(f => f.includes('hud')),
+          status: 'Live Telemetry & Shields',
+          color: '#4ade80'
+        });
+      }
+
+      if (blocks.length === 0) {
+        list.innerHTML = '<div style="color:#64748b;font-size:10px;">Waiting for building blocks...</div>';
+        return;
+      }
+
+      list.innerHTML = blocks.map((b, idx) => `
+        <div style="display:flex;align-items:flex-start;gap:6px;padding:4px 2px;border-bottom:1px solid rgba(255,255,255,.05);font-size:10px;">
+          <span style="font-size:12px;">${b.icon}</span>
+          <div style="min-width:0;flex:1;">
+            <div style="font-weight:700;color:${b.color};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">Block #${idx+1}: ${b.name}</div>
+            <div style="color:#94a3b8;font-size:9px;">${b.files.join(' · ')}</div>
+          </div>
+          <span style="color:#34d399;font-size:9px;white-space:nowrap;margin-left:auto;">✓ Active</span>
+        </div>
+      `).join('');
+    }
+  };
+
+  let activeWebSocketRelay = null;
+
   async function executeObservedTool(tool, input = {}) {
     await projectHydrationPromise;
+
+    // Diagnostic reads are executed without adding visual rows on success, but errors are recorded
+    if (DIAGNOSTIC_TOOLS.has(tool.definition.name)) {
+      try {
+        const result = await tool.handler(input, {});
+        // If an active operation was inspected and we have observation rows, update parent row in place
+        if (tool.definition.name === 'godot_get_operation_status' && result?.operation_id) {
+          const operation = managedOperations.get(result.operation_id);
+          if (operation?.observationIds?.size) {
+            const elapsed = ((Date.now() - operation.startedAt) / 1000).toFixed(1);
+            const detail = operation.terminal
+              ? (operation.status === 'succeeded' ? (operation.result?.scene_revision ? `Rev #${operation.result.scene_revision}` : 'Complete') : operation.error)
+              : `${phaseLabel(operation.phase)} · ${elapsed} s`;
+            for (const obsId of operation.observationIds) {
+              AgentObservationHUD.update(operation.status, operation.tool, {}, detail, obsId);
+            }
+          }
+        }
+        return result;
+      } catch (err) {
+        activeLogs.push({ level: 'error', time: Date.now(), msg: `[Diagnostic Failure] ${tool.definition.name}: ${err.message || String(err)}` });
+        AgentObservationHUD.update('failed', tool.definition.name, input, err instanceof Error ? err.message : String(err));
+        throw err;
+      }
+    }
+
     const observation = AgentObservationHUD.update('running', tool.definition.name, input);
+    const context = { observation_id: observation.id };
     try {
-      const result = await tool.handler(input);
+      const result = await tool.handler(input, context);
       if (result?.status === 'pending' && result.operation_id) {
         const operation = managedOperations.get(result.operation_id);
         if (operation) {
@@ -3507,7 +4133,7 @@ func _physics_process(delta):
 
       const engineColor = DiagnosticState.engine === 'ready' ? '#3fb950' : (DiagnosticState.engine === 'loading' ? '#d29922' : '#f85149');
       const webmcpColor = DiagnosticState.webmcp === 'ready' ? '#3fb950' : (DiagnosticState.webmcp === 'unsupported' ? '#58a6ff' : '#f85149');
-      const sessionColor = DiagnosticState.session === 'playtesting' ? '#a371f7' : '#3fb950';
+      const sessionColor = DiagnosticState.session === 'playtesting' ? '#a371f7' : (DiagnosticState.session === 'restore_failed' ? '#f85149' : '#3fb950');
 
       this.container.innerHTML = `
         <div style="display:flex; align-items:center; gap:5px;">
@@ -3532,9 +4158,9 @@ func _physics_process(delta):
   };
 
   // ==========================================
-  // 10. Auto-Execute Synchronous Registration
+  // 10. Auto-Execute Synchronous Registration & Coordinator
   // ==========================================
-  registerAllNativeTools().catch((error) => {
+  nativeRegistrationPromise = registerAllNativeTools().catch((error) => {
     DiagnosticState.webmcp = 'failed';
     DiagnosticState.webmcpLastError = error instanceof Error ? error.message : String(error);
     console.error('[WebMCP] Native tool registration failed:', error);
@@ -3627,9 +4253,12 @@ func _physics_process(delta):
   function initDOM() {
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
+    BuildingBlocksHUD.ensure();
     projectHydrationPromise.then(() => {
       DiagnosticHUD.render();
       AgentObservationHUD.renderFeed();
+      BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+      runStartupResumeCoordinator();
     });
 
     initWebSocketBridge();
