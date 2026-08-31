@@ -1842,7 +1842,7 @@ func _physics_process(delta):
         const upload = projectUploads.get(args.upload_id);
         if (!upload) {
           const receipt = args.idempotency_key ? idempotentMutations.get(args.idempotency_key) : null;
-          if (receipt?.metadata?.source_upload_id === args.upload_id) {
+          if (receipt?.metadata?.source_upload_id === args.upload_id || receipt?.result?.upload_receipt_id === args.upload_id) {
             return { ...receipt.result, upload_id: args.upload_id, idempotent_replay: true };
           }
           throw new Error(`Unknown or expired project upload: ${args.upload_id}`);
@@ -2003,7 +2003,8 @@ func _physics_process(delta):
           persisted: true,
           main_scene: mainScene,
           files_written: Object.keys(activeFilesDict),
-          message: `Project '${projName}' created successfully with ${projectType} template architecture.`
+          message: `Project '${projName}' created successfully with ${projectType} template architecture.`,
+          ...(args._upload_id ? { upload_receipt_id: args._upload_id } : {})
         };
 
           storeIdempotentResult(idempotencyKey, fingerprint, result, { source_upload_id: args._upload_id || null });
