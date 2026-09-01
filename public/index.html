@@ -571,6 +571,10 @@ let editor = null;
 window.__godotEditorLifecycle = {
 	state: 'idle', // idle | initializing | running | quitting | exited | failed
 	generation: 0,
+	// True while a boot sequence is running. A terminal state is only trustworthy when this is
+	// false: the project-manager re-exec boots an engine while the lifecycle still reads
+	// `exited`, and treating that as terminal would permit a second Engine over a live one.
+	bootInFlight: false,
 	startedAt: 0,
 	exitedAt: 0,
 	lastError: null
@@ -585,8 +589,13 @@ function setEditorLifecycle(state, detail) {
 	lifecycle.state = state;
 	if (detail && detail.error) lifecycle.lastError = detail.error;
 	if (state === 'initializing') {
-		lifecycle.generation += 1;
-		lifecycle.stale = 0;
+		// Generation identity IS Engine-instance identity. Godot's project-manager re-exec boots
+		// the SAME instance again, so it passes keepGeneration: bumping would make the boot's
+		// own ownership check reject it as superseded.
+		if (!(detail && detail.keepGeneration)) {
+			lifecycle.generation += 1;
+			lifecycle.stale = 0;
+		}
 		lifecycle.startedAt = Date.now();
 		lifecycle.exitedAt = 0;
 		lifecycle.lastError = null;
@@ -1072,6 +1081,7 @@ function startEditor(zip, customArgs) {
 						engine: editorInstance,
 						generation: myGeneration,
 						activeGeneration: function () { return window.__godotEditorLifecycle.generation; },
+						initArgument: undefined,
 						noteStale: noteStaleLifecycleEvent,
 						setPhase: setBootPhase,
 						// This path re-execs an already-staged project; it must not restage files.
@@ -1079,12 +1089,27 @@ function startEditor(zip, customArgs) {
 						zip: null,
 						args: args,
 						startOptions: { persistentDrops: is_project_manager, canvas: editorCanvas },
+						// onExit already set the lifecycle to `exited`. Leaving it there while this
+						// engine initializes and runs is a false terminal state, and
+						// prepareForReplacement would happily build a second Engine over it.
+						onBootStart: function () {
+							setEditorLifecycle('initializing', { keepGeneration: true });
+						},
+						markBootInFlight: function (active) {
+							window.__godotEditorLifecycle.bootInFlight = active;
+						},
 						beforeStart: function () {
 							setLoaderEnabled(false);
 							OnEditorExit = function () {
 								showTab('loader');
 								setLoaderEnabled(true);
 							};
+						},
+						onRunning: function () {
+							setEditorLifecycle('running');
+							setStatusMode('hidden');
+							initializing = false;
+							stopBootTicker();
 						}
 					}).catch(displayFailureNotice);
 				}, 0);
@@ -1198,6 +1223,9 @@ function startEditor(zip, customArgs) {
 			engine: editorInstance,
 			generation: myGeneration,
 			activeGeneration: function () { return window.__godotEditorLifecycle.generation; },
+			markBootInFlight: function (active) {
+				window.__godotEditorLifecycle.bootInFlight = active;
+			},
 			noteStale: noteStaleLifecycleEvent,
 			setPhase: setBootPhase,
 			projectFiles: window._mcpProjectFiles || null,

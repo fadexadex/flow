@@ -61,6 +61,8 @@
       engine,
       generation,
       activeGeneration,
+      // The main boot names the wasm module; Godot's own re-exec calls init() bare.
+      initArgument = 'godot.editor',
       noteStale = function () {},
       setPhase = function () {},
       projectFiles = null,
@@ -72,13 +74,30 @@
       // re-exec needs `persistentDrops` and an explicit canvas; it shares this function so it
       // gets the same fencing and the same single-catch rejection handling.
       startOptions = {},
+      // Fires before init(), for a caller that needs to mark the lifecycle as booting. The
+      // main path already transitions to `initializing` when it constructs the Engine; the
+      // project-manager re-exec reuses an existing instance and needs it here.
+      onBootStart = function () {},
+      // Brackets the whole sequence. Any state consulted while this is true must be treated
+      // as non-terminal, no matter what the lifecycle string says — a boot in flight means an
+      // Engine is live in this context.
+      markBootInFlight = function () {},
       beforeStart = function () {},
       onRunning = function () {}
     } = options;
 
     const isCurrent = () => activeGeneration() === generation;
 
-    await engine.init('godot.editor');
+    onBootStart();
+    markBootInFlight(true);
+    try {
+      return await bootPhases();
+    } finally {
+      markBootInFlight(false);
+    }
+
+    async function bootPhases() {
+    await engine.init(initArgument);
     if (!isCurrent()) {
       noteStale(generation, 'init() continuation');
       return { status: 'superseded', at: 'init' };
@@ -107,6 +126,7 @@
     }
     onRunning();
     return { status: 'running' };
+    }
   }
 
   root.GodotEditorBoot = {

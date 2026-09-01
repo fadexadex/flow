@@ -1068,9 +1068,17 @@
   // So: every non-terminal state requires a confirmed exit. When that does not arrive, the
   // answer is NOT another Engine in this context — it is a hard recovery (reload the page),
   // because nothing in this JS context can be trusted to host a replacement.
-  function editorReplacementPlan(state) {
-    if (EDITOR_TERMINAL_STATES.has(state)) {
+  // `bootInFlight` overrides the state string. Godot's project-manager re-exec boots an engine
+  // while the lifecycle still reads `exited` — a false terminal state that would let a
+  // replacement construct a second Engine over a live one, which is the exact ownership
+  // condition all of this exists to prevent. A boot in flight is never terminal.
+  function editorReplacementPlan(state, bootInFlight = false) {
+    if (EDITOR_TERMINAL_STATES.has(state) && !bootInFlight) {
       return { action: 'start', mustAwaitExit: false, requestQuit: false, waitMs: 0, exitRequired: false };
+    }
+    if (bootInFlight && EDITOR_TERMINAL_STATES.has(state)) {
+      // Nothing to ask to quit — the engine has not reached `running` — but it must be awaited.
+      return { action: 'await_exit', mustAwaitExit: true, requestQuit: true, waitMs: 25000, exitRequired: true };
     }
     return {
       action: 'await_exit',
@@ -1092,9 +1100,14 @@
       return window.__godotEditorLifecycle?.generation || 0;
     },
     // Await the engine's own exit signal, never a button attribute.
+    bootInFlight() {
+      if (typeof window === 'undefined') return false;
+      return window.__godotEditorLifecycle?.bootInFlight === true;
+    },
+
     async prepareForReplacement() {
       const state = this.state();
-      const plan = editorReplacementPlan(state);
+      const plan = editorReplacementPlan(state, this.bootInFlight());
       if (!plan.mustAwaitExit) return { ok: true, state, awaited: false };
       if (plan.requestQuit) {
         try {
@@ -1107,7 +1120,9 @@
       } else {
         outcome = (await waitFor(() => EDITOR_TERMINAL_STATES.has(this.state()), plan.waitMs, 80)) ? this.state() : 'timeout';
       }
-      const exited = outcome !== 'timeout';
+      // A boot that started during the wait leaves an Engine live even if the state now reads
+      // terminal, so the exit does not count until nothing is in flight.
+      const exited = outcome !== 'timeout' && !this.bootInFlight();
       if (exited) return { ok: true, state, awaited: true, outcome };
       return { ok: false, state, awaited: true, outcome: 'timeout' };
     },
@@ -4074,7 +4089,8 @@ func _aabb_of(node: Node) -> Array:
               platform_diagnostics: classified.platform_diagnostics.length,
               recent_project_errors: classified.errors.slice(-3),
               generation: EditorCommandChannel.generation,
-              editor_lifecycle: EditorLifecycle.describe()
+              editor_lifecycle: EditorLifecycle.describe(),
+            boot_in_flight: EditorLifecycle.bootInFlight()
             };
           })(),
           camera: {

@@ -350,3 +350,27 @@ test('a genuine stderr error is still an actionable project error', () => {
   assert.equal(result.errors.length, 1);
   assert.equal(result.warnings.length, 0);
 });
+
+// ---------------------------------------------------------------- boot-in-flight overrides state
+
+test('a terminal lifecycle state is not trusted while a boot is in flight', () => {
+  // Godot's project-manager re-exec boots an engine while the lifecycle still reads `exited`.
+  // Trusting that string would let a replacement construct a second Engine over a live one —
+  // the exact ownership condition everything here exists to prevent.
+  for (const state of ['idle', 'exited', 'failed']) {
+    const idle = editorReplacementPlan(state, false);
+    assert.equal(idle.action, 'start', `${state} with no boot in flight may start`);
+
+    const booting = editorReplacementPlan(state, true);
+    assert.equal(booting.action, 'await_exit', `${state} with a boot in flight must NOT start`);
+    assert.equal(booting.exitRequired, true);
+    assert.ok(booting.waitMs >= 20000);
+  }
+});
+
+test('boot-in-flight does not weaken the non-terminal states', () => {
+  for (const state of ['initializing', 'running', 'quitting']) {
+    assert.equal(editorReplacementPlan(state, true).exitRequired, true);
+    assert.equal(editorReplacementPlan(state, false).exitRequired, true);
+  }
+});

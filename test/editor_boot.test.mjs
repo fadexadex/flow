@@ -257,3 +257,173 @@ test('startOptions reach engine.start() without losing args', async () => {
   assert.equal(options.persistentDrops, false, 'startOptions must override the default');
   assert.equal(options.canvas, canvas);
 });
+
+// ---------------------------------------------------------------- lifecycle integration
+//
+// The previous re-exec test checked the boot function's options and rejection propagation but
+// never executed the surrounding lifecycle, so it could not catch that the re-exec left the
+// lifecycle reading `exited` while the engine was initializing and then running. A false
+// terminal state lets a replacement build a second Engine over a live one — the exact
+// ownership condition. These drive the transitions themselves.
+
+// A lifecycle that mirrors index.html's, including the keepGeneration rule.
+function fakeLifecycle(initialState = 'idle', initialGeneration = 0) {
+  const record = { state: initialState, generation: initialGeneration, bootInFlight: false, transitions: [] };
+  return {
+    record,
+    set(state, detail) {
+      if (state === 'initializing' && !(detail && detail.keepGeneration)) record.generation += 1;
+      record.transitions.push(`${record.state}->${state}@g${record.generation}`);
+      record.state = state;
+      return record.generation;
+    },
+    markBootInFlight(active) { record.bootInFlight = active; },
+    activeGeneration: () => record.generation
+  };
+}
+
+test('the re-exec boot leaves the lifecycle running, never stranded at exited', async () => {
+  const life = fakeLifecycle('exited', 1);
+  const engine = fakeEngine();
+  const booting = runEditorBoot({
+    engine,
+    generation: 1,
+    activeGeneration: life.activeGeneration,
+    initArgument: undefined,
+    projectFiles: null,
+    args: ['--path', '/demo', '--editor'],
+    startOptions: { persistentDrops: false },
+    onBootStart: () => life.set('initializing', { keepGeneration: true }),
+    markBootInFlight: life.markBootInFlight,
+    onRunning: () => life.set('running')
+  });
+
+  // The moment the boot starts, the state must no longer be terminal.
+  assert.equal(life.record.state, 'initializing');
+  assert.equal(life.record.bootInFlight, true);
+  assert.equal(life.record.generation, 1, 'a re-exec reuses the same Engine, so the generation must not move');
+
+  engine.finishInit();
+  await Promise.resolve();
+  engine.finishStart();
+  await booting;
+
+  assert.equal(life.record.state, 'running');
+  assert.equal(life.record.bootInFlight, false);
+  assert.deepEqual(life.record.transitions, ['exited->initializing@g1', 'initializing->running@g1']);
+});
+
+test('bumping the generation on a re-exec would make the boot reject itself', async () => {
+  // Guards the keepGeneration rule: generation identity is Engine-instance identity, and a
+  // re-exec reuses the instance. Bumping makes the boot's own ownership check fail.
+  const life = fakeLifecycle('exited', 1);
+  const engine = fakeEngine();
+  const booting = runEditorBoot({
+    engine,
+    generation: 1,
+    activeGeneration: life.activeGeneration,
+    projectFiles: null,
+    onBootStart: () => life.set('initializing'), // deliberately WITHOUT keepGeneration
+    markBootInFlight: life.markBootInFlight,
+    onRunning: () => life.set('running')
+  });
+  engine.finishInit();
+  const result = await booting;
+  assert.equal(result.status, 'superseded', 'a bumped generation must abort its own boot');
+  assert.equal(engine.started(), false);
+});
+
+test('bootInFlight is cleared even when the boot fails', async () => {
+  // Otherwise a failed boot would block every future replacement forever.
+  const life = fakeLifecycle('exited', 1);
+  const engine = fakeEngine();
+  engine.copyFailures.add('main.tscn');
+  const booting = runEditorBoot({
+    engine,
+    generation: 1,
+    activeGeneration: life.activeGeneration,
+    projectFiles: { 'main.tscn': '[gd_scene]' },
+    projectName: 'demo',
+    onBootStart: () => life.set('initializing', { keepGeneration: true }),
+    markBootInFlight: life.markBootInFlight
+  });
+  engine.finishInit();
+  await assert.rejects(booting, /EDITOR_FS_COPY_FAILED/);
+  assert.equal(life.record.bootInFlight, false, 'a failed boot must not leave the flag set');
+});
+
+test('bootInFlight brackets the whole sequence, including the superseded exit', async () => {
+  const life = fakeLifecycle('idle', 1);
+  const engine = fakeEngine();
+  const booting = runEditorBoot({
+    engine,
+    generation: 1,
+    activeGeneration: life.activeGeneration,
+    projectFiles: null,
+    markBootInFlight: life.markBootInFlight
+  });
+  assert.equal(life.record.bootInFlight, true);
+  life.record.generation += 1; // superseded mid-boot
+  engine.finishInit();
+  const result = await booting;
+  assert.equal(result.status, 'superseded');
+  assert.equal(life.record.bootInFlight, false);
+});
+
+// ---------------------------------------------------------------- call-site guards
+//
+// The tests above drive runEditorBoot with a lifecycle the test itself wires up, which proves
+// the contract but NOT that index.html honours it — the original omission was exactly a
+// missing option at the call site. These read the real call sites.
+
+const indexHtml = fs.readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
+
+function bootCallSites(source) {
+  const sites = [];
+  let index = source.indexOf('runEditorBoot({');
+  while (index >= 0) {
+    // Walk braces to the end of the options object.
+    let depth = 0;
+    let cursor = source.indexOf('{', index);
+    const start = cursor;
+    do {
+      if (source[cursor] === '{') depth += 1;
+      else if (source[cursor] === '}') depth -= 1;
+      cursor += 1;
+    } while (depth > 0 && cursor < source.length);
+    sites.push(source.slice(start, cursor));
+    index = source.indexOf('runEditorBoot({', cursor);
+  }
+  return sites;
+}
+
+test('every runEditorBoot call site brackets its boot with markBootInFlight', () => {
+  const sites = bootCallSites(indexHtml);
+  assert.equal(sites.length, 2, `expected the main boot and the re-exec boot, found ${sites.length}`);
+  for (const [position, site] of sites.entries()) {
+    assert.match(site, /markBootInFlight\s*:/,
+      `call site ${position} does not mark its boot in flight, so a terminal lifecycle state would be trusted while an Engine is live`);
+  }
+});
+
+test('the re-exec call site transitions the lifecycle out of exited and back to running', () => {
+  // The reported defect: onExit set `exited`, the re-exec then booted without ever leaving
+  // that state, so prepareForReplacement saw a false terminal state.
+  const reexec = bootCallSites(indexHtml).find(site => /projectFiles\s*:\s*null/.test(site));
+  assert.ok(reexec, 'could not find the re-exec call site (it is the one that stages no files)');
+  assert.match(reexec, /onBootStart\s*:/, 're-exec must leave the terminal state before initializing');
+  assert.match(reexec, /keepGeneration\s*:\s*true/, 're-exec reuses the same Engine, so it must not bump the generation');
+  assert.match(reexec, /onRunning\s*:/, 're-exec must report running when its engine starts');
+  assert.match(reexec, /setEditorLifecycle\('running'\)/, 're-exec onRunning must set the lifecycle');
+});
+
+test('both call sites catch their boot, so no rejection can go unhandled', () => {
+  for (const marker of ['runEditorBoot({']) {
+    let index = indexHtml.indexOf(marker);
+    while (index >= 0) {
+      const tail = indexHtml.slice(index, index + 4000);
+      assert.match(tail, /\}\)\s*\.catch\(/, 'a runEditorBoot call site is missing its .catch');
+      index = indexHtml.indexOf(marker, index + 1);
+    }
+  }
+});
