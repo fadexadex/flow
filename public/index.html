@@ -561,6 +561,61 @@ function closeWelcomeModal(dontShowAgain) { // eslint-disable-line no-unused-var
 		<script>
 let editor = null;
 
+// Explicit editor lifecycle. The bridge used to infer "the old editor has stopped" from the
+// close button's disabled attribute, which is already disabled while an editor is still
+// initializing — so a rollback could construct a replacement Engine before the failed one had
+// exited, and the overlapping lifecycle invalidated the new instance
+// ("Engine must be inited before copying files"). Each Engine generation owns its own state
+// and exit promise, and a replacement must await `exited`, never a DOM attribute.
+window.__godotEditorLifecycle = {
+	state: 'idle', // idle | initializing | running | quitting | exited | failed
+	generation: 0,
+	startedAt: 0,
+	exitedAt: 0,
+	lastError: null
+};
+
+let editorExitResolve = null;
+let editorExitPromise = Promise.resolve();
+
+function setEditorLifecycle(state, detail) {
+	const lifecycle = window.__godotEditorLifecycle;
+	const previous = lifecycle.state;
+	lifecycle.state = state;
+	if (detail && detail.error) lifecycle.lastError = detail.error;
+	if (state === 'initializing') {
+		lifecycle.generation += 1;
+		lifecycle.startedAt = Date.now();
+		lifecycle.exitedAt = 0;
+		lifecycle.lastError = null;
+		editorExitPromise = new Promise(function (resolve) { editorExitResolve = resolve; });
+	}
+	if (state === 'exited' || state === 'failed') {
+		lifecycle.exitedAt = Date.now();
+		if (editorExitResolve) {
+			const resolve = editorExitResolve;
+			editorExitResolve = null;
+			resolve(state);
+		}
+	}
+	console.log('[Editor lifecycle] ' + previous + ' -> ' + state + ' (generation ' + lifecycle.generation + ')');
+	window.dispatchEvent(new CustomEvent('godot-editor-lifecycle', {
+		detail: { state: state, previous: previous, generation: lifecycle.generation }
+	}));
+}
+
+// Resolves when the current editor Engine has actually exited. Already-exited is immediate.
+window.__godotAwaitEditorExit = function (timeoutMs) {
+	const lifecycle = window.__godotEditorLifecycle;
+	if (lifecycle.state === 'idle' || lifecycle.state === 'exited' || lifecycle.state === 'failed') {
+		return Promise.resolve(lifecycle.state);
+	}
+	return Promise.race([
+		editorExitPromise,
+		new Promise(function (resolve) { setTimeout(function () { resolve('timeout'); }, timeoutMs || 20000); })
+	]);
+};
+
 // The editor and the playtest are two SEPARATE Engine instances, each with its own
 // in-memory filesystem. Copying files into the editor engine therefore proves nothing about
 // what the game will load: doing only that reported success while the playtest still
@@ -573,6 +628,9 @@ function copyFilesIntoEngine(engine, files, projectName) {
 	const encoder = new TextEncoder();
 	const written = [];
 	const failed = [];
+	// Retained so the acknowledgement can be a fingerprint of the bytes actually handed to
+	// copyToFS, not merely an echo of the revision label it was asked to copy.
+	const copied = {};
 	for (const [relPath, content] of Object.entries(files || {})) {
 		const cleanPath = String(relPath).replace(/^\/+/, '');
 		const fullPath = '/home/web_user/projects/' + projectName + '/' + cleanPath;
@@ -580,11 +638,50 @@ function copyFilesIntoEngine(engine, files, projectName) {
 		try {
 			engine.copyToFS(fullPath, bytes.buffer);
 			written.push(cleanPath);
+			copied[cleanPath] = bytes;
 		} catch (error) {
 			failed.push({ path: cleanPath, error: error && error.message ? error.message : String(error) });
 		}
 	}
-	return { ok: failed.length === 0, written: written.length, failed };
+	return { ok: failed.length === 0, written: written.length, failed, copied };
+}
+
+// Consume the staged snapshot exactly once and acknowledge it by fingerprint and launch
+// token, not just by revision. Clearing on read matters because Execute() also runs when a
+// human presses Play in Godot: a stale WebMCP snapshot must never be silently applied to a
+// later manual run.
+async function consumeStagedProjectFor(engine) {
+	const staged = window.__godotStagedProject;
+	window.__godotStagedProject = null;
+	if (!staged || !staged.files) {
+		return {
+			ok: false, revision: null, fingerprint: null, launchToken: null,
+			written: 0, failed: [], reason: 'no_staged_snapshot',
+			error: 'No project snapshot was staged for this run (a manual Play, or the snapshot was already consumed).',
+			at: Date.now()
+		};
+	}
+	const copied = copyFilesIntoEngine(engine, staged.files, staged.projectName);
+	let fingerprint = null;
+	try {
+		if (copied.copied && typeof window.__godotFingerprintFiles === 'function') {
+			fingerprint = await window.__godotFingerprintFiles(copied.copied);
+		}
+	} catch (error) {
+		fingerprint = 'error:' + (error && error.message ? error.message : String(error));
+	}
+	return {
+		ok: copied.ok === true,
+		revision: staged.revision,
+		fingerprint: fingerprint,
+		launchToken: staged.launchToken || null,
+		expectedFingerprint: staged.fingerprint || null,
+		expectedFiles: Object.keys(staged.files).length,
+		written: copied.written || 0,
+		failed: copied.failed || [],
+		error: copied.error || null,
+		at: Date.now()
+	};
 }
 
 // Copy into the live editor engine. Useful for keeping the editor's on-disk view current,
@@ -694,6 +791,10 @@ document.addEventListener('keydown', function (event) {
 function closeEditor() { // eslint-disable-line no-unused-vars
 	closeGame();
 	if (editor) {
+		const state = window.__godotEditorLifecycle.state;
+		if (state === 'initializing' || state === 'running') {
+			setEditorLifecycle('quitting');
+		}
 		editor.requestQuit();
 	}
 }
@@ -892,24 +993,9 @@ function startEditor(zip, customArgs) {
 			window.__godotGameFsAck = null;
 			game.init().then(function () {
 				console.log('[Runtime lifecycle] initialized');
-				// The decisive step: stage the authoritative files into THIS engine's own
-				// filesystem before it starts, then acknowledge the revision received. Without
-				// this the game boots whatever its instance happened to mount.
-				const staged = window.__godotStagedProject;
-				if (staged && staged.files) {
-					const copied = copyFilesIntoEngine(game, staged.files, staged.projectName);
-					window.__godotGameFsAck = {
-						ok: copied.ok,
-						revision: staged.revision,
-						written: copied.written || 0,
-						failed: copied.failed || [],
-						error: copied.error || null,
-						at: Date.now()
-					};
-					console.log('[Runtime lifecycle] staged revision ' + staged.revision + ' into the game engine: ' + JSON.stringify(window.__godotGameFsAck));
-				} else {
-					window.__godotGameFsAck = { ok: false, revision: null, written: 0, failed: [], error: 'No project snapshot was staged for the playtest.', at: Date.now() };
-				}
+				// The decisive step: copy the authoritative files into THIS engine's own
+				// filesystem before it starts, then acknowledge by fingerprint and token.
+				// Without this the game boots whatever its instance happened to mount.
 				let launchStarted = false;
 				const launchGame = function () {
 					if (launchStarted || !game) return;
@@ -929,8 +1015,20 @@ function startEditor(zip, customArgs) {
 						}));
 					});
 				};
-				requestAnimationFrame(launchGame);
-				setTimeout(launchGame, 250);
+				// The copy must complete before the game starts, so the launch is chained off it
+				// rather than racing a rAF.
+				consumeStagedProjectFor(game).then(function (ack) {
+					window.__godotGameFsAck = ack;
+					console.log('[Runtime lifecycle] playtest snapshot ack: ' + JSON.stringify({ ok: ack.ok, revision: ack.revision, written: ack.written, reason: ack.reason || null }));
+					launchGame();
+				}).catch(function (error) {
+					window.__godotGameFsAck = {
+						ok: false, revision: null, fingerprint: null, launchToken: null,
+						written: 0, failed: [], error: error && error.message ? error.message : String(error), at: Date.now()
+					};
+					launchGame();
+				});
+				setTimeout(launchGame, 3000);
 			}).catch(function (error) {
 				console.error('Game initialization failed:', error);
 				resetFailedGameRuntime();
@@ -986,6 +1084,9 @@ function startEditor(zip, customArgs) {
 		'canvasResizePolicy': 0,
 		'onExit': function () {
 			editorCanvas = replaceCanvas(editorCanvas);
+			// The authoritative "this Engine is gone" signal. Everything that replaces an
+			// editor waits on this rather than guessing from the DOM.
+			setEditorLifecycle('exited');
 			if (OnEditorExit) {
 				OnEditorExit();
 			}
@@ -996,6 +1097,7 @@ function startEditor(zip, customArgs) {
 		'godotPoolSize': Math.floor(concurrency / 3), // Ensures at least 4 threads for the pool (see above).
 	};
 	editor = new Engine(editorConfig);
+	setEditorLifecycle('initializing');
 
 	function displayFailureNotice(err) {
 		console.error(err);
@@ -1007,6 +1109,7 @@ function startEditor(zip, customArgs) {
 			setStatusNotice('An unknown error occurred.');
 		}
 		setStatusMode('notice');
+		setEditorLifecycle('failed', { error: err instanceof Error ? err.message : String(err) });
 		initializing = false;
 		window.dispatchEvent(new CustomEvent('godot-engine-failed', {
 			detail: { message: err instanceof Error ? err.message : String(err) }
@@ -1049,6 +1152,7 @@ function startEditor(zip, customArgs) {
 			const args = customArgs || (zip ? ['--path', '/home/web_user/preload', '--editor'] : ['--project-manager', '--single-window']);
 			editor.start({ 'args': args, 'persistentDrops': true }).then(function () {
 				setStatusMode('hidden');
+				setEditorLifecycle('running');
 				initializing = false;
 				stopBootTicker();
 				window.dispatchEvent(new Event('godot-engine-ready'));

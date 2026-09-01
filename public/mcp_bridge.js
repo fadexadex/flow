@@ -228,6 +228,44 @@
     }
   }
 
+  // A fingerprint over the BYTES a file will occupy, independent of whether the caller holds
+  // it as a string or a Uint8Array. `computeProjectContentFingerprint` tags text and binary
+  // differently, which is right for the persisted snapshot but wrong across the playtest
+  // handshake: the bridge stages strings while the copier hashes the encoded buffers it wrote,
+  // so the same content hashed to two different values. One canonical framing, used by both
+  // sides, is the only way that comparison means anything.
+  async function fingerprintProjectBytes(files) {
+    const encoder = new TextEncoder();
+    const entries = Object.entries(files || {})
+      .map(([rawPath, content]) => [
+        String(rawPath).replace(/^res:\/\//, '').replace(/^\/+/, ''),
+        typeof content === 'string' ? encoder.encode(content) : new Uint8Array(content)
+      ])
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const parts = [];
+    for (const [path, bytes] of entries) {
+      const pathBytes = encoder.encode(path);
+      parts.push(encoder.encode(`\0f:${pathBytes.length}:${bytes.length}:`), pathBytes, bytes);
+    }
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const merged = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      merged.set(part, offset);
+      offset += part.byteLength;
+    }
+    if (typeof crypto !== 'undefined' && crypto?.subtle?.digest) {
+      const digest = await crypto.subtle.digest('SHA-256', merged);
+      return `sha256:${Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('')}`;
+    }
+    let hash = 2166136261;
+    for (let index = 0; index < merged.length; index += 1) {
+      hash ^= merged[index];
+      hash = Math.imul(hash, 16777619);
+    }
+    return `fnv1a:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+  }
+
   function yieldProgress() {
     return new Promise((resolve) => {
       if (typeof requestAnimationFrame === 'function') {
@@ -1014,13 +1052,103 @@
     return normalizeResourcePath(configuredScene || firstScene, 'res://main.tscn');
   }
 
+  // What a replacement should do given the current lifecycle state. Pure, so the decision
+  // itself is testable without an engine: the bug being fixed was inferring "stopped" from a
+  // DOM attribute that is also set while an editor is still initializing.
+  const EDITOR_TERMINAL_STATES = new Set(['idle', 'exited', 'failed']);
+
+  // The corrupting case is narrow and specific: replacing an engine that is still
+  // INITIALIZING. That is what happened when a boot timed out and rollback immediately built
+  // a second Engine over the half-constructed first one, giving
+  // "Engine must be inited before copying files" for every file and a dead viewport.
+  //
+  // A RUNNING editor is different. The host is built for a replacement to take over the
+  // canvas, and this editor does not always honour `requestQuit()` — blocking on its exit
+  // simply prevents every restart. So a running engine is asked to quit, waited on briefly,
+  // and then replaced anyway; only an initializing engine is a hard barrier.
+  function editorReplacementPlan(state) {
+    if (EDITOR_TERMINAL_STATES.has(state)) {
+      return { action: 'start', mustAwaitExit: false, requestQuit: false, waitMs: 0, exitRequired: false };
+    }
+    if (state === 'initializing') {
+      return { action: 'await_exit', mustAwaitExit: true, requestQuit: true, waitMs: 25000, exitRequired: true };
+    }
+    // 'running' or 'quitting': bounded wait, then proceed.
+    return {
+      action: 'await_exit',
+      mustAwaitExit: true,
+      requestQuit: state === 'running',
+      waitMs: 6000,
+      exitRequired: false
+    };
+  }
+
+  const EditorLifecycle = {
+    state() {
+      if (typeof window === 'undefined') return 'idle';
+      return window.__godotEditorLifecycle?.state || 'idle';
+    },
+    generation() {
+      if (typeof window === 'undefined') return 0;
+      return window.__godotEditorLifecycle?.generation || 0;
+    },
+    // Await the engine's own exit signal, never a button attribute.
+    async prepareForReplacement() {
+      const state = this.state();
+      const plan = editorReplacementPlan(state);
+      if (!plan.mustAwaitExit) return { ok: true, state, awaited: false };
+      if (plan.requestQuit) {
+        try {
+          if (typeof window.closeEditor === 'function') window.closeEditor();
+        } catch (_) {}
+      }
+      let outcome = 'timeout';
+      if (typeof window.__godotAwaitEditorExit === 'function') {
+        outcome = await window.__godotAwaitEditorExit(plan.waitMs);
+      } else {
+        outcome = (await waitFor(() => EDITOR_TERMINAL_STATES.has(this.state()), plan.waitMs, 80)) ? this.state() : 'timeout';
+      }
+      const exited = outcome !== 'timeout';
+      if (exited) return { ok: true, state, awaited: true, outcome };
+      // Only an initializing engine is a hard barrier; see editorReplacementPlan.
+      return {
+        ok: !plan.exitRequired,
+        state,
+        awaited: true,
+        outcome: 'timeout',
+        proceeded_without_exit: !plan.exitRequired
+      };
+    },
+    describe() {
+      if (typeof window === 'undefined') return { state: 'idle', generation: 0 };
+      const lifecycle = window.__godotEditorLifecycle || {};
+      return {
+        state: lifecycle.state || 'idle',
+        generation: lifecycle.generation || 0,
+        started_at: lifecycle.startedAt || null,
+        exited_at: lifecycle.exitedAt || null,
+        last_error: lifecycle.lastError || null
+      };
+    }
+  };
+
   let editorRestartCount = 0;
+  // Exactly one replacement at a time. Two overlapping restarts is precisely how a rollback
+  // raced a still-initializing engine.
+  let editorReplacementInFlight = false;
 
   async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
+    if (editorReplacementInFlight) {
+      const error = new Error('Another editor replacement is already in flight; refusing to start a second one.');
+      error.code = 'EDITOR_REPLACEMENT_IN_FLIGHT';
+      throw error;
+    }
+    editorReplacementInFlight = true;
+    try {
     editorRestartCount += 1;
     window.__webmcpRestartCount = editorRestartCount;
     if (typeof window !== 'undefined') holdRuntimeFrame();
@@ -1028,11 +1156,27 @@
     // editor first can race its shutdown and leave the new --path unmounted.
     if (operation) await advancePhase(operation, 'stopping_runtime');
     await stopGameRuntime(10000);
-    const closeEditorButton = document.getElementById('btn-close-editor');
-    if (closeEditorButton && !closeEditorButton.disabled) {
-      if (operation) await advancePhase(operation, 'replacing_editor');
-      if (typeof window.closeEditor === 'function') window.closeEditor();
-      await waitFor(() => closeEditorButton.disabled, 3000);
+
+    // Wait for the previous Engine to actually EXIT. The old check read the close button's
+    // disabled attribute, which is also set while an editor is still initializing — so a
+    // rollback after a boot timeout could construct a replacement while the failed instance
+    // was mid-construction, invalidating it ("Engine must be inited before copying files")
+    // and leaving a black viewport with no recovery path.
+    if (operation) await advancePhase(operation, 'replacing_editor');
+    const replacement = await EditorLifecycle.prepareForReplacement();
+    if (!replacement.ok) {
+      const error = new Error(`The previous Godot editor is still initializing and did not exit within 25 seconds; refusing to build a replacement over a half-constructed engine.`);
+      error.code = 'EDITOR_EXIT_TIMEOUT';
+      error.lifecycle_state = replacement.state;
+      throw error;
+    }
+    if (replacement.proceeded_without_exit) {
+      activeLogs.push({
+        level: 'warn',
+        time: Date.now(),
+        generation: EditorCommandChannel.generation,
+        msg: `[Editor lifecycle] the previous editor did not acknowledge requestQuit within the wait window (state: ${replacement.state}); the replacement is taking over the canvas.`
+      });
     }
 
     window._mcpProjectName = projectName;
@@ -1079,6 +1223,9 @@
     DiagnosticHUD.render();
     if (typeof window === 'undefined' || !window.__godotWebMcpKeepRuntimeFrame) releaseRuntimeFrame();
     return true;
+    } finally {
+      editorReplacementInFlight = false;
+    }
   }
 
   async function restoreProjectSnapshot(previous, operation = null) {
@@ -1128,20 +1275,25 @@
   // which calls GENERATE_TRAP() — an unconditional abort — so the runtime does not survive it
   // and everything reported afterwards is suspect. Surfaced separately from ordinary errors
   // and never filtered by the tolerated-noise patterns above.
-  function fatalGodotErrors(sinceTime, generation = null) {
-    return activeLogs.filter(entry => entry.time >= sinceTime
+  function fatalGodotErrors(sinceTime, generation = null, logs = activeLogs) {
+    return logs.filter(entry => entry.time >= sinceTime
       && /\bFATAL:/.test(String(entry.msg))
       && (generation === null || entry.generation === generation));
+  }
+
+  // Errors belonging to one editor generation, with teardown noise from a previous process
+  // excluded. Pure over the log array so it can be tested without a browser.
+  function generationScopedErrors(logs, generation, sinceTime = 0) {
+    return logs.filter(entry => entry.time >= sinceTime
+      && entry.level === 'error'
+      && entry.generation === generation
+      && !/leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked/i.test(String(entry.msg)));
   }
 
   // Teardown from a previous editor process logs RID/ObjectDB/WebGL leaks that are expected
   // and belong to a generation that no longer exists. Separate them from this session's.
   function currentGenerationErrors(sinceTime) {
-    const generation = EditorCommandChannel.generation;
-    return activeLogs.filter(entry => entry.time >= sinceTime
-      && entry.level === 'error'
-      && entry.generation === generation
-      && !/leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked/i.test(String(entry.msg)));
+    return generationScopedErrors(activeLogs, EditorCommandChannel.generation, sinceTime);
   }
 
   function waitForRuntimeEvent(successEvent, failureEvent, timeoutMs, timeoutMessage) {
@@ -1225,11 +1377,13 @@
     return { gameReady: true, gameVisible: visible ? gameVisible : false, startedAt };
   }
 
-  async function validateProjectRuntimeBoot(operation = null, sinceTime = 0) {
+  async function validateProjectRuntimeBoot(operation = null, sinceTime = 0, expectedGeneration = null) {
     if (operation) await advancePhase(operation, 'validating_runtime');
-    // Any FATAL emitted while staging or booting this project means the engine trapped, so
-    // the project must not be reported as validated regardless of what else looks healthy.
-    const fatals = fatalGodotErrors(sinceTime || operation?.startedAt || 0);
+    // Any FATAL emitted while booting THIS generation means the engine trapped, so the project
+    // must not be reported as validated. Scoped by generation: a fatal logged while the
+    // previous engine tore down must not fail the replacement that succeeded it.
+    const generation = expectedGeneration === null ? EditorCommandChannel.generation : expectedGeneration;
+    const fatals = fatalGodotErrors(sinceTime || operation?.startedAt || 0, generation);
     if (fatals.length > 0) {
       const error = new Error(`The Godot engine reported a fatal error while validating this project: ${fatals[0].msg}`);
       error.code = 'ENGINE_FATAL';
@@ -2067,7 +2221,7 @@ func _physics_process(delta):
         await advancePhase(operation, 'validating_request');
         await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject, 60000, operation);
         if (mode === 'validate_runtime') {
-          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0, EditorCommandChannel.generation);
         }
         await advancePhase(operation, 'persisting_commit');
         DiagnosticState.session = 'editor-ready';
@@ -3544,36 +3698,91 @@ func _aabb_of(node: Node) -> Array:
     }
   }
 
-  // Stage the snapshot the playtest engine must boot from, and clear any stale acknowledgement
-  // so the wait below cannot pass on a previous run's ack.
-  function stageProjectForPlaytest() {
-    if (typeof window === 'undefined') return null;
+  const PLAYTEST_SNAPSHOT_TTL_MS = 60000;
+  let playtestLaunchCounter = 0;
+
+  // Stage the snapshot the playtest engine must boot from. The token makes it one-shot: the
+  // game side clears it on read, so a later manual Play in Godot cannot silently pick up a
+  // stale WebMCP snapshot, and a replayed acknowledgement cannot satisfy a new launch.
+  async function stagePlaytestSnapshot(files, projectName, revision, scope = typeof window !== 'undefined' ? window : null) {
+    playtestLaunchCounter += 1;
     const staged = {
-      projectName: DiagnosticState.activeProject,
-      revision: DiagnosticState.sceneRevision,
-      files: cloneProjectFiles(activeFilesDict)
+      projectName,
+      revision,
+      launchToken: `launch_${Date.now()}_${playtestLaunchCounter}_${Math.random().toString(36).slice(2, 8)}`,
+      stagedAt: Date.now(),
+      files: cloneProjectFiles(files),
+      fingerprint: await fingerprintProjectBytes(files)
     };
-    window.__godotStagedProject = staged;
-    window.__godotGameFsAck = null;
+    if (scope) {
+      scope.__godotStagedProject = staged;
+      scope.__godotGameFsAck = null;
+    }
     return staged;
   }
 
-  // The game engine copies the staged files in during its own boot and publishes what it
-  // received. Anything short of an ack for this exact revision means the running game is not
-  // showing the current scene, and saying otherwise is the false success this replaces.
-  async function awaitPlaytestFsAck(expectedRevision, timeoutMs = 12000) {
-    const ready = await waitFor(() => Boolean(window.__godotGameFsAck), timeoutMs, 60);
-    const ack = window.__godotGameFsAck || null;
-    if (!ready || !ack) {
-      return { ok: false, acknowledged: false, error: 'The playtest engine never acknowledged the staged project snapshot.' };
+  // Pure: decide whether an acknowledgement actually proves the running game loaded this
+  // snapshot. A revision label alone proves only that the copy loop was handed that label.
+  function verifyPlaytestAcknowledgement(staged, ack, now = Date.now()) {
+    if (!staged) return { ok: false, code: 'NOT_STAGED', error: 'No snapshot was staged for this launch.' };
+    if (!ack) return { ok: false, code: 'NO_ACK', error: 'The playtest engine never acknowledged the staged project snapshot.' };
+    if (ack.reason === 'no_staged_snapshot') {
+      return { ok: false, code: 'SNAPSHOT_ALREADY_CONSUMED', error: ack.error || 'The staged snapshot was already consumed by an earlier run.' };
+    }
+    if (!ack.launchToken || ack.launchToken !== staged.launchToken) {
+      return { ok: false, code: 'LAUNCH_TOKEN_MISMATCH', error: `The playtest acknowledged launch token ${ack.launchToken || 'none'}, not ${staged.launchToken}.` };
+    }
+    if (now - staged.stagedAt > PLAYTEST_SNAPSHOT_TTL_MS) {
+      return { ok: false, code: 'SNAPSHOT_EXPIRED', error: `The staged snapshot is ${Math.round((now - staged.stagedAt) / 1000)}s old and was not consumed in time.` };
     }
     if (!ack.ok) {
-      return { ok: false, acknowledged: true, error: ack.error || `${ack.failed?.length || 0} file(s) failed to copy into the playtest engine.`, ack };
+      const failedCount = ack.failed?.length || 0;
+      return { ok: false, code: 'COPY_FAILED', error: ack.error || `${failedCount} file(s) failed to copy into the playtest engine.` };
     }
-    if (ack.revision !== expectedRevision) {
-      return { ok: false, acknowledged: true, error: `The playtest engine acknowledged revision ${ack.revision}, not ${expectedRevision}.`, ack };
+    if (ack.revision !== staged.revision) {
+      return { ok: false, code: 'REVISION_MISMATCH', error: `The playtest engine acknowledged revision ${ack.revision}, not ${staged.revision}.` };
     }
-    return { ok: true, acknowledged: true, revision: ack.revision, written: ack.written, ack };
+    const expectedFiles = Object.keys(staged.files).length;
+    if (Number(ack.written) !== expectedFiles) {
+      return { ok: false, code: 'PARTIAL_COPY', error: `The playtest engine wrote ${ack.written} of ${expectedFiles} staged files.` };
+    }
+    if (staged.fingerprint && ack.fingerprint && ack.fingerprint !== staged.fingerprint) {
+      return { ok: false, code: 'FINGERPRINT_MISMATCH', error: `The bytes copied into the playtest engine hash to ${ack.fingerprint}, not ${staged.fingerprint}.` };
+    }
+    if (staged.fingerprint && !ack.fingerprint) {
+      return { ok: false, code: 'FINGERPRINT_MISSING', error: 'The playtest engine did not report a content fingerprint, so the copied bytes cannot be verified.' };
+    }
+    return { ok: true, revision: ack.revision, written: ack.written, fingerprint: ack.fingerprint };
+  }
+
+  async function awaitPlaytestAcknowledgement(staged, timeoutMs = 12000) {
+    await waitFor(() => Boolean(window.__godotGameFsAck), timeoutMs, 60);
+    return verifyPlaytestAcknowledgement(staged, window.__godotGameFsAck || null);
+  }
+
+  // `status: 'healthy'` used to be a hardcoded literal, so the top line said healthy while
+  // engine_state was failed, the session was failed, and the command channel was gone. Derived
+  // from the same facts the caller can see, and pure so it is testable.
+  function deriveOverallStatus(snapshot) {
+    const {
+      engine, session, lifecycleState = 'idle',
+      commandChannelAvailable = false, commandChannelExpected = true,
+      fatalCount = 0, unpersisted = false
+    } = snapshot || {};
+    if (engine === 'failed' || session === 'failed' || session === 'restore_failed') {
+      return { status: 'failed', reason: engine === 'failed' ? 'engine_failed' : 'session_failed' };
+    }
+    if (fatalCount > 0) return { status: 'failed', reason: 'engine_fatal' };
+    if (lifecycleState === 'initializing' || lifecycleState === 'quitting'
+      || session === 'auto_restoring' || engine === 'loading') {
+      return { status: 'recovering', reason: 'engine_restarting' };
+    }
+    if (engine !== 'ready') return { status: 'recovering', reason: 'engine_not_ready' };
+    if (unpersisted) return { status: 'degraded', reason: 'unpersisted_changes' };
+    if (commandChannelExpected && !commandChannelAvailable) {
+      return { status: 'degraded', reason: 'editor_command_channel_unavailable' };
+    }
+    return { status: 'healthy', reason: null };
   }
 
   function resolvedNodePath(commandReply, requestedPath) {
@@ -3750,8 +3959,19 @@ func _aabb_of(node: Node) -> Array:
         const isWebGL = typeof WebGLRenderingContext !== 'undefined';
         const autoResumeEnabled = typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-auto-resume') !== 'false' : true;
         const lastValidatedRev = hydratedSnapshot?.last_validated_revision ?? DiagnosticState.sceneRevision;
+        const overall = deriveOverallStatus({
+          engine: DiagnosticState.engine,
+          session: DiagnosticState.session,
+          lifecycleState: EditorLifecycle.state(),
+          commandChannelAvailable: EditorCommandChannel.available(),
+          // The channel is only expected once an editor has actually booted at least once.
+          commandChannelExpected: EditorCommandChannel.generation > 0,
+          fatalCount: fatalGodotErrors(0, EditorCommandChannel.generation).length,
+          unpersisted: DiagnosticState.sceneRevision !== DiagnosticState.persistedRevision
+        });
         return {
-          status: 'healthy',
+          status: overall.status,
+          status_reason: overall.reason,
           engine_state: DiagnosticState.engine,
           webmcp_state: DiagnosticState.webmcp,
           webmcp_registered_tools_count: DiagnosticState.webmcpRegisteredCount,
@@ -3763,7 +3983,8 @@ func _aabb_of(node: Node) -> Array:
             // previous process is excluded rather than counted against this session.
             fatal_errors: fatalGodotErrors(0, EditorCommandChannel.generation).slice(-3).map(entry => entry.msg),
             session_errors: currentGenerationErrors(0).length,
-            generation: EditorCommandChannel.generation
+            generation: EditorCommandChannel.generation,
+            editor_lifecycle: EditorLifecycle.describe()
           },
           camera: {
             auto_follow: CameraGuidance.autoFollowEnabled(),
@@ -3913,7 +4134,7 @@ func _aabb_of(node: Node) -> Array:
 
           try {
             await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
-            await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
+            await validateProjectRuntimeBoot(operation, operation?.startedAt || 0, EditorCommandChannel.generation);
           } catch (error) {
             await restoreProjectSnapshot(previous, operation);
             throw error;
@@ -4357,7 +4578,7 @@ func _aabb_of(node: Node) -> Array:
 
         try {
           await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
-          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0, EditorCommandChannel.generation);
         } catch (error) {
           await restoreProjectSnapshot(previous, operation);
           throw error;
@@ -4517,7 +4738,7 @@ func _aabb_of(node: Node) -> Array:
 
         try {
           await restartEditorWithProject(stagedFiles, DiagnosticState.activeProject, 60000, operation);
-          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0, EditorCommandChannel.generation);
         } catch (error) {
           try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject, 60000, operation); } catch (_) {}
           releaseRuntimeFrame();
@@ -4915,8 +5136,7 @@ func _aabb_of(node: Node) -> Array:
         // Hand the snapshot to the game engine itself and require it to acknowledge the
         // revision it received.
         const editorCopy = copyActiveProjectToEditorFS();
-        const staged = stageProjectForPlaytest();
-        const expectedRevision = staged?.revision ?? DiagnosticState.sceneRevision;
+        const staged = await stagePlaytestSnapshot(activeFilesDict, DiagnosticState.activeProject, DiagnosticState.sceneRevision);
         try {
           await startGameRuntime({ visible: true, timeoutMs: 15000 });
         } catch (error) {
@@ -4924,14 +5144,15 @@ func _aabb_of(node: Node) -> Array:
           DiagnosticHUD.render();
           throw error;
         }
-        const handshake = await awaitPlaytestFsAck(expectedRevision);
+        const handshake = await awaitPlaytestAcknowledgement(staged);
         if (!handshake.ok) {
           // Refuse to report a playtest as current when it demonstrably is not.
           await stopGameRuntime(8000).catch(() => {});
           DiagnosticState.session = 'editor-ready';
           DiagnosticHUD.render();
-          const error = new Error(`The playtest did not confirm it loaded scene revision ${expectedRevision}: ${handshake.error}`);
+          const error = new Error(`The playtest did not confirm it loaded scene revision ${staged.revision}: ${handshake.error}`);
           error.code = 'PLAYTEST_REVISION_UNCONFIRMED';
+          error.handshake_code = handshake.code;
           throw error;
         }
         DiagnosticState.engine = 'ready';
@@ -4944,9 +5165,11 @@ func _aabb_of(node: Node) -> Array:
           viewport: 'game',
           viewport_visible: true,
           scene_revision: DiagnosticState.sceneRevision,
-          // Acknowledged by the playtest engine itself, for this exact revision.
+          // Acknowledged by the playtest engine itself: this exact revision, this one-shot
+          // launch token, and a fingerprint over the bytes it actually copied.
           playtest_revision_confirmed: handshake.revision,
           playtest_files_received: handshake.written,
+          playtest_fingerprint: handshake.fingerprint,
           // Separate, weaker fact: the editor engine's filesystem was refreshed too. This is
           // NOT evidence about what the game loaded.
           editor_fs_copy_succeeded: editorCopy.ok === true,
@@ -6361,6 +6584,12 @@ func _aabb_of(node: Node) -> Array:
       inputSchema: definition.input_schema,
       execute: async (input) => executeObservedTool(tool, input || {})
     };
+  }
+
+  // index.html's playtest copier fingerprints the bytes it wrote using this exact
+  // implementation, so the two sides cannot drift into disagreeing framings.
+  if (typeof window !== 'undefined') {
+    window.__godotFingerprintFiles = fingerprintProjectBytes;
   }
 
   function installTestBridge() {
