@@ -11,7 +11,7 @@ tools: Bash, Read, mcp__Claude_Browser__navigate, mcp__Claude_Browser__javascrip
 
 Run one named verification checklist from `test/checklists/` against the live godot-web-mcp page and report OBSERVED FACTS. You are not a debugger, not a fixer, not a reviewer of code quality. Never form an opinion about whether something "should" work — only report what you actually observed happen when you ran the steps.
 
-You will be told which checklist to run (`catalog`, `boot`, `camera`, or `restarts` — matching a file in `test/checklists/`). If you are not told, ask for one before doing anything else; do not guess.
+You will be told which checklist to run (`catalog`, `boot`, `camera`, `restarts`, or `persistence` — matching a file in `test/checklists/`). If you are not told, ask for one before doing anything else; do not guess.
 
 ## Forbidden
 

@@ -56,6 +56,25 @@ func _tune_navigation_feel() -> void:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+## Why no EditorInterface.save_scene() in the mutation ops below.
+##
+## JavaScriptBridge callbacks run SYNCHRONOUSLY, inline, on whatever JS call stack invoked
+## them (platform/web/javascript_bridge_singleton.cpp: JavaScriptObjectImpl::callback calls
+## _callback directly on the main thread, with no call_deferred). So this code executes at an
+## arbitrary point in the frame, not from a settled main-loop iteration.
+##
+## EditorInterface.save_scene() routes through EditorNode::_save_scene_with_preview, which
+## reads back the live 3D viewport texture to build a thumbnail and then packs the scene.
+## Called re-entrantly from a JS callback that path aborted the whole WASM runtime with
+## "FATAL: Index p_index = -1 is out of bounds (size() = 0)" — CRASH_BAD_INDEX, which calls
+## GENERATE_TRAP(), an unconditional abort rather than a recoverable error. Recovery was
+## impossible: subsequent file copies failed with "Engine must be inited".
+##
+## UndoRedo.commit_action() already applies the change to the live scene tree, and the WebMCP
+## bridge serializes the .tscn text itself and syncs it to the virtual filesystem
+## (window.__godotSyncToFS) before a playtest. Saving from here bought nothing and cost the
+## editor. The scene is simply left dirty, which is also the honest state: there are unsaved
+## live edits.
 func _on_command(args: Array) -> String:
 	var payload: Variant = null
 	if args.size() > 0 and typeof(args[0]) == TYPE_STRING:
@@ -77,6 +96,8 @@ func _on_command(args: Array) -> String:
 		"node_transform": reply = _op_node_transform(payload)
 		"node_material": reply = _op_node_material(payload)
 		"node_delete": reply = _op_node_delete(payload)
+		"node_state": reply = _op_node_state(payload)
+		"save_scene": reply = _op_save_scene()
 		"inspect_property": reply = _op_inspect_property(payload)
 		"open_scene": reply = _op_open_scene(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
@@ -157,7 +178,7 @@ func _scene_is_dirty() -> bool:
 func _op_inspect_property(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var property_name := String(payload.get("property", ""))
 	if property_name == "":
 		var names: Array = []
@@ -187,9 +208,20 @@ func _resolve_node(node_path: String) -> Node:
 	var direct := root.get_node_or_null(NodePath(node_path))
 	if direct != null:
 		return direct
-	# Fall back to a by-name search so agents can address nodes without full paths.
+	# Fall back to a by-name search so agents can address nodes without full paths — but only
+	# when the name is unique. A .tscn may hold BranchA/TwinOrb and BranchB/TwinOrb, and
+	# silently picking the first is how an edit lands on the wrong object.
 	var leaf := node_path.get_file() if node_path.contains("/") else node_path
-	return _find_by_name(root, leaf)
+	var matches := _find_all_by_name(root, leaf)
+	return matches[0] if matches.size() == 1 else null
+
+## Every node with this name, so callers can tell "missing" from "ambiguous".
+func _find_all_by_name(node: Node, wanted: String, found: Array = []) -> Array:
+	if String(node.name) == wanted:
+		found.append(node)
+	for child in node.get_children():
+		_find_all_by_name(child, wanted, found)
+	return found
 
 func _find_by_name(node: Node, wanted: String) -> Node:
 	if String(node.name) == wanted:
@@ -200,10 +232,30 @@ func _find_by_name(node: Node, wanted: String) -> Node:
 			return found
 	return null
 
+## A single explanation for every failed lookup, so an ambiguous path is never reported as a
+## missing node (which would send the caller looking for the wrong problem).
+func _resolve_error(node_path: String, expected := "Node") -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var leaf := node_path.get_file() if node_path.contains("/") else node_path
+	var matches := _find_all_by_name(root, leaf)
+	if matches.size() > 1:
+		var paths: Array = []
+		for match in matches:
+			paths.append(String(root.get_path_to(match)))
+		return {
+			"ok": false,
+			"code": "AMBIGUOUS_NODE_PATH",
+			"candidates": paths,
+			"error": "'%s' is ambiguous: %d nodes are named '%s' (%s). Pass the full scene-relative path." % [node_path, matches.size(), leaf, ", ".join(paths)],
+		}
+	return {"ok": false, "error": "%s not found: %s" % [expected, node_path]}
+
 func _op_select(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var selection := EditorInterface.get_selection()
 	selection.clear()
 	selection.add_node(node)
@@ -428,18 +480,18 @@ func _op_node_add(payload: Dictionary) -> Dictionary:
 	undo.add_do_reference(instance)
 	undo.add_undo_method(parent, "remove_child", instance)
 	undo.commit_action()
-	EditorInterface.save_scene()
 	return {
 		"ok": true,
 		"node_path": String(root.get_path_to(instance)),
 		"node_name": node_name,
 		"aabb": _aabb_of(instance),
+		"transform": _transform_array(instance),
 	}
 
 func _op_node_transform(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null or not (node is Node3D):
-		return {"ok": false, "error": "Node3D not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")), "Node3D")
 	var node3d := node as Node3D
 	var relative := bool(payload.get("relative", false))
 	var target := node3d.transform
@@ -457,34 +509,79 @@ func _op_node_transform(payload: Dictionary) -> Dictionary:
 	undo.add_do_property(node3d, "transform", target)
 	undo.add_undo_property(node3d, "transform", node3d.transform)
 	undo.commit_action()
-	EditorInterface.save_scene()
 	return {
 		"ok": true,
 		"node_path": String(EditorInterface.get_edited_scene_root().get_path_to(node3d)),
 		"position": [target.origin.x, target.origin.y, target.origin.z],
 		"aabb": _aabb_of(node3d),
+		"transform": _transform_array(node3d),
 	}
 
 func _op_node_material(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null or not (node is MeshInstance3D):
-		return {"ok": false, "error": "MeshInstance3D not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")), "MeshInstance3D")
 	var instance := node as MeshInstance3D
 	var previous := instance.get_surface_override_material(0)
-	var updated := _build_material(payload, previous.duplicate() if previous != null else null)
+	# Copy-on-write, exactly like the editor's own inspector: never mutate a material that
+	# other nodes may share. With no override yet, seed from whatever the mesh is actually
+	# rendering so a recolour changes one property instead of resetting the whole look.
+	var seed: Material = previous
+	if seed == null and instance.mesh != null:
+		seed = instance.get_active_material(0)
+	var updated := _build_material(payload, seed.duplicate() if seed != null else null)
 	var undo := get_undo_redo()
 	undo.create_action("WebMCP: material %s" % instance.name, UndoRedo.MERGE_ENDS, instance)
 	undo.add_do_method(instance, "set_surface_override_material", 0, updated)
 	undo.add_do_reference(updated)
 	undo.add_undo_method(instance, "set_surface_override_material", 0, previous)
 	undo.commit_action()
-	EditorInterface.save_scene()
-	return {"ok": true, "node_path": String(payload.get("node_path", ""))}
+	# The RESOLVED path, not the requested one: the bridge targets its .tscn edit with this, so
+	# echoing back a bare ambiguous leaf would send the source edit to the wrong node.
+	var root := EditorInterface.get_edited_scene_root()
+	# Report what actually happened rather than a proxy for it. A new material resource is
+	# ALWAYS assigned here (copy-on-write), so "forked_material: previous == null" was false
+	# precisely in the case that forks from a shared seed.
+	var seed_source := "surface_override"
+	if previous == null:
+		seed_source = "mesh_active_material" if seed != null else "new"
+	var applied := {
+		"ok": true,
+		"node_path": String(root.get_path_to(instance)),
+		"requested_path": String(payload.get("node_path", "")),
+		"assigned_new_material": true,
+		"material_seed": seed_source,
+	}
+	var resolved := _op_node_state({"node_path": String(root.get_path_to(instance))})
+	if resolved.get("ok", false) and resolved.has("material"):
+		applied["material"] = resolved["material"]
+	return applied
+
+## Explicit, opt-in, and deferred. Never called from a mutation op.
+##
+## Deferring moves the save onto the next main-loop pass, which is the execution context the
+## packer and the thumbnail readback assume. save_scene_as(path, false) is used instead of
+## save_scene() specifically to skip the with_preview branch, which is the render-state
+## sensitive part. Both guards mirror EditorInterface::save_scene's own preconditions so this
+## fails predictably rather than relying on the C++ check.
+func _op_save_scene() -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	if root.scene_file_path.is_empty():
+		return {"ok": false, "error": "The edited scene has no file path yet; save it once from the editor first."}
+	EditorInterface.call_deferred("save_scene_as", root.scene_file_path, false)
+	return {
+		"ok": true,
+		"scene_file_path": root.scene_file_path,
+		"deferred": true,
+		"note": "Queued for the next main-loop pass; saving inline from a JS callback aborts the web editor.",
+	}
 
 func _op_node_delete(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var root := EditorInterface.get_edited_scene_root()
 	if node == root:
 		return {"ok": false, "error": "The scene root cannot be deleted through the command channel."}
@@ -497,9 +594,9 @@ func _op_node_delete(payload: Dictionary) -> Dictionary:
 	undo.add_undo_method(parent, "move_child", node, index)
 	undo.add_undo_method(node, "set_owner", root)
 	undo.add_undo_reference(node)
+	var resolved_path := String(root.get_path_to(node))
 	undo.commit_action()
-	EditorInterface.save_scene()
-	return {"ok": true, "deleted_node": String(payload.get("node_path", ""))}
+	return {"ok": true, "deleted_node": resolved_path, "node_path": resolved_path, "requested_path": String(payload.get("node_path", ""))}
 
 func _op_open_scene(payload: Dictionary) -> Dictionary:
 	var scene_path := String(payload.get("scene_path", ""))
@@ -509,6 +606,49 @@ func _op_open_scene(payload: Dictionary) -> Dictionary:
 		return {"ok": false, "error": "Scene does not exist: %s" % scene_path}
 	EditorInterface.open_scene_from_path(scene_path)
 	return {"ok": true, "scene_path": scene_path}
+
+## The exact twelve floats Godot itself would write into a .tscn Transform3D, in the same
+## column-major order. The JS side writes these back verbatim instead of recomputing a basis
+## from Euler angles, which is what let a rotation-only edit exist in the editor but never
+## reach the saved scene.
+func _transform_array(node: Node) -> Array:
+	if not (node is Node3D):
+		return []
+	var t := (node as Node3D).transform
+	return [
+		t.basis.x.x, t.basis.x.y, t.basis.x.z,
+		t.basis.y.x, t.basis.y.y, t.basis.y.z,
+		t.basis.z.x, t.basis.z.y, t.basis.z.z,
+		t.origin.x, t.origin.y, t.origin.z,
+	]
+
+## Read back what the editor actually holds, so the bridge can serialize truth rather than
+## its own model of what it asked for.
+func _op_node_state(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return _resolve_error(String(payload.get("node_path", "")))
+	var root := EditorInterface.get_edited_scene_root()
+	var state := {
+		"ok": true,
+		"node_path": String(root.get_path_to(node)),
+		"node_class": node.get_class(),
+		"transform": _transform_array(node),
+		"aabb": _aabb_of(node),
+	}
+	if node is MeshInstance3D:
+		var material := (node as MeshInstance3D).get_surface_override_material(0)
+		if material is StandardMaterial3D:
+			var standard := material as StandardMaterial3D
+			state["material"] = {
+				"albedo_color": standard.albedo_color.to_html(true),
+				"metallic": standard.metallic,
+				"roughness": standard.roughness,
+				"emission_enabled": standard.emission_enabled,
+				"emission": standard.emission.to_html(false),
+				"emission_energy": standard.emission_energy_multiplier,
+			}
+	return state
 
 func _aabb_of(node: Node) -> Array:
 	if node is VisualInstance3D:

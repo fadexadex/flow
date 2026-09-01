@@ -24,6 +24,10 @@
     webmcpSurface: 'none',
     session: 'authoring', // 'empty' | 'authoring' | 'persisted' | 'resume_available' | 'auto_restoring' | 'editor-ready' | 'playtesting' | 'stopped' | 'restore_failed' | 'failed'
     sceneRevision: 1,
+    // The revision actually written to IndexedDB. It is not an invariant that this equals
+    // sceneRevision — persistence can fail — so both are reported and the session is marked
+    // `dirty_unpersisted` when they diverge, rather than pretending they always agree.
+    persistedRevision: 1,
     undoDepth: 0,
     activeProject: 'neon_skyrail_3d'
   };
@@ -251,6 +255,17 @@
     return 'editor';
   }
 
+  // The Godot editor process can exit on its own (a WASM crash, or Godot's own quit path),
+  // and index.html then shows the Loader tab. Nothing dispatches an event for that, so the
+  // visible tab is the only honest signal that there is still an editor to talk to.
+  function editorSurfaceLive() {
+    if (typeof document === 'undefined') return false;
+    const editorTab = document.getElementById('tab-editor');
+    const gameTab = document.getElementById('tab-game');
+    // A playtest hides the editor tab but the editor process is still alive behind it.
+    return editorTab?.style.display === 'block' || gameTab?.style.display === 'block';
+  }
+
   // Never cache the element: `replaceCanvas` in index.html destroys and recreates
   // both canvases on every engine exit.
   function resolveGodotCanvas(target = 'auto') {
@@ -367,20 +382,24 @@
     });
   }
 
-  async function persistActiveProjectState() {
+  async function persistActiveProjectState(candidate = null) {
+    // `candidate` lets a mutation persist the state it is ABOUT to publish, so the stored
+    // snapshot is written before `sceneRevision` advances rather than after.
+    const files = candidate?.files || activeFilesDict;
+    const revision = candidate?.revision ?? DiagnosticState.sceneRevision;
     try {
       const database = await openRecordingDatabase();
-      const contentFingerprint = await computeProjectContentFingerprint(activeFilesDict);
+      const contentFingerprint = await computeProjectContentFingerprint(files);
       const snapshot = {
         id: 'active',
         project_name: DiagnosticState.activeProject,
         main_scene: activeMainScene,
-        scene_revision: DiagnosticState.sceneRevision,
-        files: cloneProjectFiles(activeFilesDict),
+        scene_revision: revision,
+        files: cloneProjectFiles(files),
         undo_stack: undoStack.map(entry => ({ ...entry, files_before: cloneProjectFiles(entry.files_before || {}), files_after: cloneProjectFiles(entry.files_after || {}) })),
         idempotent_mutations: [...idempotentMutations.entries()].slice(-100),
         content_fingerprint: contentFingerprint,
-        last_validated_revision: DiagnosticState.sceneRevision,
+        last_validated_revision: revision,
         validation_state: 'runtime_validated',
         updated_at: Date.now()
       };
@@ -394,6 +413,7 @@
       persistedProjectAvailable = Object.keys(snapshot.files).length > 0;
       hydratedSnapshot = snapshot;
       projectPersistenceError = null;
+      DiagnosticState.persistedRevision = revision;
       BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
       return true;
     } catch (error) {
@@ -480,6 +500,9 @@
         DiagnosticState.activeProject = hydratedProject;
         activeMainScene = normalizeResourcePath(snapshot.main_scene || (hasFiles ? inferMainScene(hydratedFiles) : activeMainScene));
         DiagnosticState.sceneRevision = snapshot.scene_revision;
+        // The hydrated snapshot IS the persisted state, so seed both. Without this a restored
+        // session reports itself as having unpersisted edits it does not have.
+        DiagnosticState.persistedRevision = snapshot.scene_revision;
         activeFilesDict = hydratedFiles;
         undoStack.splice(0, undoStack.length, ...snapshot.undo_stack);
         idempotentMutations.clear();
@@ -678,6 +701,26 @@
     return filePath.startsWith('res://') ? filePath : `res://${filePath.replace(/^\/+/, '')}`;
   }
 
+  // Detect the editor leaving on its own and tell the truth about it everywhere at once.
+  function noteEditorSurfaceGone() {
+    if (typeof window === 'undefined') return;
+    if (editorSurfaceLive()) {
+      // Coming back (a playtest ending, or the loader being dismissed) must restore the
+      // reported state; availability is derived, never latched off.
+      refreshMeasuredEngineState();
+      DiagnosticHUD.render();
+      return;
+    }
+    // Deliberately does NOT clear `__godotEditorPluginReady`: that flag is owned by the
+    // plugin's _enter_tree and cannot be re-set from JS, so clearing it here would
+    // permanently disable the channel for a merely hidden editor. `available()` already
+    // requires a live surface, which is the derived, self-correcting signal.
+    if (DiagnosticState.engine === 'ready') DiagnosticState.engine = 'loading';
+    if (DiagnosticState.session === 'editor-ready') DiagnosticState.session = 'authoring';
+    AgentFocusOverlay.hide('editor_surface_gone');
+    DiagnosticHUD.render();
+  }
+
   function refreshMeasuredEngineState() {
     if (typeof document === 'undefined') return DiagnosticState.engine;
     const editorTab = document.getElementById('btn-tab-editor');
@@ -688,7 +731,7 @@
       (editorTab && !editorTab.disabled && editorCanvas) ||
       (gameTab && !gameTab.disabled && gameCanvas)
     );
-    if (hasUsableRuntime && DiagnosticState.engine !== 'failed') {
+    if (hasUsableRuntime && editorSurfaceLive() && DiagnosticState.engine !== 'failed') {
       DiagnosticState.engine = 'ready';
       DiagnosticState.engineError = null;
     }
@@ -1081,6 +1124,26 @@
     return activeLogs.filter(entry => entry.time >= sinceTime && entry.level === 'error' && patterns.test(entry.msg));
   }
 
+  // A `FATAL:` line is not diagnostic noise. In this engine it comes from CRASH_BAD_INDEX,
+  // which calls GENERATE_TRAP() — an unconditional abort — so the runtime does not survive it
+  // and everything reported afterwards is suspect. Surfaced separately from ordinary errors
+  // and never filtered by the tolerated-noise patterns above.
+  function fatalGodotErrors(sinceTime, generation = null) {
+    return activeLogs.filter(entry => entry.time >= sinceTime
+      && /\bFATAL:/.test(String(entry.msg))
+      && (generation === null || entry.generation === generation));
+  }
+
+  // Teardown from a previous editor process logs RID/ObjectDB/WebGL leaks that are expected
+  // and belong to a generation that no longer exists. Separate them from this session's.
+  function currentGenerationErrors(sinceTime) {
+    const generation = EditorCommandChannel.generation;
+    return activeLogs.filter(entry => entry.time >= sinceTime
+      && entry.level === 'error'
+      && entry.generation === generation
+      && !/leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked/i.test(String(entry.msg)));
+  }
+
   function waitForRuntimeEvent(successEvent, failureEvent, timeoutMs, timeoutMessage) {
     return new Promise((resolve, reject) => {
       let timeout;
@@ -1162,8 +1225,17 @@
     return { gameReady: true, gameVisible: visible ? gameVisible : false, startedAt };
   }
 
-  async function validateProjectRuntimeBoot(operation = null) {
+  async function validateProjectRuntimeBoot(operation = null, sinceTime = 0) {
     if (operation) await advancePhase(operation, 'validating_runtime');
+    // Any FATAL emitted while staging or booting this project means the engine trapped, so
+    // the project must not be reported as validated regardless of what else looks healthy.
+    const fatals = fatalGodotErrors(sinceTime || operation?.startedAt || 0);
+    if (fatals.length > 0) {
+      const error = new Error(`The Godot engine reported a fatal error while validating this project: ${fatals[0].msg}`);
+      error.code = 'ENGINE_FATAL';
+      error.fatal_log = fatals.slice(0, 5).map(entry => entry.msg);
+      throw error;
+    }
     if (typeof window !== 'undefined' && window.__godotGameState !== 'running') {
       if (typeof window.showTab === 'function') window.showTab('editor');
       return true;
@@ -1183,17 +1255,17 @@
   const origWarn = console.warn;
 
   console.log = function (...args) {
-    activeLogs.push({ level: 'info', time: Date.now(), msg: args.map(String).join(' ') });
+    activeLogs.push({ level: 'info', time: Date.now(), generation: EditorCommandChannel.generation, msg: args.map(String).join(' ') });
     if (activeLogs.length > MAX_LOGS) activeLogs.shift();
     origLog.apply(console, args);
   };
   console.error = function (...args) {
-    activeLogs.push({ level: 'error', time: Date.now(), msg: args.map(String).join(' ') });
+    activeLogs.push({ level: 'error', time: Date.now(), generation: EditorCommandChannel.generation, msg: args.map(String).join(' ') });
     if (activeLogs.length > MAX_LOGS) activeLogs.shift();
     origError.apply(console, args);
   };
   console.warn = function (...args) {
-    activeLogs.push({ level: 'warn', time: Date.now(), msg: args.map(String).join(' ') });
+    activeLogs.push({ level: 'warn', time: Date.now(), generation: EditorCommandChannel.generation, msg: args.map(String).join(' ') });
     if (activeLogs.length > MAX_LOGS) activeLogs.shift();
     origWarn.apply(console, args);
   };
@@ -1995,7 +2067,7 @@ func _physics_process(delta):
         await advancePhase(operation, 'validating_request');
         await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject, 60000, operation);
         if (mode === 'validate_runtime') {
-          await validateProjectRuntimeBoot(operation);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
         }
         await advancePhase(operation, 'persisting_commit');
         DiagnosticState.session = 'editor-ready';
@@ -2311,6 +2383,25 @@ func _tune_navigation_feel() -> void:
 # Dispatch
 # ---------------------------------------------------------------------------
 
+## Why no EditorInterface.save_scene() in the mutation ops below.
+##
+## JavaScriptBridge callbacks run SYNCHRONOUSLY, inline, on whatever JS call stack invoked
+## them (platform/web/javascript_bridge_singleton.cpp: JavaScriptObjectImpl::callback calls
+## _callback directly on the main thread, with no call_deferred). So this code executes at an
+## arbitrary point in the frame, not from a settled main-loop iteration.
+##
+## EditorInterface.save_scene() routes through EditorNode::_save_scene_with_preview, which
+## reads back the live 3D viewport texture to build a thumbnail and then packs the scene.
+## Called re-entrantly from a JS callback that path aborted the whole WASM runtime with
+## "FATAL: Index p_index = -1 is out of bounds (size() = 0)" — CRASH_BAD_INDEX, which calls
+## GENERATE_TRAP(), an unconditional abort rather than a recoverable error. Recovery was
+## impossible: subsequent file copies failed with "Engine must be inited".
+##
+## UndoRedo.commit_action() already applies the change to the live scene tree, and the WebMCP
+## bridge serializes the .tscn text itself and syncs it to the virtual filesystem
+## (window.__godotSyncToFS) before a playtest. Saving from here bought nothing and cost the
+## editor. The scene is simply left dirty, which is also the honest state: there are unsaved
+## live edits.
 func _on_command(args: Array) -> String:
 	var payload: Variant = null
 	if args.size() > 0 and typeof(args[0]) == TYPE_STRING:
@@ -2332,6 +2423,8 @@ func _on_command(args: Array) -> String:
 		"node_transform": reply = _op_node_transform(payload)
 		"node_material": reply = _op_node_material(payload)
 		"node_delete": reply = _op_node_delete(payload)
+		"node_state": reply = _op_node_state(payload)
+		"save_scene": reply = _op_save_scene()
 		"inspect_property": reply = _op_inspect_property(payload)
 		"open_scene": reply = _op_open_scene(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
@@ -2412,7 +2505,7 @@ func _scene_is_dirty() -> bool:
 func _op_inspect_property(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var property_name := String(payload.get("property", ""))
 	if property_name == "":
 		var names: Array = []
@@ -2442,9 +2535,20 @@ func _resolve_node(node_path: String) -> Node:
 	var direct := root.get_node_or_null(NodePath(node_path))
 	if direct != null:
 		return direct
-	# Fall back to a by-name search so agents can address nodes without full paths.
+	# Fall back to a by-name search so agents can address nodes without full paths — but only
+	# when the name is unique. A .tscn may hold BranchA/TwinOrb and BranchB/TwinOrb, and
+	# silently picking the first is how an edit lands on the wrong object.
 	var leaf := node_path.get_file() if node_path.contains("/") else node_path
-	return _find_by_name(root, leaf)
+	var matches := _find_all_by_name(root, leaf)
+	return matches[0] if matches.size() == 1 else null
+
+## Every node with this name, so callers can tell "missing" from "ambiguous".
+func _find_all_by_name(node: Node, wanted: String, found: Array = []) -> Array:
+	if String(node.name) == wanted:
+		found.append(node)
+	for child in node.get_children():
+		_find_all_by_name(child, wanted, found)
+	return found
 
 func _find_by_name(node: Node, wanted: String) -> Node:
 	if String(node.name) == wanted:
@@ -2455,10 +2559,30 @@ func _find_by_name(node: Node, wanted: String) -> Node:
 			return found
 	return null
 
+## A single explanation for every failed lookup, so an ambiguous path is never reported as a
+## missing node (which would send the caller looking for the wrong problem).
+func _resolve_error(node_path: String, expected := "Node") -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var leaf := node_path.get_file() if node_path.contains("/") else node_path
+	var matches := _find_all_by_name(root, leaf)
+	if matches.size() > 1:
+		var paths: Array = []
+		for match in matches:
+			paths.append(String(root.get_path_to(match)))
+		return {
+			"ok": false,
+			"code": "AMBIGUOUS_NODE_PATH",
+			"candidates": paths,
+			"error": "'%s' is ambiguous: %d nodes are named '%s' (%s). Pass the full scene-relative path." % [node_path, matches.size(), leaf, ", ".join(paths)],
+		}
+	return {"ok": false, "error": "%s not found: %s" % [expected, node_path]}
+
 func _op_select(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var selection := EditorInterface.get_selection()
 	selection.clear()
 	selection.add_node(node)
@@ -2683,18 +2807,18 @@ func _op_node_add(payload: Dictionary) -> Dictionary:
 	undo.add_do_reference(instance)
 	undo.add_undo_method(parent, "remove_child", instance)
 	undo.commit_action()
-	EditorInterface.save_scene()
 	return {
 		"ok": true,
 		"node_path": String(root.get_path_to(instance)),
 		"node_name": node_name,
 		"aabb": _aabb_of(instance),
+		"transform": _transform_array(instance),
 	}
 
 func _op_node_transform(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null or not (node is Node3D):
-		return {"ok": false, "error": "Node3D not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")), "Node3D")
 	var node3d := node as Node3D
 	var relative := bool(payload.get("relative", false))
 	var target := node3d.transform
@@ -2712,34 +2836,79 @@ func _op_node_transform(payload: Dictionary) -> Dictionary:
 	undo.add_do_property(node3d, "transform", target)
 	undo.add_undo_property(node3d, "transform", node3d.transform)
 	undo.commit_action()
-	EditorInterface.save_scene()
 	return {
 		"ok": true,
 		"node_path": String(EditorInterface.get_edited_scene_root().get_path_to(node3d)),
 		"position": [target.origin.x, target.origin.y, target.origin.z],
 		"aabb": _aabb_of(node3d),
+		"transform": _transform_array(node3d),
 	}
 
 func _op_node_material(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null or not (node is MeshInstance3D):
-		return {"ok": false, "error": "MeshInstance3D not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")), "MeshInstance3D")
 	var instance := node as MeshInstance3D
 	var previous := instance.get_surface_override_material(0)
-	var updated := _build_material(payload, previous.duplicate() if previous != null else null)
+	# Copy-on-write, exactly like the editor's own inspector: never mutate a material that
+	# other nodes may share. With no override yet, seed from whatever the mesh is actually
+	# rendering so a recolour changes one property instead of resetting the whole look.
+	var seed: Material = previous
+	if seed == null and instance.mesh != null:
+		seed = instance.get_active_material(0)
+	var updated := _build_material(payload, seed.duplicate() if seed != null else null)
 	var undo := get_undo_redo()
 	undo.create_action("WebMCP: material %s" % instance.name, UndoRedo.MERGE_ENDS, instance)
 	undo.add_do_method(instance, "set_surface_override_material", 0, updated)
 	undo.add_do_reference(updated)
 	undo.add_undo_method(instance, "set_surface_override_material", 0, previous)
 	undo.commit_action()
-	EditorInterface.save_scene()
-	return {"ok": true, "node_path": String(payload.get("node_path", ""))}
+	# The RESOLVED path, not the requested one: the bridge targets its .tscn edit with this, so
+	# echoing back a bare ambiguous leaf would send the source edit to the wrong node.
+	var root := EditorInterface.get_edited_scene_root()
+	# Report what actually happened rather than a proxy for it. A new material resource is
+	# ALWAYS assigned here (copy-on-write), so "forked_material: previous == null" was false
+	# precisely in the case that forks from a shared seed.
+	var seed_source := "surface_override"
+	if previous == null:
+		seed_source = "mesh_active_material" if seed != null else "new"
+	var applied := {
+		"ok": true,
+		"node_path": String(root.get_path_to(instance)),
+		"requested_path": String(payload.get("node_path", "")),
+		"assigned_new_material": true,
+		"material_seed": seed_source,
+	}
+	var resolved := _op_node_state({"node_path": String(root.get_path_to(instance))})
+	if resolved.get("ok", false) and resolved.has("material"):
+		applied["material"] = resolved["material"]
+	return applied
+
+## Explicit, opt-in, and deferred. Never called from a mutation op.
+##
+## Deferring moves the save onto the next main-loop pass, which is the execution context the
+## packer and the thumbnail readback assume. save_scene_as(path, false) is used instead of
+## save_scene() specifically to skip the with_preview branch, which is the render-state
+## sensitive part. Both guards mirror EditorInterface::save_scene's own preconditions so this
+## fails predictably rather than relying on the C++ check.
+func _op_save_scene() -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	if root.scene_file_path.is_empty():
+		return {"ok": false, "error": "The edited scene has no file path yet; save it once from the editor first."}
+	EditorInterface.call_deferred("save_scene_as", root.scene_file_path, false)
+	return {
+		"ok": true,
+		"scene_file_path": root.scene_file_path,
+		"deferred": true,
+		"note": "Queued for the next main-loop pass; saving inline from a JS callback aborts the web editor.",
+	}
 
 func _op_node_delete(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null:
-		return {"ok": false, "error": "Node not found: %s" % payload.get("node_path", "")}
+		return _resolve_error(String(payload.get("node_path", "")))
 	var root := EditorInterface.get_edited_scene_root()
 	if node == root:
 		return {"ok": false, "error": "The scene root cannot be deleted through the command channel."}
@@ -2752,9 +2921,9 @@ func _op_node_delete(payload: Dictionary) -> Dictionary:
 	undo.add_undo_method(parent, "move_child", node, index)
 	undo.add_undo_method(node, "set_owner", root)
 	undo.add_undo_reference(node)
+	var resolved_path := String(root.get_path_to(node))
 	undo.commit_action()
-	EditorInterface.save_scene()
-	return {"ok": true, "deleted_node": String(payload.get("node_path", ""))}
+	return {"ok": true, "deleted_node": resolved_path, "node_path": resolved_path, "requested_path": String(payload.get("node_path", ""))}
 
 func _op_open_scene(payload: Dictionary) -> Dictionary:
 	var scene_path := String(payload.get("scene_path", ""))
@@ -2764,6 +2933,49 @@ func _op_open_scene(payload: Dictionary) -> Dictionary:
 		return {"ok": false, "error": "Scene does not exist: %s" % scene_path}
 	EditorInterface.open_scene_from_path(scene_path)
 	return {"ok": true, "scene_path": scene_path}
+
+## The exact twelve floats Godot itself would write into a .tscn Transform3D, in the same
+## column-major order. The JS side writes these back verbatim instead of recomputing a basis
+## from Euler angles, which is what let a rotation-only edit exist in the editor but never
+## reach the saved scene.
+func _transform_array(node: Node) -> Array:
+	if not (node is Node3D):
+		return []
+	var t := (node as Node3D).transform
+	return [
+		t.basis.x.x, t.basis.x.y, t.basis.x.z,
+		t.basis.y.x, t.basis.y.y, t.basis.y.z,
+		t.basis.z.x, t.basis.z.y, t.basis.z.z,
+		t.origin.x, t.origin.y, t.origin.z,
+	]
+
+## Read back what the editor actually holds, so the bridge can serialize truth rather than
+## its own model of what it asked for.
+func _op_node_state(payload: Dictionary) -> Dictionary:
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return _resolve_error(String(payload.get("node_path", "")))
+	var root := EditorInterface.get_edited_scene_root()
+	var state := {
+		"ok": true,
+		"node_path": String(root.get_path_to(node)),
+		"node_class": node.get_class(),
+		"transform": _transform_array(node),
+		"aabb": _aabb_of(node),
+	}
+	if node is MeshInstance3D:
+		var material := (node as MeshInstance3D).get_surface_override_material(0)
+		if material is StandardMaterial3D:
+			var standard := material as StandardMaterial3D
+			state["material"] = {
+				"albedo_color": standard.albedo_color.to_html(true),
+				"metallic": standard.metallic,
+				"roughness": standard.roughness,
+				"emission_enabled": standard.emission_enabled,
+				"emission": standard.emission.to_html(false),
+				"emission_energy": standard.emission_energy_multiplier,
+			}
+	return state
 
 func _aabb_of(node: Node) -> Array:
 	if node is VisualInstance3D:
@@ -2833,7 +3045,15 @@ func _aabb_of(node: Node) -> Array:
 
     available() {
       if (typeof window === 'undefined') return false;
-      return window.__godotEditorPluginReady === true && typeof window.__godotEditorCommand === 'function';
+      if (window.__godotEditorPluginReady !== true || typeof window.__godotEditorCommand !== 'function') return false;
+      // The plugin's ready flag is set once at _enter_tree and cannot unset itself if the
+      // editor process dies. Without this check the bridge reported `available: true` and a
+      // healthy session while the page was sitting on the Loader screen.
+      if (!editorSurfaceLive()) {
+        this.unavailableReason = 'The Godot editor process is not running (the page is showing the loader).';
+        return false;
+      }
+      return true;
     },
 
     async waitForReady(timeoutMs = 6000) {
@@ -3067,11 +3287,22 @@ func _aabb_of(node: Node) -> Array:
     return { nodes, by_type: byType, scene_count: new Set(nodes.map(node => node.path)).size };
   }
 
+  // Same rule as findNodeBlock: exact path first, bare leaf only when unambiguous. Silently
+  // picking the first same-named node is how an overlay ends up pointing at the wrong object.
   function findSceneNode(filesDict, nodeName) {
     if (!nodeName) return null;
-    const leaf = String(nodeName).replace(/^.*\//, '');
+    const wanted = String(nodeName).replace(/^\.\//, '');
     const graph = sceneGraphFromFiles(filesDict);
-    return graph.nodes.find(node => node.name === leaf || node.node_path === nodeName) || null;
+    const exact = graph.nodes.find(node => node.node_path === wanted);
+    if (exact) return exact;
+    const leaf = wanted.replace(/^.*\//, '');
+    const byName = graph.nodes.filter(node => node.name === leaf);
+    return byName.length === 1 ? byName[0] : null;
+  }
+
+  function findSceneNodeCandidates(filesDict, nodeName) {
+    const leaf = String(nodeName || '').replace(/^.*\//, '');
+    return sceneGraphFromFiles(filesDict).nodes.filter(node => node.name === leaf).map(node => node.node_path);
   }
 
   // ==========================================
@@ -3160,7 +3391,9 @@ func _aabb_of(node: Node) -> Array:
   // ==========================================
   function parseColor(val, fallback = 'Color(1, 1, 1, 1)') {
     if (!val) return fallback;
-    if (typeof val === 'string' && val.startsWith('#')) {
+    // Godot's Color.to_html() returns bare hex with no leading '#', so the plugin's own
+    // reported material values have to parse here too.
+    if (typeof val === 'string' && (val.startsWith('#') || /^[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(val))) {
       const hex = val.replace('#', '');
       const r = parseInt(hex.substring(0, 2), 16) / 255;
       const g = parseInt(hex.substring(2, 4), 16) / 255;
@@ -3222,6 +3455,132 @@ func _aabb_of(node: Node) -> Array:
     return lines.join('\n') + '\n';
   }
 
+  // The editor resolved the request against the real scene tree and reported the path it
+  // actually touched. Using that for the text edit makes the two sides agree by construction
+  // rather than by two lookups that can disagree.
+  // Read the committed text back and answer: does the file now say what the editor holds?
+  // Returning `true` without looking is exactly the defect these replace.
+  function verifyTransformInSource(source, nodePath, expected) {
+    if (!Array.isArray(expected) || expected.length < 12) {
+      return { synced: null, reason: 'no_authoritative_transform_to_compare' };
+    }
+    const block = findNodeBlock(source, nodePath);
+    if (!block) return { synced: false, mismatch: `node '${nodePath}' is absent from the written scene` };
+    const written = existingTransformOf(block.text);
+    const flat = [...written.basis, ...written.origin];
+    const delta = Math.max(...flat.map((value, index) => Math.abs(value - Number(expected[index]))));
+    return delta <= 1e-4
+      ? { synced: true, node_path: block.nodePath, delta }
+      : { synced: false, node_path: block.nodePath, delta, mismatch: `written transform differs from the editor's by ${delta.toExponential(2)}` };
+  }
+
+  function verifyMaterialInSource(source, nodePath, requested = {}) {
+    const block = findNodeBlock(source, nodePath);
+    if (!block) return { synced: false, mismatch: `node '${nodePath}' is absent from the written scene` };
+    const slot = materialSlotOf(block.text);
+    if (!slot) return { synced: false, mismatch: `node '${block.nodePath}' has no material reference after the edit` };
+    const material = readMaterialSubResource(source, slot.id);
+    if (!material) return { synced: false, mismatch: `referenced material '${slot.id}' is missing from the scene` };
+    // A recolour that leaves the node on a shared resource repaints every node using it.
+    const shares = materialReferenceCount(source, slot.id);
+    if (shares > 1) {
+      return { synced: false, mismatch: `material '${slot.id}' is still shared by ${shares} nodes, so this edit would repaint all of them` };
+    }
+    // Every requested property, not just albedo: a metallic-only edit that silently failed
+    // to serialize would otherwise still report source_synced: true.
+    const checks = [
+      ['albedo_color', 'albedo_color', value => parseColor(value)],
+      ['emission', 'emission', value => parseColor(value)],
+      ['metallic', 'metallic', value => String(value)],
+      ['roughness', 'roughness', value => String(value)],
+      ['emission_energy', 'emission_energy_multiplier', value => String(value)]
+    ];
+    const numeric = new Set(['metallic', 'roughness', 'emission_energy_multiplier']);
+    for (const [requestKey, sceneKey, format] of checks) {
+      if (requested[requestKey] === undefined || requested[requestKey] === null) continue;
+      const expected = format(requested[requestKey]);
+      const actual = material.properties[sceneKey];
+      if (actual === undefined) {
+        return { synced: false, mismatch: `${sceneKey} was requested but is absent from material '${slot.id}'` };
+      }
+      const equal = numeric.has(sceneKey)
+        ? Math.abs(Number(actual) - Number(expected)) <= 1e-6
+        : actual === expected;
+      if (!equal) {
+        return { synced: false, mismatch: `${sceneKey} is ${actual}, expected ${expected}` };
+      }
+    }
+    if ((requested.emission !== undefined || requested.emission_energy !== undefined)
+      && material.properties.emission_enabled !== 'true') {
+      return { synced: false, mismatch: `emission was requested but emission_enabled is ${material.properties.emission_enabled || 'unset'}` };
+    }
+    return { synced: true, node_path: block.nodePath, material_id: slot.id };
+  }
+
+  function verifyNodePresence(source, nodePath, shouldExist) {
+    let block = null;
+    try {
+      block = findNodeBlock(source, nodePath);
+    } catch (error) {
+      return { synced: false, mismatch: error.message };
+    }
+    if (shouldExist) {
+      return block ? { synced: true, node_path: block.nodePath } : { synced: false, mismatch: `node '${nodePath}' was not written to the scene` };
+    }
+    return block ? { synced: false, mismatch: `node '${nodePath}' is still present after delete` } : { synced: true };
+  }
+
+  // Copy into the *editor* engine. Keeps the editor's on-disk view current; it says nothing
+  // about what a playtest will load, because the playtest is a different Engine instance with
+  // its own filesystem. Named for what it actually proves.
+  function copyActiveProjectToEditorFS() {
+    if (typeof window === 'undefined' || typeof window.__godotCopyToEditorFS !== 'function') {
+      return { ok: false, error: 'The editor filesystem bridge is unavailable in this build.' };
+    }
+    try {
+      return window.__godotCopyToEditorFS(activeFilesDict, DiagnosticState.activeProject) || { ok: false, error: 'No result from the filesystem copy.' };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  // Stage the snapshot the playtest engine must boot from, and clear any stale acknowledgement
+  // so the wait below cannot pass on a previous run's ack.
+  function stageProjectForPlaytest() {
+    if (typeof window === 'undefined') return null;
+    const staged = {
+      projectName: DiagnosticState.activeProject,
+      revision: DiagnosticState.sceneRevision,
+      files: cloneProjectFiles(activeFilesDict)
+    };
+    window.__godotStagedProject = staged;
+    window.__godotGameFsAck = null;
+    return staged;
+  }
+
+  // The game engine copies the staged files in during its own boot and publishes what it
+  // received. Anything short of an ack for this exact revision means the running game is not
+  // showing the current scene, and saying otherwise is the false success this replaces.
+  async function awaitPlaytestFsAck(expectedRevision, timeoutMs = 12000) {
+    const ready = await waitFor(() => Boolean(window.__godotGameFsAck), timeoutMs, 60);
+    const ack = window.__godotGameFsAck || null;
+    if (!ready || !ack) {
+      return { ok: false, acknowledged: false, error: 'The playtest engine never acknowledged the staged project snapshot.' };
+    }
+    if (!ack.ok) {
+      return { ok: false, acknowledged: true, error: ack.error || `${ack.failed?.length || 0} file(s) failed to copy into the playtest engine.`, ack };
+    }
+    if (ack.revision !== expectedRevision) {
+      return { ok: false, acknowledged: true, error: `The playtest engine acknowledged revision ${ack.revision}, not ${expectedRevision}.`, ack };
+    }
+    return { ok: true, acknowledged: true, revision: ack.revision, written: ack.written, ack };
+  }
+
+  function resolvedNodePath(commandReply, requestedPath) {
+    const resolved = commandReply?.node_path;
+    return typeof resolved === 'string' && resolved ? resolved : requestedPath;
+  }
+
   function nowMs() {
     return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
   }
@@ -3244,49 +3603,112 @@ func _aabb_of(node: Node) -> Array:
     if (!currentTscn) {
       throw new Error(`Active main scene '${mainScenePath}' is not loaded. Create or author a scene first.`);
     }
-    const updatedTscn = mutatorFn(currentTscn);
 
     let channel = 'transaction';
     let channelError = null;
+    let commandReply = null;
     const command = options.command;
     if (command && EditorCommandChannel.available()) {
       const reply = EditorCommandChannel.call(command.op, command.payload || {});
       if (reply.ok) {
         channel = 'command';
+        commandReply = reply;
       } else if (reply.unsupported || reply.stale) {
-        // The channel is gone or belongs to a previous editor process. Falling back to a
-        // restart is correct: the .tscn text is the authority and nothing has been applied.
         channelError = reply.error || EditorCommandChannel.unavailableReason;
       } else {
-        // The editor examined the operation and refused it — a duplicate node name, a
-        // missing target, a non-Node3D. Splicing the .tscn anyway and restarting would
-        // write exactly the state the editor just rejected, which is how a second
-        // MagentaPortalRing ends up in the scene. Fail instead.
+        // Keep what the editor told us. Flattening an AMBIGUOUS_NODE_PATH with its candidate
+        // list into a generic rejection throws away exactly the information the caller needs
+        // to fix the call.
         const error = new Error(`The Godot editor rejected this operation: ${reply.error}`);
-        error.code = 'EDITOR_COMMAND_REJECTED';
+        error.code = reply.code || 'EDITOR_COMMAND_REJECTED';
+        if (Array.isArray(reply.candidates)) error.candidates = reply.candidates;
+        if (reply.requested_path) error.requested_path = reply.requested_path;
+        error.editor_error = reply.error;
         throw error;
       }
     } else if (command) {
       channelError = EditorCommandChannel.unavailableReason;
     }
 
-    activeFilesDict[mainScenePath] = updatedTscn;
-    DiagnosticState.sceneRevision++;
-    DiagnosticHUD.render();
-    BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+    // The editor is the source of truth when it applied the change: its own serialized
+    // transform is written into the .tscn rather than the bridge's idea of what it asked for.
+    const updatedTscn = mutatorFn(currentTscn, commandReply);
+
+    // Verify the text we are about to commit actually says what the editor holds, instead of
+    // asserting it. `null` means "could not be checked", which is not the same as "matches".
+    let verification = { synced: null, reason: 'not_verified' };
+    if (typeof options.verify === 'function') {
+      try {
+        verification = options.verify(updatedTscn, commandReply) || verification;
+      } catch (error) {
+        verification = { synced: false, mismatch: error instanceof Error ? error.message : String(error) };
+      }
+    }
+
+    // Two-phase commit. The candidate snapshot is built, applied to the editor, and PERSISTED
+    // before `sceneRevision` is published. Incrementing first is what left the reported
+    // revision ahead of what was actually stored when a step failed part-way.
+    const previousRevision = DiagnosticState.sceneRevision;
+    const previousFiles = activeFilesDict;
+    const candidateFiles = { ...activeFilesDict, [mainScenePath]: updatedTscn };
+    const nextRevision = previousRevision + 1;
 
     let restarted = false;
     if (channel !== 'command' && typeof window !== 'undefined' && typeof restartEditorWithProject === 'function') {
-      await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
-      restarted = true;
+      // The fallback boots from the candidate, so it has to be live for the restart.
+      activeFilesDict = candidateFiles;
+      try {
+        await restartEditorWithProject(activeFilesDict, DiagnosticState.activeProject);
+        restarted = true;
+      } catch (error) {
+        // Roll back to the last state that really existed; nothing is published.
+        activeFilesDict = previousFiles;
+        DiagnosticState.sceneRevision = previousRevision;
+        DiagnosticState.engine = 'failed';
+        DiagnosticState.engineError = error instanceof Error ? error.message : String(error);
+        DiagnosticHUD.render();
+        throw error;
+      }
     }
-    persistActiveProjectState().catch(() => {});
+
+    // Persist the candidate BEFORE publishing it.
+    let persisted = false;
+    let persistError = null;
+    try {
+      persisted = await persistActiveProjectState({ files: candidateFiles, revision: nextRevision });
+    } catch (error) {
+      persisted = false;
+      persistError = error instanceof Error ? error.message : String(error);
+    }
+
+    // Publish. The editor already holds the change either way, so the scene text and revision
+    // must describe it — but when the snapshot did not reach storage the session says so
+    // explicitly rather than leaving a silent gap between revision and persistence.
+    activeFilesDict = candidateFiles;
+    DiagnosticState.sceneRevision = nextRevision;
+    if (!persisted) {
+      DiagnosticState.session = 'dirty_unpersisted';
+      projectPersistenceError = persistError || projectPersistenceError || 'The scene snapshot could not be stored.';
+    } else if (DiagnosticState.session === 'dirty_unpersisted') {
+      DiagnosticState.session = 'editor-ready';
+    }
+    DiagnosticHUD.render();
+    BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+
     return {
       revision: DiagnosticState.sceneRevision,
       mainScene: `res://${mainScenePath}`,
       channel,
       channelError,
       restarted,
+      persisted,
+      persistError,
+      verification,
+      // Whether the .tscn text was written from Godot's own post-apply state rather than
+      // from the bridge's local model of the request.
+      authoritative: Boolean(commandReply && Array.isArray(commandReply.transform) && commandReply.transform.length >= 12)
+        || Boolean(commandReply && materialUpdateFromCommandReply(commandReply)),
+      commandReply,
       elapsedMs: Math.round((nowMs() - startedAt) * 100) / 100
     };
   }
@@ -3298,6 +3720,17 @@ func _aabb_of(node: Node) -> Array:
       scene_revision: res.revision,
       editor_channel: res.channel,
       editor_restarted: res.restarted,
+      // Four distinct facts, deliberately not collapsed into one "success":
+      //   applied              — the editor accepted and applied the operation
+      //   source_synced        — the .tscn text was re-read and matches (null = not checked)
+      //   source_authoritative — that text came from Godot's own serialized state
+      //   persisted            — the snapshot reached IndexedDB at this revision
+      applied: res.channel === 'command' ? 'editor_command' : 'editor_restart',
+      source_synced: res.verification?.synced ?? null,
+      ...(res.verification?.mismatch ? { source_mismatch: res.verification.mismatch } : {}),
+      ...(res.verification?.synced === null && res.verification?.reason ? { source_unverified_reason: res.verification.reason } : {}),
+      source_authoritative: res.authoritative === true,
+      persisted: res.persisted === true,
       // Measured wall clock for this call, including the editor restart when one was needed.
       execution_time_ms: res.elapsedMs,
       ...(res.channelError ? { editor_channel_note: res.channelError } : {})
@@ -3325,6 +3758,13 @@ func _aabb_of(node: Node) -> Array:
           webmcp_surface: DiagnosticState.webmcpSurface,
           editor_command_channel: EditorCommandChannel.describe(),
           editor_restart_count: editorRestartCount,
+          engine_health: {
+            // Fatal traps for the CURRENT editor generation only; teardown noise from a
+            // previous process is excluded rather than counted against this session.
+            fatal_errors: fatalGodotErrors(0, EditorCommandChannel.generation).slice(-3).map(entry => entry.msg),
+            session_errors: currentGenerationErrors(0).length,
+            generation: EditorCommandChannel.generation
+          },
           camera: {
             auto_follow: CameraGuidance.autoFollowEnabled(),
             active_viewport: activeGodotViewport(),
@@ -3335,6 +3775,10 @@ func _aabb_of(node: Node) -> Array:
             active_project: DiagnosticState.activeProject,
             active_main_scene: activeMainScene,
             scene_revision: DiagnosticState.sceneRevision,
+            // Reported separately on purpose: these are not guaranteed equal, and a gap means
+            // the editor holds edits that are not in storage.
+            persisted_revision: DiagnosticState.persistedRevision,
+            unpersisted: DiagnosticState.sceneRevision !== DiagnosticState.persistedRevision,
             undo_stack_depth: undoStack.length,
             active_operation_id: activeManagedMutationId
           },
@@ -3469,7 +3913,7 @@ func _aabb_of(node: Node) -> Array:
 
           try {
             await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
-            await validateProjectRuntimeBoot(operation);
+            await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
           } catch (error) {
             await restoreProjectSnapshot(previous, operation);
             throw error;
@@ -3913,7 +4357,7 @@ func _aabb_of(node: Node) -> Array:
 
         try {
           await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
-          await validateProjectRuntimeBoot(operation);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
         } catch (error) {
           await restoreProjectSnapshot(previous, operation);
           throw error;
@@ -4073,7 +4517,7 @@ func _aabb_of(node: Node) -> Array:
 
         try {
           await restartEditorWithProject(stagedFiles, DiagnosticState.activeProject, 60000, operation);
-          await validateProjectRuntimeBoot(operation);
+          await validateProjectRuntimeBoot(operation, operation?.startedAt || 0);
         } catch (error) {
           try { await restartEditorWithProject(previousFiles, DiagnosticState.activeProject, 60000, operation); } catch (_) {}
           releaseRuntimeFrame();
@@ -4465,6 +4909,14 @@ func _aabb_of(node: Node) -> Array:
         PlaytestSimulation.reset();
         GameTelemetryState.latest = null;
         GameTelemetryState.recent = [];
+        // The playtest is a SEPARATE Engine instance with its own in-memory filesystem, so
+        // copying into the editor engine proves nothing about what the game will load — doing
+        // only that reported success while the playtest still rendered the pre-edit scene.
+        // Hand the snapshot to the game engine itself and require it to acknowledge the
+        // revision it received.
+        const editorCopy = copyActiveProjectToEditorFS();
+        const staged = stageProjectForPlaytest();
+        const expectedRevision = staged?.revision ?? DiagnosticState.sceneRevision;
         try {
           await startGameRuntime({ visible: true, timeoutMs: 15000 });
         } catch (error) {
@@ -4472,10 +4924,34 @@ func _aabb_of(node: Node) -> Array:
           DiagnosticHUD.render();
           throw error;
         }
+        const handshake = await awaitPlaytestFsAck(expectedRevision);
+        if (!handshake.ok) {
+          // Refuse to report a playtest as current when it demonstrably is not.
+          await stopGameRuntime(8000).catch(() => {});
+          DiagnosticState.session = 'editor-ready';
+          DiagnosticHUD.render();
+          const error = new Error(`The playtest did not confirm it loaded scene revision ${expectedRevision}: ${handshake.error}`);
+          error.code = 'PLAYTEST_REVISION_UNCONFIRMED';
+          throw error;
+        }
         DiagnosticState.engine = 'ready';
         DiagnosticState.session = 'playtesting';
         DiagnosticHUD.render();
-        return { success: true, status: 'running', main_scene: activeMainScene, viewport: 'game', viewport_visible: true };
+        return {
+          success: true,
+          status: 'running',
+          main_scene: activeMainScene,
+          viewport: 'game',
+          viewport_visible: true,
+          scene_revision: DiagnosticState.sceneRevision,
+          // Acknowledged by the playtest engine itself, for this exact revision.
+          playtest_revision_confirmed: handshake.revision,
+          playtest_files_received: handshake.written,
+          // Separate, weaker fact: the editor engine's filesystem was refreshed too. This is
+          // NOT evidence about what the game loaded.
+          editor_fs_copy_succeeded: editorCopy.ok === true,
+          ...(editorCopy.ok ? {} : { editor_fs_copy_error: editorCopy.error || `${editorCopy.failed?.length || 0} file(s) failed to copy` })
+        };
       }
     },
     {
@@ -5005,7 +5481,7 @@ func _aabb_of(node: Node) -> Array:
     {
       definition: {
         name: 'godot_camera_focus',
-        description: 'Transient viewport-only framing: selects a node and dispatches Godot\'s own spatial_editor/focus_selection so the editor camera eases to it with the configured navigation inertia, and anchors the on-page focus reticle to the node\'s projected screen position. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload. Yields to the user for 750 ms after any pointer, wheel, or key input on the viewport.',
+        description: 'Transient viewport-only framing: selects a node, dispatches Godot\'s own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node\'s projected screen position. Reports what it measured, not what it attempted: status is \'framed\' only when the viewport pose actually changed, \'dispatched_unconfirmed\' when the shortcut was delivered but the camera did not move (Godot only advances camera interpolation while rendering, so a backgrounded tab reports this), \'overlay_only\' without the editor plugin, or \'yielded\' during the 750 ms cooldown after user input. target_reached additionally requires the node to project inside the frame. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload. Yields to the user for 750 ms after any pointer, wheel, or key input on the viewport.',
         input_schema: {
           type: 'object',
           properties: {
@@ -5099,9 +5575,14 @@ func _aabb_of(node: Node) -> Array:
         const meshSubRes = generateMeshSubResource(meshType, args, meshSubResId);
         const matSubRes = generateMaterialSubResource(mat, matSubResId);
 
-        const nodeBlock = `\n[node name="${nodeName}" type="MeshInstance3D" parent="${parentPath}"]\ntransform = Transform3D(${scale[0]}, 0, 0, 0, ${scale[1]}, 0, 0, 0, ${scale[2]}, ${pos[0]}, ${pos[1]}, ${pos[2]})\nmesh = SubResource("${meshSubResId}")\nsurface_material_override/0 = SubResource("${matSubResId}")\n`;
+        // The previous version wrote a scale-only basis, silently discarding `rotation`.
+        const localBasis = basisFromEulerScale(rot, scale);
 
-        const res = await liveMutateSceneFile((source) => {
+        const res = await liveMutateSceneFile((source, commandReply) => {
+          const authoritative = Array.isArray(commandReply?.transform) && commandReply.transform.length >= 12
+            ? commandReply.transform
+            : [...localBasis, ...pos];
+          const nodeBlock = `\n[node name="${nodeName}" type="MeshInstance3D" parent="${parentPath}"]\ntransform = ${formatTransform3D(authoritative.slice(0, 9), authoritative.slice(9, 12))}\nmesh = SubResource("${meshSubResId}")\nsurface_material_override/0 = SubResource("${matSubResId}")\n`;
           let updated = source;
           const firstNodeIdx = updated.indexOf('\n[node name="');
           if (firstNodeIdx > 0) {
@@ -5120,6 +5601,14 @@ func _aabb_of(node: Node) -> Array:
               inner_radius: args.inner_radius, outer_radius: args.outer_radius,
               position: pos, rotation: rot, scale, material: mat
             }
+          },
+          verify: (source, reply) => {
+            const path = reply?.node_path || (parentPath === '.' ? nodeName : `${parentPath}/${nodeName}`);
+            const present = verifyNodePresence(source, path, true);
+            if (!present.synced) return present;
+            return Array.isArray(reply?.transform)
+              ? verifyTransformInSource(source, path, reply.transform)
+              : { synced: true, node_path: path, reason: 'no_authoritative_transform_to_compare' };
           }
         });
 
@@ -5156,46 +5645,44 @@ func _aabb_of(node: Node) -> Array:
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const nodeName = args.node_path.replace(/^.*\//, '');
+        // The requested path is kept whole. Stripping it to a leaf name is what made an edit
+        // to BranchB/TwinOrb land on BranchA/TwinOrb in the serialized scene.
+        const requestedPath = args.node_path;
         const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : null;
-        const scale = Array.isArray(args.scale) && args.scale.length >= 3 ? args.scale : [1, 1, 1];
-
-        const res = await liveMutateSceneFile((source) => {
-          const nodeHeader = `[node name="${nodeName}"`;
-          const nodeIdx = source.indexOf(nodeHeader);
-          if (nodeIdx < 0) throw new Error(`Node '${nodeName}' not found in active 3D scene.`);
-          const nextNodeIdx = source.indexOf('\n[node name="', nodeIdx + 1);
-          const blockEnd = nextNodeIdx > 0 ? nextNodeIdx : source.length;
-          let nodeBlock = source.slice(nodeIdx, blockEnd);
-
-          if (pos) {
-            const newTransform = `transform = Transform3D(${scale[0]}, 0, 0, 0, ${scale[1]}, 0, 0, 0, ${scale[2]}, ${pos[0]}, ${pos[1]}, ${pos[2]})`;
-            if (nodeBlock.includes('transform = Transform3D(')) {
-              nodeBlock = nodeBlock.replace(/transform = Transform3D\([^\)]+\)/, newTransform);
-            } else {
-              nodeBlock = nodeBlock.replace(nodeHeader, `${nodeHeader}\n${newTransform}`);
-            }
-          }
-          return source.slice(0, nodeIdx) + nodeBlock + source.slice(blockEnd);
-        }, {
+        // Rotation was never serialized and `relative` was never implemented, so a
+        // rotation-only edit lived in the editor and died on reload. Both are handled by
+        // applyTransformToSceneText now, and Godot's own result overrides it when available.
+        const res = await liveMutateSceneFile((source, commandReply) => applyTransformToSceneText(source, resolvedNodePath(commandReply, requestedPath), {
+          position: args.position,
+          rotation: args.rotation,
+          scale: args.scale,
+          relative: args.relative === true,
+          authoritative: commandReply?.transform
+        }), {
           command: {
             op: 'node_transform',
             payload: {
               node_path: args.node_path, position: args.position,
               rotation: args.rotation, scale: args.scale, relative: args.relative === true
             }
-          }
+          },
+          verify: (source, reply) => verifyTransformInSource(source, resolvedNodePath(reply, requestedPath), reply?.transform)
         });
 
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(nodeName, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
-          CameraGuidance.noteSceneChanged(nodeName);
+          const focusPath = res.commandReply?.node_path || requestedPath;
+          AgentFocusOverlay.focus(focusPath, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
+          CameraGuidance.noteSceneChanged(focusPath);
         }
 
         return liveMutationResult(res, {
           node_path: args.node_path,
-          position: pos,
-          scale
+          resolved_node_path: res.commandReply?.node_path || null,
+          position: res.commandReply?.position || pos,
+          rotation: args.rotation || null,
+          scale: args.scale || null,
+          relative: args.relative === true,
+          serialized_transform: res.commandReply?.transform || null
         });
       }
     },
@@ -5219,31 +5706,14 @@ func _aabb_of(node: Node) -> Array:
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const nodeName = args.node_path.replace(/^.*\//, '');
-        const matSubResId = `Mat_${nodeName}`;
-        const newMatSubRes = generateMaterialSubResource(args, matSubResId);
-
-        const res = await liveMutateSceneFile((source) => {
-          const matHeader = `[sub_resource type="StandardMaterial3D" id="${matSubResId}"]`;
-          let updated = source;
-          const matIdx = updated.indexOf(matHeader);
-          if (matIdx >= 0) {
-            const nextSubResIdx = updated.indexOf('\n[sub_resource ', matIdx + 1);
-            const nextNodeIdx = updated.indexOf('\n[node ', matIdx + 1);
-            let endIdx = updated.length;
-            if (nextSubResIdx > 0 && nextSubResIdx < endIdx) endIdx = nextSubResIdx;
-            if (nextNodeIdx > 0 && nextNodeIdx < endIdx) endIdx = nextNodeIdx;
-            updated = updated.slice(0, matIdx) + newMatSubRes.trimEnd() + updated.slice(endIdx);
-          } else {
-            const firstNodeIdx = updated.indexOf('\n[node name="');
-            if (firstNodeIdx > 0) {
-              updated = updated.slice(0, firstNodeIdx) + '\n' + newMatSubRes + updated.slice(firstNodeIdx);
-            } else {
-              updated = updated + '\n' + newMatSubRes;
-            }
-          }
-          return updated;
-        }, {
+        const requestedPath = args.node_path;
+        const res = await liveMutateSceneFile((source, commandReply) => applyMaterialToSceneText(
+          source,
+          resolvedNodePath(commandReply, requestedPath),
+          // Prefer what the editor actually resolved; fall back to the request when the
+          // command channel is unavailable.
+          materialUpdateFromCommandReply(commandReply) || args
+        ), {
           command: {
             op: 'node_material',
             payload: {
@@ -5251,18 +5721,20 @@ func _aabb_of(node: Node) -> Array:
               metallic: args.metallic, roughness: args.roughness,
               emission: args.emission, emission_energy: args.emission_energy
             }
-          }
+          },
+          verify: (source, reply) => verifyMaterialInSource(source, resolvedNodePath(reply, requestedPath), args)
         });
 
         // A material tweak is not a geometry change: no auto-follow, and the reticle is
         // anchored to the node's real position rather than the origin.
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(nodeName, null, 'StandardMaterial3D', 'MATERIAL');
+          AgentFocusOverlay.focus(res.commandReply?.node_path || requestedPath, null, 'StandardMaterial3D', 'MATERIAL');
         }
 
         return liveMutationResult(res, {
           node_path: args.node_path,
-          material: {
+          resolved_node_path: res.commandReply?.node_path || null,
+          material: res.commandReply?.material || {
             albedo_color: args.albedo_color,
             metallic: args.metallic,
             roughness: args.roughness,
@@ -5287,25 +5759,344 @@ func _aabb_of(node: Node) -> Array:
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const nodeName = args.node_path.replace(/^.*\//, '');
-        const res = await liveMutateSceneFile((source) => {
-          const nodeHeader = `[node name="${nodeName}"`;
-          const nodeIdx = source.indexOf(nodeHeader);
-          if (nodeIdx < 0) throw new Error(`Node '${nodeName}' not found in active scene.`);
-          const nextNodeIdx = source.indexOf('\n[node name="', nodeIdx + 1);
-          const blockEnd = nextNodeIdx > 0 ? nextNodeIdx : source.length;
-          return source.slice(0, nodeIdx) + source.slice(blockEnd);
-        }, { command: { op: 'node_delete', payload: { node_path: args.node_path } } });
+        const requestedPath = args.node_path;
+        const res = await liveMutateSceneFile((source, commandReply) => {
+          const block = findNodeBlock(source, resolvedNodePath(commandReply, requestedPath));
+          if (!block) throw new Error(`Node '${requestedPath}' not found in active scene.`);
+          return source.slice(0, block.start) + source.slice(block.end);
+        }, {
+          command: { op: 'node_delete', payload: { node_path: args.node_path } },
+          verify: (source, reply) => verifyNodePresence(source, resolvedNodePath(reply, requestedPath), false)
+        });
 
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.hide('node_deleted');
           CameraGuidance.noteSceneChanged(null);
         }
 
-        return liveMutationResult(res, { deleted_node: nodeName });
+        return liveMutationResult(res, {
+          deleted_node: res.commandReply?.node_path || requestedPath,
+          resolved_node_path: res.commandReply?.node_path || null
+        });
       }
     }
   ];
+
+  // ==========================================
+  // 7B. Canonical .tscn text mutations
+  // ==========================================
+  // The live path writes to two places: the running editor (through the command channel) and
+  // the in-memory .tscn that export, persistence, and reload all read from. Those were two
+  // separate implementations, and they drifted — a rotation applied in the editor never
+  // reached the saved text, and a recoloured node kept pointing at its old material. Every
+  // mutation now goes through one of the functions below, and when the editor has actually
+  // applied the change its own serialized state is written back verbatim.
+
+  const DEGREES_TO_RADIANS = Math.PI / 180;
+
+  function formatFloat(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '0';
+    // Match Godot's own .tscn style: no exponent, no trailing zero noise.
+    return String(Math.abs(number) < 1e-6 ? 0 : Number(number.toFixed(6)));
+  }
+
+  function formatTransform3D(basis, origin) {
+    return `Transform3D(${[...basis, ...origin].map(formatFloat).join(', ')})`;
+  }
+
+  // Godot composes Euler angles in YXZ order by default (Basis = Ry * Rx * Rz), and the
+  // twelve .tscn floats are the basis *columns* followed by the origin.
+  function basisFromEulerScale(rotationDegrees = [0, 0, 0], scale = [1, 1, 1]) {
+    const [x, y, z] = rotationDegrees.map(value => (Number(value) || 0) * DEGREES_TO_RADIANS);
+    const [sx, cx] = [Math.sin(x), Math.cos(x)];
+    const [sy, cy] = [Math.sin(y), Math.cos(y)];
+    const [sz, cz] = [Math.sin(z), Math.cos(z)];
+    // Rows of Ry * Rx * Rz.
+    const m = [
+      [cy * cz + sy * sx * sz, -cy * sz + sy * sx * cz, sy * cx],
+      [cx * sz, cx * cz, -sx],
+      [-sy * cz + cy * sx * sz, sy * sz + cy * sx * cz, cy * cx]
+    ];
+    const s = [Number(scale[0]) || 0, Number(scale[1]) || 0, Number(scale[2]) || 0];
+    // Emit columns, each scaled by that axis' scale factor.
+    return [
+      m[0][0] * s[0], m[1][0] * s[0], m[2][0] * s[0],
+      m[0][1] * s[1], m[1][1] * s[1], m[2][1] * s[1],
+      m[0][2] * s[2], m[1][2] * s[2], m[2][2] * s[2]
+    ];
+  }
+
+  // Split a basis into its rotation columns and per-axis scale, so a position-only edit can
+  // keep an existing rotation and scale instead of flattening both to identity.
+  function decomposeBasis(basis) {
+    const columns = [basis.slice(0, 3), basis.slice(3, 6), basis.slice(6, 9)];
+    const scale = columns.map(column => Math.hypot(column[0], column[1], column[2]));
+    const rotation = columns.map((column, index) => (scale[index] > 1e-9
+      ? column.map(value => value / scale[index])
+      : [index === 0 ? 1 : 0, index === 1 ? 1 : 0, index === 2 ? 1 : 0]));
+    return { rotation: rotation.flat(), scale };
+  }
+
+  function multiplyBasis(left, right) {
+    const column = (basis, index) => basis.slice(index * 3, index * 3 + 3);
+    const apply = ([x, y, z]) => [
+      left[0] * x + left[3] * y + left[6] * z,
+      left[1] * x + left[4] * y + left[7] * z,
+      left[2] * x + left[5] * y + left[8] * z
+    ];
+    return [...apply(column(right, 0)), ...apply(column(right, 1)), ...apply(column(right, 2))];
+  }
+
+  // Enumerate every [node ...] block with the scene-relative path Godot itself would use.
+  // A `.tscn` may legitimately contain several nodes with the same leaf name under different
+  // parents (BranchA/TwinOrb and BranchB/TwinOrb), so a block can only be identified by path.
+  function enumerateNodeBlocks(source) {
+    const blocks = [];
+    const headerPattern = /^\[node name="([^"]+)"(?:\s+type="([^"]+)")?(?:\s+parent="([^"]+)")?[^\]]*\]/gm;
+    for (const match of source.matchAll(headerPattern)) {
+      const [header, name, type, parent] = match;
+      blocks.push({
+        name,
+        type: type || null,
+        parent: parent || null,
+        nodePath: parent ? (parent === '.' ? name : `${parent}/${name}`) : '.',
+        header,
+        start: match.index
+      });
+    }
+    for (let index = 0; index < blocks.length; index += 1) {
+      // A block ends at the next section header of any kind, so a trailing [connection]
+      // or [editable] block is never swallowed into the last node.
+      const rest = source.slice(blocks[index].start + blocks[index].header.length);
+      const nextSection = rest.search(/\n\[[a-z_]+[\s\]]/);
+      blocks[index].end = nextSection < 0
+        ? source.length
+        : blocks[index].start + blocks[index].header.length + nextSection + 1;
+      blocks[index].text = source.slice(blocks[index].start, blocks[index].end);
+    }
+    return blocks;
+  }
+
+  function normalizeNodePath(nodePath) {
+    return String(nodePath || '').replace(/^\.\//, '').replace(/^res:\/\//, '').replace(/^\/+/, '');
+  }
+
+  // Resolve a requested path to exactly one block. An exact scene-relative path always wins.
+  // A bare leaf name is accepted only when it is unambiguous — editing the wrong one of two
+  // same-named nodes is worse than refusing, and refusing is what the editor channel does too.
+  function findNodeBlock(source, nodePath) {
+    const wanted = normalizeNodePath(nodePath);
+    if (!wanted) return null;
+    const blocks = enumerateNodeBlocks(source);
+    const exact = blocks.find(block => block.nodePath === wanted);
+    if (exact) return exact;
+    const leaf = wanted.replace(/^.*\//, '');
+    const byName = blocks.filter(block => block.name === leaf);
+    if (byName.length === 1) return byName[0];
+    if (byName.length > 1) {
+      const error = new Error(`'${nodePath}' is ambiguous: ${byName.length} nodes are named '${leaf}' (${byName.map(block => block.nodePath).join(', ')}). Pass the full scene-relative path.`);
+      error.code = 'AMBIGUOUS_NODE_PATH';
+      throw error;
+    }
+    return null;
+  }
+
+  function existingTransformOf(blockText) {
+    const match = blockText.match(/transform\s*=\s*Transform3D\(([^)]*)\)/);
+    if (match) {
+      const parsed = transformFromLiteral(parseVectorLiteral(`(${match[1]})`));
+      if (parsed) return parsed;
+    }
+    const position = blockText.match(/^position\s*=\s*Vector3\(([^)]*)\)/m);
+    const origin = position ? parseVectorLiteral(`(${position[1]})`) : [0, 0, 0];
+    return { basis: [1, 0, 0, 0, 1, 0, 0, 0, 1], origin: origin.length >= 3 ? origin.slice(0, 3) : [0, 0, 0] };
+  }
+
+  function writeTransformLine(blockText, header, transformLine) {
+    if (/transform\s*=\s*Transform3D\([^)]*\)/.test(blockText)) {
+      return blockText.replace(/transform\s*=\s*Transform3D\([^)]*\)/, transformLine);
+    }
+    // A node written with `position = Vector3(...)` gets upgraded to a full transform, and
+    // the now-redundant position line is dropped so the two cannot disagree.
+    const withoutPosition = blockText.replace(/^position\s*=\s*Vector3\([^)]*\)\n?/m, '');
+    const headerEnd = withoutPosition.indexOf(']', withoutPosition.indexOf(header)) + 1;
+    return `${withoutPosition.slice(0, headerEnd)}\n${transformLine}${withoutPosition.slice(headerEnd)}`;
+  }
+
+  // `authoritative` is the twelve floats the editor itself reported after applying the
+  // change. When present it wins outright: the text then says exactly what Godot holds.
+  function applyTransformToSceneText(source, nodePath, options = {}) {
+    const block = findNodeBlock(source, nodePath);
+    if (!block) throw new Error(`Node '${nodePath}' not found in active 3D scene.`);
+    let basis;
+    let origin;
+    if (Array.isArray(options.authoritative) && options.authoritative.length >= 12) {
+      basis = options.authoritative.slice(0, 9);
+      origin = options.authoritative.slice(9, 12);
+    } else {
+      const current = existingTransformOf(block.text);
+      const decomposed = decomposeBasis(current.basis);
+      const relative = options.relative === true;
+      const hasPosition = Array.isArray(options.position) && options.position.length >= 3;
+      const hasRotation = Array.isArray(options.rotation) && options.rotation.length >= 3;
+      const hasScale = Array.isArray(options.scale) && options.scale.length >= 3;
+
+      origin = hasPosition
+        ? (relative
+          ? current.origin.map((value, index) => value + Number(options.position[index]))
+          : options.position.slice(0, 3).map(Number))
+        : current.origin.slice(0, 3);
+
+      const scale = hasScale
+        ? (relative
+          ? decomposed.scale.map((value, index) => value * Number(options.scale[index]))
+          : options.scale.slice(0, 3).map(Number))
+        : decomposed.scale;
+
+      if (hasRotation) {
+        const rotationBasis = basisFromEulerScale(options.rotation.slice(0, 3), [1, 1, 1]);
+        const composed = relative ? multiplyBasis(rotationBasis, decomposed.rotation) : rotationBasis;
+        basis = [
+          ...composed.slice(0, 3).map(v => v * scale[0]),
+          ...composed.slice(3, 6).map(v => v * scale[1]),
+          ...composed.slice(6, 9).map(v => v * scale[2])
+        ];
+      } else {
+        // No rotation given: keep the existing orientation rather than flattening it.
+        basis = [
+          ...decomposed.rotation.slice(0, 3).map(v => v * scale[0]),
+          ...decomposed.rotation.slice(3, 6).map(v => v * scale[1]),
+          ...decomposed.rotation.slice(6, 9).map(v => v * scale[2])
+        ];
+      }
+    }
+    const updatedBlock = writeTransformLine(block.text, block.header, `transform = ${formatTransform3D(basis, origin)}`);
+    return source.slice(0, block.start) + updatedBlock + source.slice(block.end);
+  }
+
+  const MATERIAL_SLOT_PATTERN = /^(surface_material_override\/0|material_override)\s*=\s*SubResource\("([^"]+)"\)/m;
+
+  function materialSlotOf(blockText) {
+    const match = blockText.match(MATERIAL_SLOT_PATTERN);
+    return match ? { property: match[1], id: match[2] } : null;
+  }
+
+  function readMaterialSubResource(source, id) {
+    const header = `[sub_resource type="StandardMaterial3D" id="${id}"]`;
+    const start = source.indexOf(header);
+    if (start < 0) return null;
+    let end = source.length;
+    for (const marker of ['\n[sub_resource ', '\n[node ', '\n[connection ']) {
+      const index = source.indexOf(marker, start + 1);
+      if (index > 0 && index < end) end = index;
+    }
+    const body = source.slice(start + header.length, end);
+    const properties = {};
+    for (const line of body.split('\n')) {
+      const match = line.match(/^\s*([A-Za-z0-9_/]+)\s*=\s*(.+?)\s*$/);
+      if (match) properties[match[1]] = match[2];
+    }
+    return { start, end, properties };
+  }
+
+  // Merge rather than replace: recolouring a node must not silently erase its emission.
+  function mergeMaterialProperties(existing = {}, update = {}) {
+    const merged = { ...existing };
+    if (update.albedo_color !== undefined) merged.albedo_color = parseColor(update.albedo_color);
+    if (typeof update.metallic === 'number') merged.metallic = String(update.metallic);
+    if (typeof update.roughness === 'number') merged.roughness = String(update.roughness);
+    if (update.emission !== undefined) {
+      merged.emission_enabled = 'true';
+      merged.emission = parseColor(update.emission);
+    }
+    if (typeof update.emission_energy === 'number') {
+      merged.emission_enabled = 'true';
+      merged.emission_energy_multiplier = String(update.emission_energy);
+    }
+    return merged;
+  }
+
+  function renderMaterialSubResource(id, properties) {
+    const order = ['albedo_color', 'metallic', 'roughness', 'emission_enabled', 'emission', 'emission_energy_multiplier'];
+    const keys = [...order.filter(key => key in properties), ...Object.keys(properties).filter(key => !order.includes(key))];
+    return [`[sub_resource type="StandardMaterial3D" id="${id}"]`, ...keys.map(key => `${key} = ${properties[key]}`)].join('\n') + '\n';
+  }
+
+  // The old implementation always wrote a fresh `Mat_<node>` sub-resource and never pointed
+  // the node at it, so a live recolour vanished on reload while the node kept referencing its
+  // original material. Mutate the material the node actually uses; only mint a new one when
+  // the node has no override, and then wire the reference up in the same edit.
+  // How many nodes in the scene point at this material sub-resource.
+  function materialReferenceCount(source, id) {
+    return enumerateNodeBlocks(source).filter(block => materialSlotOf(block.text)?.id === id).length;
+  }
+
+  function uniqueMaterialId(source, nodePath) {
+    const base = `Mat_${String(nodePath).replace(/[^A-Za-z0-9_]/g, '_')}`;
+    if (!source.includes(`id="${base}"`)) return base;
+    let suffix = 2;
+    while (source.includes(`id="${base}_${suffix}"`)) suffix += 1;
+    return `${base}_${suffix}`;
+  }
+
+  // Recolouring one node must not repaint every node that happens to share its material.
+  // Godot's own editor copy-on-writes here (set_surface_override_material assigns a duplicate
+  // to that node alone), so the serialized scene has to do the same: when the referenced
+  // material is shared, fork it, apply the change to the fork, and repoint only this node.
+  // Mutating the shared resource in place is how recolouring one comet turned both green.
+  // Godot reports its post-apply material as bare-hex colours and floats. Converting that
+  // into the same shape the request uses lets the .tscn be written from the editor's resolved
+  // state, the way transforms already are, instead of from the request alone.
+  function materialUpdateFromCommandReply(reply) {
+    const resolved = reply?.material;
+    if (!resolved || typeof resolved !== 'object') return null;
+    const update = {};
+    if (typeof resolved.albedo_color === 'string') update.albedo_color = resolved.albedo_color;
+    if (typeof resolved.metallic === 'number') update.metallic = resolved.metallic;
+    if (typeof resolved.roughness === 'number') update.roughness = resolved.roughness;
+    if (resolved.emission_enabled === true) {
+      if (typeof resolved.emission === 'string') update.emission = resolved.emission;
+      if (typeof resolved.emission_energy === 'number') update.emission_energy = resolved.emission_energy;
+    }
+    return Object.keys(update).length > 0 ? update : null;
+  }
+
+  function applyMaterialToSceneText(source, nodePath, material = {}) {
+    const block = findNodeBlock(source, nodePath);
+    if (!block) throw new Error(`Node '${nodePath}' not found in active 3D scene.`);
+    const slot = materialSlotOf(block.text);
+    const shared = Boolean(slot) && materialReferenceCount(source, slot.id) > 1;
+    const inherited = slot ? readMaterialSubResource(source, slot.id)?.properties : undefined;
+    const targetId = slot && !shared ? slot.id : uniqueMaterialId(source, block.nodePath);
+    const existing = shared ? null : (slot ? readMaterialSubResource(source, targetId) : null);
+    // A fork starts from the shared material's values so only the requested fields change.
+    const rendered = renderMaterialSubResource(targetId, mergeMaterialProperties(existing?.properties ?? (shared ? inherited : undefined), material));
+
+    let updated;
+    if (existing) {
+      updated = source.slice(0, existing.start) + rendered.trimEnd() + source.slice(existing.end);
+    } else {
+      const firstNode = source.indexOf('\n[node name="');
+      updated = firstNode > 0
+        ? source.slice(0, firstNode) + '\n' + rendered + source.slice(firstNode)
+        : source + '\n' + rendered;
+    }
+
+    // Wire the reference when the node had none, or when we forked a shared material.
+    if (!slot || shared) {
+      const refreshed = findNodeBlock(updated, block.nodePath);
+      if (!refreshed) throw new Error(`Node '${nodePath}' disappeared while assigning its material.`);
+      const wired = slot
+        ? refreshed.text.replace(MATERIAL_SLOT_PATTERN, `${slot.property} = SubResource("${targetId}")`)
+        : (() => {
+          const headerEnd = refreshed.text.indexOf(']') + 1;
+          return `${refreshed.text.slice(0, headerEnd)}\nsurface_material_override/0 = SubResource("${targetId}")${refreshed.text.slice(headerEnd)}`;
+        })();
+      updated = updated.slice(0, refreshed.start) + wired + updated.slice(refreshed.end);
+    }
+    return updated;
+  }
 
   // ==========================================
   // 7. Fail-Closed Manifest Startup Verification
@@ -5483,6 +6274,24 @@ func _aabb_of(node: Node) -> Array:
     }
   };
 
+  // One "Complete" hid three different outcomes. Spell out which stage was actually reached:
+  // the editor applying a command is not the same as the scene source matching it, and
+  // neither is the same as a camera we watched move.
+  function describeOutcome(result) {
+    if (!result || typeof result !== 'object') return '';
+    const parts = [];
+    if (result.scene_revision) parts.push(`Rev #${result.scene_revision}`);
+    if (result.editor_channel === 'command') parts.push('applied live');
+    else if (result.editor_restarted) parts.push('applied via restart');
+    if (result.source_synced) parts.push(result.source_authoritative ? 'source from editor' : 'source written');
+    if (result.status === 'framed') parts.push(result.target_reached ? 'camera framed' : 'camera moved');
+    if (result.status === 'dispatched_unconfirmed') parts.push('camera unconfirmed');
+    if (result.status === 'yielded') parts.push('yielded to you');
+    if (result.status === 'overlay_only') parts.push('overlay only');
+    if (parts.length === 0 && result.success === true) parts.push('Complete');
+    return parts.join(' · ');
+  }
+
   let activeWebSocketRelay = null;
 
   async function executeObservedTool(tool, input = {}) {
@@ -5533,8 +6342,7 @@ func _aabb_of(node: Node) -> Array:
         AgentObservationHUD.update('pending', tool.definition.name, input, `Operation ${result.operation_id}`, observation.id);
         return result;
       }
-      const detail = result?.scene_revision ? `Rev #${result.scene_revision}` : result?.success === true ? 'Complete' : '';
-      AgentObservationHUD.update('succeeded', tool.definition.name, input, detail, observation.id);
+      AgentObservationHUD.update('succeeded', tool.definition.name, input, describeOutcome(result), observation.id);
       return result;
     } catch (error) {
       AgentObservationHUD.update('failed', tool.definition.name, input, error instanceof Error ? error.message : String(error), observation.id);
@@ -5656,6 +6464,11 @@ func _aabb_of(node: Node) -> Array:
       if (this.animation !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(this.animation);
       this.animation = null;
       this.current = null;
+      // A note like `SentinelRight · framed` must not linger in the rail after the reticle it
+      // describes is gone — least of all through a playtest.
+      if (reason !== 'unresolved_target' && reason !== 'no_camera_pose' && reason !== 'canvas_not_laid_out') {
+        AgentStatusRail.setFocusNote('');
+      }
       if (publishState) this.publish({ mode: 'hidden', reason });
     },
 
@@ -5679,6 +6492,11 @@ func _aabb_of(node: Node) -> Array:
 
     focus(nodeName, pos = null, type = 'Node3D', action = 'SPAWNED') {
       if (!this.ensure()) return { mode: 'hidden', reason: 'no_document' };
+      if (!editorSurfaceLive()) {
+        // Neither the editor nor the playtest is on screen; there is nothing to point at.
+        this.hide('editor_surface_gone');
+        return { mode: 'hidden', reason: 'editor_surface_gone' };
+      }
       const surface = resolveGodotCanvas('auto');
       const target = this.resolveTarget(nodeName, pos);
       if (!surface || !target.worldPosition) {
@@ -5798,7 +6616,10 @@ func _aabb_of(node: Node) -> Array:
         world_position: target.worldPosition
       };
       this.publish(state);
-      AgentStatusRail.setFocusNote(`${nodeName} · framed`);
+      // "framed" would overstate this: the reticle being anchored to the node says where the
+      // node is on screen, not that the camera moved to it. Camera motion is reported
+      // separately, and only when measured.
+      AgentStatusRail.setFocusNote(`${nodeName} · on screen`);
       return state;
     },
 
@@ -5860,6 +6681,7 @@ func _aabb_of(node: Node) -> Array:
   const USER_INPUT_COOLDOWN_MILLISECONDS = 750;
   const MAX_GUIDANCE_FRAMES = 8;
   const CAMERA_AUTO_FOLLOW_PREFERENCE_KEY = 'godot-webmcp.auto-follow';
+  const AUTO_FOLLOW_DEBOUNCE_MILLISECONDS = 180;
 
   function nextFrame(timeoutMs = 64) {
     return new Promise((resolve) => {
@@ -5877,7 +6699,7 @@ func _aabb_of(node: Node) -> Array:
   const CameraGuidance = {
     lastInteractionAt: Number.NEGATIVE_INFINITY,
     pending: null,
-    queued: false,
+    followTimer: null,
     lastGeometrySignature: null,
     installed: false,
 
@@ -5893,8 +6715,13 @@ func _aabb_of(node: Node) -> Array:
       try {
         sessionStorage?.setItem(CAMERA_AUTO_FOLLOW_PREFERENCE_KEY, enabled ? 'on' : 'off');
       } catch (_) {}
-      if (enabled) this.lastInteractionAt = Number.NEGATIVE_INFINITY;
-      else this.pending = null;
+      if (enabled) {
+        this.lastInteractionAt = Number.NEGATIVE_INFINITY;
+      } else {
+        this.pending = null;
+        if (this.followTimer !== null) clearTimeout(this.followTimer);
+        this.followTimer = null;
+      }
       CameraControls.render();
       return this.autoFollowEnabled();
     },
@@ -5928,8 +6755,40 @@ func _aabb_of(node: Node) -> Array:
     },
 
     // Drives Godot's own damped fly-to via selection + `spatial_editor/focus_selection`,
-    // then polls the viewport pose for a bounded number of frames so the reticle tracks the
-    // camera while Godot eases it.
+    // then polls the viewport pose to find out whether the camera actually moved.
+    //
+    // The previous version waited a few frames and then returned `camera_moved: true,
+    // target_reached: true` unconditionally, so a camera that never budged still reported
+    // success. Dispatching a shortcut is not evidence that Godot acted on it. Three facts are
+    // now reported separately: `dispatched` is what we did, `camera_moved` is what we
+    // measured, and `target_reached` additionally requires the node to project inside the
+    // frame afterwards.
+    poseDelta(before, after) {
+      if (!before || !after) return Infinity;
+      const positionDelta = Math.hypot(
+        after.position[0] - before.position[0],
+        after.position[1] - before.position[1],
+        after.position[2] - before.position[2]);
+      const basisDelta = before.basis.reduce((total, value, index) => total + Math.abs(value - after.basis[index]), 0);
+      return positionDelta + basisDelta;
+    },
+
+    readPose() {
+      const reply = EditorCommandChannel.call('camera_pose');
+      return reply.ok ? { position: reply.position, basis: reply.basis, fov: reply.fov } : null;
+    },
+
+    // Did the framing actually put the node on screen? Answered by projecting it, not assumed.
+    targetFramed(node) {
+      const surface = resolveGodotCanvas('editor');
+      const pose = editorViewportCameraPose();
+      if (!surface || !pose || !node?.world_position) return null;
+      const rect = surface.canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return null;
+      const projection = projectWorldPoint(node.world_position, pose, rect);
+      return projection ? projection.onScreen : null;
+    },
+
     async guide({ nodeName, reason = 'explicit' }) {
       this.install();
       if (this.withinCooldown()) return this.yieldedToUser();
@@ -5940,25 +6799,40 @@ func _aabb_of(node: Node) -> Array:
       }
 
       const overlayState = AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
+      const base = {
+        transient: true,
+        node_path: node.node_path,
+        scene_revision: DiagnosticState.sceneRevision,
+        overlay: overlayState
+      };
+
+      const before = this.readPose();
       // Select, let Node3DEditor's deferred selection handling run, then dispatch the
       // framing shortcut. Sending both in one frame frames an empty selection.
       const selected = EditorCommandChannel.call('select', { node_path: node.node_path });
-      let reply = selected;
-      if (selected.ok) {
-        await nextFrame();
-        await nextFrame();
-        reply = EditorCommandChannel.call('focus_dispatch');
-      }
-      if (!reply.ok) {
+      if (!selected.ok) {
         return {
+          ...base,
           status: 'overlay_only',
-          reason: reply.unsupported ? 'command_channel_unavailable' : 'focus_rejected',
-          error: reply.error,
+          reason: selected.unsupported ? 'command_channel_unavailable' : 'select_rejected',
+          error: selected.error,
+          dispatched: false,
           camera_moved: false,
-          target_reached: false,
-          transient: true,
-          overlay: overlayState,
-          scene_revision: DiagnosticState.sceneRevision
+          target_reached: false
+        };
+      }
+      await nextFrame();
+      await nextFrame();
+      const dispatch = EditorCommandChannel.call('focus_dispatch');
+      if (!dispatch.ok) {
+        return {
+          ...base,
+          status: 'overlay_only',
+          reason: dispatch.unsupported ? 'command_channel_unavailable' : 'focus_rejected',
+          error: dispatch.error,
+          dispatched: false,
+          camera_moved: false,
+          target_reached: false
         };
       }
 
@@ -5966,37 +6840,60 @@ func _aabb_of(node: Node) -> Array:
         && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
       const frames = reduced ? 1 : MAX_GUIDANCE_FRAMES;
       let framesPresented = 0;
+      let moved = false;
+      let after = before;
       for (let frame = 0; frame < frames; frame += 1) {
         await nextFrame();
         if (EditorCommandChannel.generation !== generation) {
-          return { status: 'stale', reason: 'editor_restarted', transient: true, frames_presented: framesPresented };
+          return { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
         }
         if (this.withinCooldown()) return this.yieldedToUser();
         AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
         framesPresented += 1;
+        after = this.readPose() || after;
+        if (this.poseDelta(before, after) > 0.001) moved = true;
+      }
+
+      const framed = moved ? this.targetFramed(findSceneNode(activeFilesDict, nodeName)) : null;
+      if (!moved) {
+        // The shortcut went out and the editor did not move the camera. Say exactly that.
+        return {
+          ...base,
+          status: 'dispatched_unconfirmed',
+          reason: 'camera_pose_unchanged',
+          mechanism: dispatch.mechanism || 'spatial_editor/focus_selection',
+          dispatched: true,
+          camera_moved: false,
+          target_reached: false,
+          frames_presented: framesPresented,
+          selection_count: dispatch.selection_count ?? null,
+          note: 'The framing shortcut was delivered and the node is selected, but the viewport camera pose did not change. Godot only advances its camera interpolation while the editor is rendering, so a backgrounded or throttled tab will report this.'
+        };
       }
       return {
+        ...base,
         status: 'framed',
         reason,
+        mechanism: dispatch.mechanism || 'spatial_editor/focus_selection',
+        dispatched: true,
         camera_moved: true,
-        target_reached: true,
-        transient: true,
-        frames_presented: framesPresented,
-        mechanism: reply.mechanism || 'spatial_editor/focus_selection',
-        node_path: node.node_path,
-        scene_revision: DiagnosticState.sceneRevision,
-        overlay: overlayState
+        // null when the projection could not be evaluated — never silently true.
+        target_reached: framed === true,
+        target_framing_verified: framed !== null,
+        frames_presented: framesPresented
       };
     },
 
-    // One pending follow at a time: a burst of spawns collapses to a single camera move.
+    // One pending follow at a time, coalesced over a real time window. A microtask was too
+    // narrow: agents call tools sequentially with an await between each, so every spawn in a
+    // burst landed in its own microtask and got its own camera move. A newer target simply
+    // replaces the pending one.
     queueFollow(nodeName, reason = 'geometry_change') {
       if (!this.autoFollowEnabled()) return;
       this.pending = { nodeName, reason };
-      if (this.queued) return;
-      this.queued = true;
-      Promise.resolve().then(async () => {
-        this.queued = false;
+      if (this.followTimer !== null) clearTimeout(this.followTimer);
+      this.followTimer = setTimeout(async () => {
+        this.followTimer = null;
         const request = this.pending;
         this.pending = null;
         if (!request || !this.autoFollowEnabled()) return;
@@ -6005,7 +6902,7 @@ func _aabb_of(node: Node) -> Array:
         } catch (_) {
           // Auto-follow is best-effort; it must never fail an accepted scene mutation.
         }
-      });
+      }, AUTO_FOLLOW_DEBOUNCE_MILLISECONDS);
     },
 
     // Geometry only. A material tweak must not yank the camera.
@@ -6140,12 +7037,21 @@ func _aabb_of(node: Node) -> Array:
     applyLayout() {
       if (!this.root) return;
       const narrow = isNarrowRail();
-      for (const [id, hideWhenNarrow] of [['webmcp-camera-slot', true], ['webmcp-status-slot', false], ['webmcp-inspector-slot', true]]) {
+      // The camera presets and scene inspector are editor-only affordances, and the playtest
+      // canvas is full-bleed: during a playtest the rail shrinks to the status strip alone so
+      // it covers as little of the game as possible.
+      const playtesting = activeGodotViewport() === 'game';
+      for (const [id, secondary] of [['webmcp-camera-slot', true], ['webmcp-status-slot', false], ['webmcp-inspector-slot', true]]) {
         const slot = document.getElementById(id);
-        if (slot) slot.style.display = narrow && hideWhenNarrow ? 'none' : 'flex';
+        if (slot) slot.style.display = secondary && (narrow || playtesting) ? 'none' : 'flex';
       }
+      this.root.style.padding = playtesting ? '4px 10px' : '8px 10px';
       const strip = document.getElementById('webmcp-agent-status-strip');
-      if (strip) strip.style.maxWidth = narrow ? 'calc(100vw - 20px)' : 'min(620px, calc(100vw - 32px))';
+      if (strip) {
+        strip.style.maxWidth = narrow || playtesting ? 'calc(100vw - 20px)' : 'min(620px, calc(100vw - 32px))';
+        strip.style.opacity = playtesting ? '0.82' : '1';
+        if (playtesting) AgentStatusRail.expanded = false;
+      }
     },
 
     slot(id, alignment) {
@@ -6456,6 +7362,13 @@ func _aabb_of(node: Node) -> Array:
       window.__godotWebMcpPageUnloading = true;
     });
 
+    for (const event of ['godot-game-launched', 'godot-game-stopped', 'godot-preview-left']) {
+      window.addEventListener(event, () => {
+        AgentRail.applyLayout();
+        AgentStatusRail.render();
+      });
+    }
+
     window.addEventListener('godot-game-stopped', () => {
       // A deliberate close should return to the editor. A page reload, however,
       // keeps the preview intent so the host can rebuild the Game canvas.
@@ -6474,6 +7387,18 @@ func _aabb_of(node: Node) -> Array:
         DiagnosticHUD.render();
       }
     });
+
+    // index.html swaps tabs by writing inline display styles and dispatches no event, so the
+    // only way to notice the editor exiting to the Loader is to watch those styles.
+    const surfaceObserver = new MutationObserver(() => {
+      noteEditorSurfaceGone();
+      AgentRail.applyLayout();
+      AgentStatusRail.render();
+    });
+    for (const id of ['tab-loader', 'tab-editor', 'tab-game']) {
+      const element = document.getElementById(id);
+      if (element) surfaceObserver.observe(element, { attributes: true, attributeFilter: ['style'] });
+    }
 
     const readinessObserver = new MutationObserver(() => {
       const previousState = DiagnosticState.engine;

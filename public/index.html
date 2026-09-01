@@ -560,6 +560,44 @@ function closeWelcomeModal(dontShowAgain) { // eslint-disable-line no-unused-var
 		<script src="godot.editor.js"></script>
 		<script>
 let editor = null;
+
+// The editor and the playtest are two SEPARATE Engine instances, each with its own
+// in-memory filesystem. Copying files into the editor engine therefore proves nothing about
+// what the game will load: doing only that reported success while the playtest still
+// rendered the pre-edit scene. Files must be copied into the *game* engine, after its
+// `init()` and before its `start()`, and the game side must acknowledge what it received.
+function copyFilesIntoEngine(engine, files, projectName) {
+	if (!engine || typeof engine.copyToFS !== 'function') {
+		return { ok: false, error: 'That Godot engine instance is not initialized; cannot copy files.' };
+	}
+	const encoder = new TextEncoder();
+	const written = [];
+	const failed = [];
+	for (const [relPath, content] of Object.entries(files || {})) {
+		const cleanPath = String(relPath).replace(/^\/+/, '');
+		const fullPath = '/home/web_user/projects/' + projectName + '/' + cleanPath;
+		const bytes = typeof content === 'string' ? encoder.encode(content) : new Uint8Array(content);
+		try {
+			engine.copyToFS(fullPath, bytes.buffer);
+			written.push(cleanPath);
+		} catch (error) {
+			failed.push({ path: cleanPath, error: error && error.message ? error.message : String(error) });
+		}
+	}
+	return { ok: failed.length === 0, written: written.length, failed };
+}
+
+// Copy into the live editor engine. Useful for keeping the editor's on-disk view current,
+// but explicitly NOT proof that a playtest will see the revision — see the handshake below.
+window.__godotCopyToEditorFS = function (files, projectName) {
+	return copyFilesIntoEngine(editor, files, projectName);
+};
+
+// The bridge stages the authoritative snapshot here before asking for a playtest. The game
+// engine copies it in during its own boot and publishes an acknowledgement carrying the
+// revision it actually received, which `godot_run_game` waits for.
+window.__godotStagedProject = null;
+window.__godotGameFsAck = null;
 let game = null;
 let setStatusMode;
 let setStatusNotice;
@@ -851,8 +889,27 @@ function startEditor(zip, customArgs) {
 			console.log('[Runtime lifecycle] initializing');
 			game = new Engine(gameConfig);
 			showTab('game');
+			window.__godotGameFsAck = null;
 			game.init().then(function () {
 				console.log('[Runtime lifecycle] initialized');
+				// The decisive step: stage the authoritative files into THIS engine's own
+				// filesystem before it starts, then acknowledge the revision received. Without
+				// this the game boots whatever its instance happened to mount.
+				const staged = window.__godotStagedProject;
+				if (staged && staged.files) {
+					const copied = copyFilesIntoEngine(game, staged.files, staged.projectName);
+					window.__godotGameFsAck = {
+						ok: copied.ok,
+						revision: staged.revision,
+						written: copied.written || 0,
+						failed: copied.failed || [],
+						error: copied.error || null,
+						at: Date.now()
+					};
+					console.log('[Runtime lifecycle] staged revision ' + staged.revision + ' into the game engine: ' + JSON.stringify(window.__godotGameFsAck));
+				} else {
+					window.__godotGameFsAck = { ok: false, revision: null, written: 0, failed: [], error: 'No project snapshot was staged for the playtest.', at: Date.now() };
+				}
 				let launchStarted = false;
 				const launchGame = function () {
 					if (launchStarted || !game) return;

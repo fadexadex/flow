@@ -407,7 +407,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_camera_focus',
-    description: "Transient viewport-only framing: selects a node and dispatches Godot's own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node's projected screen position. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload.",
+    description: "Transient viewport-only framing: selects a node, dispatches Godot's own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node's projected screen position. Reports what it measured, not what it attempted: status is 'framed' only when the viewport pose actually changed, 'dispatched_unconfirmed' when the shortcut was delivered but the camera did not move (Godot only advances camera interpolation while rendering, so a backgrounded tab reports this), 'overlay_only' without the editor plugin, or 'yielded' during the 750 ms cooldown after user input. target_reached additionally requires the node to project inside the frame. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload.",
     input_schema: {
       type: 'object',
       properties: { node_path: { type: 'string', description: 'Node name or scene-relative path to frame' } },

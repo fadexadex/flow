@@ -10,12 +10,44 @@ A browser-hosted Godot 4 editor (WASM/WebGL build in `public/godot.editor.*`) in
 
 ```bash
 npm install
-npm test              # verify_catalog_parity.mjs + operation_state_machine.test.mjs (node --test)
+npm test               # catalog parity + 4 node --test suites (41 tests)
 npm run verify:catalog # catalog parity check only
+npm run verify:plugin  # re-embed public/addons/webmcp/plugin.gd and check it matches
 node server.mjs        # run the local Express + WebSocket server on :8060 (set PORT to override)
 ```
 
-There is no build step — `public/` is served as-is. `npm test` is the only automated check; there is no lint config and no browser test runner wired into `npm test` (the `test/*.mjs` scripts outside `operation_state_machine.test.mjs` are ad hoc Puppeteer inspection/capture scripts run manually with `node test/<name>.mjs`, not part of CI).
+There is no build step — `public/` is served as-is. There is no lint config. `npm test` runs
+`verify_catalog_parity.mjs` plus four `node --test` suites:
+
+| Suite | Covers |
+|---|---|
+| `test/operation_state_machine.test.mjs` | fingerprints, idempotency, managed-operation phases |
+| `test/scene_projection.test.mjs` | `.tscn` parsing, world transforms, AABBs, world→screen projection |
+| `test/scene_roundtrip.test.mjs` | mutate-then-reparse: transforms, materials, duplicate leaf paths, shared-material forking, and the `source_synced` verifiers |
+| `test/plugin_source_parity.test.mjs` | embedded vs on-disk plugin source, op coverage, project.godot patching |
+
+**Reading a result honestly.** A live mutation reports four independent facts; do not collapse
+them. `applied` is `editor_command` or `editor_restart`. `source_synced` is the answer to
+re-reading the written `.tscn` and comparing every requested property — `true`, `false` with a
+`source_mismatch`, or **`null`** meaning it could not be checked, which is not the same as
+passing. `source_authoritative` says the text came from Godot's own serialized state (its
+twelve transform floats, or its resolved material values) rather than the bridge recomputing
+it. `persisted` says the snapshot reached IndexedDB at that revision.
+
+**The persistence invariant, stated precisely.** Mutations are two-phase: build the candidate,
+apply it to the editor, **persist the candidate**, then publish `activeFilesDict` and
+`sceneRevision`. A failed fallback restart rolls both back and publishes nothing. It is *not*
+claimed that revision and persistence can never disagree — storage can still fail after the
+editor has already applied the edit. When that happens the session becomes
+`dirty_unpersisted` and `godot_get_session_status` reports `persisted_revision` alongside
+`scene_revision` plus an `unpersisted` flag, so the gap is visible rather than silent.
+
+**What `npm test` still does not prove.** Everything below is browser-only and is verified by
+hand, or by the `webmcp-verifier` subagent against a running page — never assume a green
+`npm test` covers it: a real Godot WASM boot, `JavaScriptBridge` command execution, UndoRedo
+behaviour, the zero-restart claim, actual camera movement, MediaRecorder capture, and
+IndexedDB reload persistence. The `test/*.mjs` files outside the four suites above are ad hoc
+Puppeteer inspection scripts run manually with `node test/<name>.mjs`.
 
 ### Running a single test
 
@@ -95,6 +127,13 @@ Mutating tools accept an `idempotency_key`; results are cached in `idempotentMut
 
 - A tool that is not wired to a real editor acknowledgement must throw `EDITOR_COMMAND_UNSUPPORTED`, not fake success. `godot_connect_signal_live`, `godot_resize_gizmo_live`, `godot_live_code_diff`, `godot_hot_reload_property`, and `godot_switch_mode` are still stubs on purpose.
 - Never report a latency you did not measure, and never claim `live_streamed` for a path that restarted the editor.
+- Never report an outcome you did not observe. `godot_camera_focus` dispatches a shortcut; whether Godot *moved* is a separate measurement, which is why `status: 'framed'` requires a real pose delta and `dispatched_unconfirmed` exists. Results separate `applied` (the editor took the command), `source_synced` (the `.tscn` matches), and `source_authoritative` (that text came from Godot's own serialized state).
+- **The editor and the playtest are two separate `Engine` instances with two separate filesystems.** `index.html` creates `editor = new Engine(editorConfig)` and, on playtest, `game = new Engine(gameConfig)`. Copying files into the editor engine tells you *nothing* about what the game will load — doing only that reported `source_synced_to_disk: true` while the playtest still rendered the pre-edit scene. `godot_run_game` stages the snapshot on `window.__godotStagedProject`, the game engine copies it into its own FS between `init()` and `start()`, and publishes `window.__godotGameFsAck` carrying the revision it received. The tool waits for that ack and **throws `PLAYTEST_REVISION_UNCONFIRMED`** if it is missing, failed, or for a different revision. `editor_fs_copy_succeeded` is reported separately and is deliberately the weaker claim.
+- **A `FATAL:` log line is never tolerable noise.** It comes from `CRASH_BAD_INDEX` → `GENERATE_TRAP()`, an unconditional abort, so the runtime does not survive it and everything reported afterwards is suspect. `fatalGodotErrors()` is checked by `validateProjectRuntimeBoot`, which fails the authoring operation with `ENGINE_FATAL` and rolls back. Log entries are tagged with the editor boot generation, so teardown noise (RID/ObjectDB/WebGL leaks from a previous process) is separable from the current session's errors — see `currentGenerationErrors()`.
+- **Never call `EditorInterface.save_scene()` (or `save_scene_as`) inline from a command-channel op.** `JavaScriptBridge` callbacks run *synchronously* on whatever JS stack invoked them — `JavaScriptObjectImpl::callback` calls `_callback` directly on the main thread with no `call_deferred` — so plugin code executes at an arbitrary point in the frame. `save_scene()` routes through `EditorNode::_save_scene_with_preview`, which reads back the live 3D viewport texture; called re-entrantly it aborted the whole WASM runtime with `FATAL: Index p_index = -1 is out of bounds (size() = 0)`. That is `CRASH_BAD_INDEX` → `GENERATE_TRAP()`, an unconditional abort, not a recoverable error — nothing survives it, and later calls fail with `Engine must be inited`. `UndoRedo.commit_action()` already applies the edit to the live tree; the bridge serializes the `.tscn` itself and pushes it to the virtual filesystem with `window.__godotSyncToFS` before a playtest. The plugin's `save_scene` op exists but is explicit, guarded, deferred, and uses `save_scene_as(path, false)` to skip the preview branch.
+- **A node is identified by its scene-relative path, never by its leaf name.** A `.tscn` may hold `BranchA/TwinOrb` and `BranchB/TwinOrb`. Stripping the path and taking the first match edited the wrong node while the editor edited the right one, so a reload swapped which object had moved. `findNodeBlock`/`findSceneNode` resolve an exact path first and accept a bare leaf only when unique; ambiguity throws `AMBIGUOUS_NODE_PATH` listing the candidates, and the plugin refuses the same way. Handlers pass `commandReply.node_path` — the path the *editor* resolved — into the text mutation, so both sides agree by construction.
+- **Material edits are copy-on-write.** Several nodes may reference one sub-resource. Mutating it in place recoloured every node using it. `applyMaterialToSceneText` forks a shared material (inheriting its values), repoints only the target node, and mutates in place only when the material is private.
+- **What the human sees must be what survives reload.** Live mutations write to two places — the running editor and the in-memory `.tscn`. Route every text edit through `applyTransformToSceneText` / `applyMaterialToSceneText`, and when the command channel applied the change, write back the transform Godot itself reported instead of recomputing one. Two independent implementations of the same mutation is exactly how a rotation ended up in the editor but not in the saved scene, and how a recoloured node kept pointing at its old material. `test/scene_roundtrip.test.mjs` is the regression net for that whole bug class.
 - The scene inspector renders only what `sceneGraphFromFiles` actually parsed. Do not infer gameplay semantics from filename substrings.
 - `#game-canvas` is a static element in `index.html` and always exists, so `getElementById('game-canvas') || getElementById('editor-canvas')` can never reach the editor. Route through `resolveGodotCanvas(target)`, which follows the visible tab.
 - The canvas is destroyed and recreated by `replaceCanvas` on every engine exit — never cache the element, and re-query after each `godot-engine-ready`.
@@ -102,4 +141,4 @@ Mutating tools accept an `idempotency_key`; results are cached in `idempotentMut
 
 ## Verification harness
 
-Because most browsers (including the in-app browser used by this project's agent tooling) don't implement native WebMCP, `test/webmcp-harness.md` documents a dependency-free polyfill (`test/webmcp-polyfill.js`) that installs a spec-shaped `document.modelContext`/`navigator.modelContext` surface so a cheap model can still drive the `godot_*` tools via `javascript_tool`. The `webmcp-verifier` subagent (`.claude/agents/webmcp-verifier.md`, runs on `model: haiku`) bootstraps this polyfill against a live page and executes one of the numbered checklists in `test/checklists/` (`catalog.md`, `boot.md`, `camera.md`, `restarts.md`), reporting only observed PASS/FAIL/NOT_IMPLEMENTED facts — never fixes anything itself. Use it for cheap, repeatable, read-only regression passes against the tool catalog, boot sequence, camera-focus HUD, and live-mutator restart behavior.
+Because most browsers (including the in-app browser used by this project's agent tooling) don't implement native WebMCP, `test/webmcp-harness.md` documents a dependency-free polyfill (`test/webmcp-polyfill.js`) that installs a spec-shaped `document.modelContext`/`navigator.modelContext` surface so a cheap model can still drive the `godot_*` tools via `javascript_tool`. The `webmcp-verifier` subagent (`.claude/agents/webmcp-verifier.md`, runs on `model: haiku`) bootstraps this polyfill against a live page and executes one of the numbered checklists in `test/checklists/` (`catalog.md`, `boot.md`, `camera.md`, `restarts.md`, `persistence.md`), reporting only observed PASS/FAIL/NOT_IMPLEMENTED facts — never fixes anything itself. Use it for cheap, repeatable, read-only regression passes against the tool catalog, boot sequence, camera-focus HUD, and live-mutator restart behavior.
