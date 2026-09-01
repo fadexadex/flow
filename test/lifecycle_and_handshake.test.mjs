@@ -119,19 +119,22 @@ test('7. a boot timeout leaves the engine initializing, which is a HARD barrier 
   assert.ok(plan.waitMs >= 20000, 'an initializing engine gets the long wait');
 });
 
-test('8. a running editor is replaced after a bounded wait, not blocked forever', () => {
-  // The host chains a replacement onto the canvas by design, and this editor does not always
-  // honour requestQuit(). Treating `running` as a hard barrier stopped every restart: a file
-  // transaction failed with EDITOR_EXIT_TIMEOUT after 25s while the editor sat in `quitting`.
-  const running = editorReplacementPlan('running');
-  assert.equal(running.mustAwaitExit, true);
-  assert.equal(running.requestQuit, true);
-  assert.equal(running.exitRequired, false, 'a running engine must not block the replacement indefinitely');
-  assert.ok(running.waitMs > 0 && running.waitMs < 20000, 'a running engine gets the short, bounded wait');
-
-  const quitting = editorReplacementPlan('quitting');
-  assert.equal(quitting.requestQuit, false, 'a quitting engine must not be asked to quit twice');
-  assert.equal(quitting.exitRequired, false);
+test('8. no same-page takeover without a confirmed exit, in ANY non-terminal state', () => {
+  // The barrier was defeated by being asymmetric: the original path refused for
+  // `initializing`, then rollback arrived while the engine read `quitting` — a state that
+  // permitted takeover after a short wait — and recreated the very overlap the barrier
+  // existed to prevent. Both Engines share one JS context, the canvas, and the `editor`
+  // global, so no non-terminal state is safe to replace over.
+  for (const state of ['initializing', 'running', 'quitting']) {
+    const plan = editorReplacementPlan(state);
+    assert.equal(plan.mustAwaitExit, true, `state ${state} must await exit`);
+    assert.equal(plan.exitRequired, true, `state ${state} must REQUIRE a confirmed exit, never take over`);
+    assert.ok(plan.waitMs >= 20000, `state ${state} must get the full wait`);
+  }
+  // A quitting engine has already been asked to quit; asking again is pointless.
+  assert.equal(editorReplacementPlan('quitting').requestQuit, false);
+  assert.equal(editorReplacementPlan('running').requestQuit, true);
+  assert.equal(editorReplacementPlan('initializing').requestQuit, true);
 });
 
 test('terminal states start a replacement immediately', () => {
@@ -248,4 +251,19 @@ test('a length-prefixed framing prevents adjacent-content collisions', async () 
   assert.notEqual(
     await fingerprintProjectBytes({ ab: '', c: 'd' }),
     await fingerprintProjectBytes({ a: 'bc', d: '' }));
+});
+
+// ---------------------------------------------------------------- recovery after exit timeout
+
+test('a page that cannot confirm an exit is reported as failed, not merely degraded', () => {
+  // Once an engine has not confirmed its exit, nothing in this JS context can host a
+  // replacement. The status must say so rather than describing a recoverable condition.
+  const blocked = deriveOverallStatus({
+    engine: 'ready', session: 'editor-ready', commandChannelAvailable: true, restartRequired: true
+  });
+  assert.equal(blocked.status, 'failed');
+  assert.equal(blocked.reason, 'restart_required');
+
+  // The session flag alone is enough, even without the explicit input.
+  assert.equal(deriveOverallStatus({ engine: 'loading', session: 'restart_required' }).reason, 'restart_required');
 });

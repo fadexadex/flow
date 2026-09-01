@@ -1057,29 +1057,28 @@
   // DOM attribute that is also set while an editor is still initializing.
   const EDITOR_TERMINAL_STATES = new Set(['idle', 'exited', 'failed']);
 
-  // The corrupting case is narrow and specific: replacing an engine that is still
-  // INITIALIZING. That is what happened when a boot timed out and rollback immediately built
-  // a second Engine over the half-constructed first one, giving
-  // "Engine must be inited before copying files" for every file and a dead viewport.
+  // Same-page takeover is never safe without the previous Engine's real exit signal.
   //
-  // A RUNNING editor is different. The host is built for a replacement to take over the
-  // canvas, and this editor does not always honour `requestQuit()` — blocking on its exit
-  // simply prevents every restart. So a running engine is asked to quit, waited on briefly,
-  // and then replaced anyway; only an initializing engine is a hard barrier.
+  // Both Engines live in one JS context and share the canvas and the `editor` global, so a
+  // superseded boot's promise continuation can still call into the newer instance. That is
+  // what produced "Engine must be inited before copying files" for every project file. An
+  // earlier attempt here allowed takeover for `running`/`quitting` after a short wait, which
+  // is exactly the weaker path a rollback then slipped through.
+  //
+  // So: every non-terminal state requires a confirmed exit. When that does not arrive, the
+  // answer is NOT another Engine in this context — it is a hard recovery (reload the page),
+  // because nothing in this JS context can be trusted to host a replacement.
   function editorReplacementPlan(state) {
     if (EDITOR_TERMINAL_STATES.has(state)) {
       return { action: 'start', mustAwaitExit: false, requestQuit: false, waitMs: 0, exitRequired: false };
     }
-    if (state === 'initializing') {
-      return { action: 'await_exit', mustAwaitExit: true, requestQuit: true, waitMs: 25000, exitRequired: true };
-    }
-    // 'running' or 'quitting': bounded wait, then proceed.
     return {
       action: 'await_exit',
       mustAwaitExit: true,
-      requestQuit: state === 'running',
-      waitMs: 6000,
-      exitRequired: false
+      // A quitting engine has already been asked; asking twice is pointless.
+      requestQuit: state !== 'quitting',
+      waitMs: 25000,
+      exitRequired: true
     };
   }
 
@@ -1110,14 +1109,7 @@
       }
       const exited = outcome !== 'timeout';
       if (exited) return { ok: true, state, awaited: true, outcome };
-      // Only an initializing engine is a hard barrier; see editorReplacementPlan.
-      return {
-        ok: !plan.exitRequired,
-        state,
-        awaited: true,
-        outcome: 'timeout',
-        proceeded_without_exit: !plan.exitRequired
-      };
+      return { ok: false, state, awaited: true, outcome: 'timeout' };
     },
     describe() {
       if (typeof window === 'undefined') return { state: 'idle', generation: 0 };
@@ -1136,12 +1128,22 @@
   // Exactly one replacement at a time. Two overlapping restarts is precisely how a rollback
   // raced a still-initializing engine.
   let editorReplacementInFlight = false;
+  // Set when an engine never confirms its exit. Once true, NOTHING in this page may build
+  // another Engine — including a rollback, which is the path that previously slipped past the
+  // barrier and recreated the overlap it existed to prevent.
+  let editorRestartBlocked = false;
 
   async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
     }
     validateProjectFiles(files);
+    if (editorRestartBlocked) {
+      const error = new Error('This page can no longer host a Godot editor: a previous engine never confirmed it exited. Reload the page to recover; the project is safe in storage.');
+      error.code = 'EDITOR_RESTART_REQUIRED';
+      error.recovery_action = 'reload_page';
+      throw error;
+    }
     if (editorReplacementInFlight) {
       const error = new Error('Another editor replacement is already in flight; refusing to start a second one.');
       error.code = 'EDITOR_REPLACEMENT_IN_FLIGHT';
@@ -1149,8 +1151,6 @@
     }
     editorReplacementInFlight = true;
     try {
-    editorRestartCount += 1;
-    window.__webmcpRestartCount = editorRestartCount;
     if (typeof window !== 'undefined') holdRuntimeFrame();
     // A running game owns the same virtual project filesystem. Replacing the
     // editor first can race its shutdown and leave the new --path unmounted.
@@ -1165,19 +1165,24 @@
     if (operation) await advancePhase(operation, 'replacing_editor');
     const replacement = await EditorLifecycle.prepareForReplacement();
     if (!replacement.ok) {
-      const error = new Error(`The previous Godot editor is still initializing and did not exit within 25 seconds; refusing to build a replacement over a half-constructed engine.`);
+      // Latch. Another Engine in this JS context cannot be trusted after this, and a rollback
+      // retrying through a weaker path is how the barrier was defeated last time.
+      editorRestartBlocked = true;
+      DiagnosticState.session = 'restart_required';
+      DiagnosticState.engine = 'failed';
+      DiagnosticState.engineError = `The previous Godot editor (state: ${replacement.state}) never confirmed it exited.`;
+      DiagnosticHUD.render();
+      const error = new Error(`The previous Godot editor did not confirm it exited (state: ${replacement.state}). Refusing to construct another engine in this page; reload the page to recover — the project is safe in storage.`);
       error.code = 'EDITOR_EXIT_TIMEOUT';
       error.lifecycle_state = replacement.state;
+      error.recovery_action = 'reload_page';
       throw error;
     }
-    if (replacement.proceeded_without_exit) {
-      activeLogs.push({
-        level: 'warn',
-        time: Date.now(),
-        generation: EditorCommandChannel.generation,
-        msg: `[Editor lifecycle] the previous editor did not acknowledge requestQuit within the wait window (state: ${replacement.state}); the replacement is taking over the canvas.`
-      });
-    }
+
+    // Counted only once a replacement is actually permitted, so refused attempts do not
+    // inflate the restart count that regression checks read.
+    editorRestartCount += 1;
+    window.__webmcpRestartCount = editorRestartCount;
 
     window._mcpProjectName = projectName;
     // The agent command plugin rides along on disk without entering activeFilesDict.
@@ -1230,9 +1235,28 @@
 
   async function restoreProjectSnapshot(previous, operation = null) {
     if (operation) await advancePhase(operation, 'rolling_back');
+    // In-memory metadata is restored first and unconditionally, so the project is never lost
+    // even when the engine cannot be revived.
     DiagnosticState.activeProject = previous.projectName;
     activeMainScene = previous.mainScene;
     activeFilesDict = cloneProjectFiles(previous.files);
+    if (editorRestartBlocked) {
+      // The whole point of the barrier. A rollback that builds another Engine after an exit
+      // timeout recreates exactly the overlap the barrier exists to prevent — that is how the
+      // corruption reappeared: the original path refused, then rollback retried and slipped
+      // through. The project state is restored; the page must be reloaded to get an editor.
+      DiagnosticState.session = 'restart_required';
+      DiagnosticState.engine = 'failed';
+      DiagnosticHUD.render();
+      activeLogs.push({
+        level: 'error',
+        time: Date.now(),
+        generation: EditorCommandChannel.generation,
+        msg: '[Editor lifecycle] rollback restored the project in memory but did NOT construct a replacement engine: a previous engine never confirmed it exited. Reload the page to recover.'
+      });
+      await persistActiveProjectState({ files: activeFilesDict, revision: DiagnosticState.sceneRevision }).catch(() => {});
+      return false;
+    }
     if (Object.keys(previous.files).length > 0) {
       try {
         await restartEditorWithProject(previous.files, previous.projectName, 60000, operation);
@@ -3769,8 +3793,9 @@ func _aabb_of(node: Node) -> Array:
       commandChannelAvailable = false, commandChannelExpected = true,
       fatalCount = 0, unpersisted = false
     } = snapshot || {};
-    if (engine === 'failed' || session === 'failed' || session === 'restore_failed') {
-      return { status: 'failed', reason: engine === 'failed' ? 'engine_failed' : 'session_failed' };
+    if (snapshot?.restartRequired) return { status: 'failed', reason: 'restart_required' };
+    if (engine === 'failed' || session === 'failed' || session === 'restore_failed' || session === 'restart_required') {
+      return { status: 'failed', reason: session === 'restart_required' ? 'restart_required' : (engine === 'failed' ? 'engine_failed' : 'session_failed') };
     }
     if (fatalCount > 0) return { status: 'failed', reason: 'engine_fatal' };
     if (lifecycleState === 'initializing' || lifecycleState === 'quitting'
@@ -3967,7 +3992,8 @@ func _aabb_of(node: Node) -> Array:
           // The channel is only expected once an editor has actually booted at least once.
           commandChannelExpected: EditorCommandChannel.generation > 0,
           fatalCount: fatalGodotErrors(0, EditorCommandChannel.generation).length,
-          unpersisted: DiagnosticState.sceneRevision !== DiagnosticState.persistedRevision
+          unpersisted: DiagnosticState.sceneRevision !== DiagnosticState.persistedRevision,
+          restartRequired: editorRestartBlocked
         });
         return {
           status: overall.status,
@@ -3978,6 +4004,13 @@ func _aabb_of(node: Node) -> Array:
           webmcp_surface: DiagnosticState.webmcpSurface,
           editor_command_channel: EditorCommandChannel.describe(),
           editor_restart_count: editorRestartCount,
+          recovery: {
+            // True when this page can no longer host an editor. The project is safe in
+            // storage; only a browser reload can restore a working runtime.
+            restart_required: editorRestartBlocked,
+            action: editorRestartBlocked ? 'reload_page' : null,
+            stale_lifecycle_events: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.stale || 0) : 0
+          },
           engine_health: {
             // Fatal traps for the CURRENT editor generation only; teardown noise from a
             // previous process is excluded rather than counted against this session.

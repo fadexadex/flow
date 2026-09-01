@@ -585,6 +585,7 @@ function setEditorLifecycle(state, detail) {
 	if (detail && detail.error) lifecycle.lastError = detail.error;
 	if (state === 'initializing') {
 		lifecycle.generation += 1;
+		lifecycle.stale = 0;
 		lifecycle.startedAt = Date.now();
 		lifecycle.exitedAt = 0;
 		lifecycle.lastError = null;
@@ -602,6 +603,16 @@ function setEditorLifecycle(state, detail) {
 	window.dispatchEvent(new CustomEvent('godot-editor-lifecycle', {
 		detail: { state: state, previous: previous, generation: lifecycle.generation }
 	}));
+	return lifecycle.generation;
+}
+
+// A callback from a superseded Engine must never touch the current one. Counted, so that it
+// is reportable rather than invisible.
+function noteStaleLifecycleEvent(generation, what) {
+	const lifecycle = window.__godotEditorLifecycle;
+	lifecycle.stale = (lifecycle.stale || 0) + 1;
+	console.warn('[Editor lifecycle] ignoring ' + what + ' from superseded generation ' + generation
+		+ ' (active is ' + lifecycle.generation + ')');
 }
 
 // Resolves when the current editor Engine has actually exited. Already-exited is immediate.
@@ -800,6 +811,17 @@ function closeEditor() { // eslint-disable-line no-unused-vars
 }
 
 function startEditor(zip, customArgs) {
+	// Every Engine this boot creates is owned by THIS invocation. The global `editor` exists
+	// only so closeEditor()/Execute() can reach the current one; no async continuation may use
+	// it, because by the time a slow `init()` resolves the global may already point at a newer
+	// Engine — and calling copyToFS on that one before it is initialized is exactly the
+	// "Engine must be inited before copying files" failure.
+	let editorInstance = null;
+	let myGeneration = 0;
+	const isCurrentGeneration = function () {
+		return window.__godotEditorLifecycle.generation === myGeneration;
+	};
+
 	const persistentPaths = ['/home/web_user'];
 
 	let editorCanvas = document.getElementById('editor-canvas');
@@ -1040,13 +1062,23 @@ function startEditor(zip, customArgs) {
 			OnEditorExit = function (code) {
 				setLoaderEnabled(true);
 				setTimeout(function () {
-					editor.init().then(function () {
+					// Godot's own project-manager -> editor re-exec. Same ownership rule: use the
+					// Engine this boot created, never whatever the global points at by now.
+					if (!isCurrentGeneration()) {
+						noteStaleLifecycleEvent(myGeneration, 'Execute re-exec');
+						return;
+					}
+					editorInstance.init().then(function () {
+						if (!isCurrentGeneration()) {
+							noteStaleLifecycleEvent(myGeneration, 'Execute re-exec init');
+							return;
+						}
 						setLoaderEnabled(false);
 						OnEditorExit = function () {
 							showTab('loader');
 							setLoaderEnabled(true);
 						};
-						editor.start({ 'args': args, 'persistentDrops': is_project_manager, 'canvas': editorCanvas });
+						editorInstance.start({ 'args': args, 'persistentDrops': is_project_manager, 'canvas': editorCanvas });
 					});
 				}, 0);
 				OnEditorExit = null;
@@ -1083,6 +1115,13 @@ function startEditor(zip, customArgs) {
 		'canvas': editorCanvas,
 		'canvasResizePolicy': 0,
 		'onExit': function () {
+			// Generation-fenced: a previous Engine exiting after a newer one has started must
+			// not mark the NEW generation as exited, or the bridge would believe a live editor
+			// had gone away.
+			if (!isCurrentGeneration()) {
+				noteStaleLifecycleEvent(myGeneration, 'onExit');
+				return;
+			}
 			editorCanvas = replaceCanvas(editorCanvas);
 			// The authoritative "this Engine is gone" signal. Everything that replaces an
 			// editor waits on this rather than guessing from the DOM.
@@ -1096,11 +1135,16 @@ function startEditor(zip, customArgs) {
 		'emscriptenPoolSize': concurrency,
 		'godotPoolSize': Math.floor(concurrency / 3), // Ensures at least 4 threads for the pool (see above).
 	};
-	editor = new Engine(editorConfig);
-	setEditorLifecycle('initializing');
+	editorInstance = new Engine(editorConfig);
+	editor = editorInstance;
+	myGeneration = setEditorLifecycle('initializing');
 
 	function displayFailureNotice(err) {
 		console.error(err);
+		if (!isCurrentGeneration()) {
+			noteStaleLifecycleEvent(myGeneration, 'failure notice');
+			return;
+		}
 		if (err instanceof Error) {
 			setStatusNotice(err.message);
 		} else if (typeof err === 'string') {
@@ -1121,8 +1165,16 @@ function startEditor(zip, customArgs) {
 	} else {
 		setStatusMode('indeterminate');
 		setBootPhase('Starting engine');
-		editor.init('godot.editor').then(function () {
+		// NOTE: every reference below is to the captured `editorInstance`, never the global
+		// `editor`. A slow init() resolving after a newer generation replaced the global is
+		// precisely how copyToFS ended up being called on an uninitialized Engine.
+		editorInstance.init('godot.editor').then(function () {
+			if (!isCurrentGeneration()) {
+				noteStaleLifecycleEvent(myGeneration, 'init() continuation');
+				return;
+			}
 			setBootPhase('Mounting virtual filesystem');
+			const copyFailures = [];
 			if (window._mcpProjectFiles) {
 				const encoder = new TextEncoder();
 				const projName = window._mcpProjectName || 'astro_dodger';
@@ -1131,18 +1183,30 @@ function startEditor(zip, customArgs) {
 					const fullPath = '/home/web_user/projects/' + projName + '/' + cleanPath;
 					const bytes = typeof content === 'string' ? encoder.encode(content) : new Uint8Array(content);
 					try {
-						editor.copyToFS(fullPath, bytes.buffer);
+						editorInstance.copyToFS(fullPath, bytes.buffer);
 					} catch(e) {
-						console.error('Failed to copy to FS:', fullPath, e);
+						// Swallowing this used to leave the editor booting from stale or partial
+						// project contents, then failing 60 seconds later with no useful reason.
+						copyFailures.push({ path: cleanPath, error: e && e.message ? e.message : String(e) });
 					}
 				}
 			}
+			if (copyFailures.length > 0) {
+				const detail = copyFailures.map(function (f) { return f.path + ': ' + f.error; }).join('; ');
+				const failure = new Error('EDITOR_FS_COPY_FAILED: ' + copyFailures.length
+					+ ' project file(s) could not be written into the editor filesystem — ' + detail);
+				failure.code = 'EDITOR_FS_COPY_FAILED';
+				failure.failed_paths = copyFailures.map(function (f) { return f.path; });
+				window.__godotEditorLifecycle.lastError = failure.message;
+				displayFailureNotice(failure);
+				return;
+			}
 			if (zip) {
-				editor.copyToFS('/tmp/preload.zip', zip);
+				editorInstance.copyToFS('/tmp/preload.zip', zip);
 			}
 			try {
 				// Avoid user creating project in the persistent root folder.
-				editor.copyToFS('/home/web_user/keep', new Uint8Array());
+				editorInstance.copyToFS('/home/web_user/keep', new Uint8Array());
 			} catch (e) {
 				// File exists
 			}
@@ -1150,7 +1214,11 @@ function startEditor(zip, customArgs) {
 			setLoaderEnabled(false);
 			setBootPhase('Opening project');
 			const args = customArgs || (zip ? ['--path', '/home/web_user/preload', '--editor'] : ['--project-manager', '--single-window']);
-			editor.start({ 'args': args, 'persistentDrops': true }).then(function () {
+			editorInstance.start({ 'args': args, 'persistentDrops': true }).then(function () {
+				if (!isCurrentGeneration()) {
+					noteStaleLifecycleEvent(myGeneration, 'start() continuation');
+					return;
+				}
 				setStatusMode('hidden');
 				setEditorLifecycle('running');
 				initializing = false;
