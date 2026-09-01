@@ -68,6 +68,10 @@
       zip = null,
       args = [],
       encoder = new TextEncoder(),
+      // Extra options merged into engine.start(). Godot's own project-manager -> editor
+      // re-exec needs `persistentDrops` and an explicit canvas; it shares this function so it
+      // gets the same fencing and the same single-catch rejection handling.
+      startOptions = {},
       beforeStart = function () {},
       onRunning = function () {}
     } = options;
@@ -96,7 +100,7 @@
     beforeStart();
     setPhase('Opening project');
     // Awaited, so a rejection propagates to the caller's single catch.
-    await engine.start({ args: args, persistentDrops: true });
+    await engine.start(Object.assign({ args: args, persistentDrops: true }, startOptions));
     if (!isCurrent()) {
       noteStale(generation, 'start() continuation');
       return { status: 'superseded', at: 'start' };

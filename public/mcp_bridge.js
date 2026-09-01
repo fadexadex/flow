@@ -1355,8 +1355,11 @@
       if (TEARDOWN_NOISE_PATTERN.test(entry.text)) continue;
       if (/\bFATAL:/.test(entry.text)) { errors.push(entry.text); continue; }
       if (PLATFORM_DIAGNOSTIC_PATTERNS.some(pattern => pattern.test(entry.text))) { platform.push(entry.text); continue; }
-      if (entry.level === 'error') { errors.push(entry.text); continue; }
-      if (entry.level === 'warn' || /^WARNING:/.test(entry.text)) warnings.push(entry.text);
+      // Godot writes WARNING: lines to stderr, so they arrive tagged level 'error'. The text
+      // is what says what it is; testing the level first counted every engine warning as a
+      // project error. Only FATAL outranks the prefix.
+      if (/^\s*WARNING:/.test(entry.text) || entry.level === 'warn') { warnings.push(entry.text); continue; }
+      if (entry.level === 'error') errors.push(entry.text);
     }
     return { errors, warnings, platform_diagnostics: platform };
   }

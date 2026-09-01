@@ -1063,24 +1063,30 @@ function startEditor(zip, customArgs) {
 			OnEditorExit = function (code) {
 				setLoaderEnabled(true);
 				setTimeout(function () {
-					// Godot's own project-manager -> editor re-exec. Same ownership rule: use the
-					// Engine this boot created, never whatever the global points at by now.
-					if (!isCurrentGeneration()) {
-						noteStaleLifecycleEvent(myGeneration, 'Execute re-exec');
-						return;
-					}
-					editorInstance.init().then(function () {
-						if (!isCurrentGeneration()) {
-							noteStaleLifecycleEvent(myGeneration, 'Execute re-exec init');
-							return;
+					// Godot's own project-manager -> editor re-exec. It used to be a bare promise
+					// chain whose init() and start() were neither returned nor caught, so an async
+					// rejection went unhandled and left the UI stuck on the loader. Routed through
+					// the same runEditorBoot as the main path: one sequence, fenced at every await,
+					// with a single catch.
+					window.GodotEditorBoot.runEditorBoot({
+						engine: editorInstance,
+						generation: myGeneration,
+						activeGeneration: function () { return window.__godotEditorLifecycle.generation; },
+						noteStale: noteStaleLifecycleEvent,
+						setPhase: setBootPhase,
+						// This path re-execs an already-staged project; it must not restage files.
+						projectFiles: null,
+						zip: null,
+						args: args,
+						startOptions: { persistentDrops: is_project_manager, canvas: editorCanvas },
+						beforeStart: function () {
+							setLoaderEnabled(false);
+							OnEditorExit = function () {
+								showTab('loader');
+								setLoaderEnabled(true);
+							};
 						}
-						setLoaderEnabled(false);
-						OnEditorExit = function () {
-							showTab('loader');
-							setLoaderEnabled(true);
-						};
-						editorInstance.start({ 'args': args, 'persistentDrops': is_project_manager, 'canvas': editorCanvas });
-					});
+					}).catch(displayFailureNotice);
 				}, 0);
 				OnEditorExit = null;
 			};
@@ -1106,6 +1112,13 @@ function startEditor(zip, customArgs) {
 					renderBootStatusText();
 					if (current === total) {
 						setTimeout(() => {
+							// Fenced separately from onProgress: this fires 100ms later, by which
+							// time a replacement may have begun, and it would otherwise overwrite
+							// the new generation's loading UI.
+							if (!isCurrentGeneration()) {
+								noteStaleLifecycleEvent(myGeneration, 'delayed progress transition');
+								return;
+							}
 							setStatusMode('indeterminate');
 							setBootPhase('Starting engine');
 						}, 100);

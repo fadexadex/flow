@@ -209,3 +209,51 @@ test('the file copier reports every failure rather than stopping at the first', 
   assert.deepEqual(failures.map(f => f.path), ['a.txt', 'c.txt']);
   assert.ok(engine.copied().some(path => path.endsWith('/demo/b.txt')), 'a healthy file must still be attempted');
 });
+
+test('the project-manager re-exec path shares the same fenced, catchable boot', async () => {
+  // Godot's own project-manager -> editor transition used to be a separate promise chain whose
+  // init()/start() were neither returned nor caught, so an async rejection went unhandled and
+  // stranded the UI on the loader. It now goes through runEditorBoot with no project files.
+  const life = lifecycle(1);
+  const engine = fakeEngine();
+  let beforeStartRan = false;
+  const booting = runEditorBoot({
+    engine,
+    generation: 1,
+    activeGeneration: life.activeGeneration,
+    noteStale: life.noteStale,
+    projectFiles: null,
+    args: ['--path', '/home/web_user/projects/demo', '--editor'],
+    startOptions: { persistentDrops: false, canvas: { id: 'editor-canvas' } },
+    beforeStart: () => { beforeStartRan = true; }
+  });
+
+  engine.finishInit();
+  await Promise.resolve();
+  engine.failStart(new Error('re-exec start failed'));
+
+  // The whole point: this rejection is observable instead of unhandled.
+  await assert.rejects(booting, /re-exec start failed/);
+  assert.equal(beforeStartRan, true);
+  // No project files were restaged; only the `keep` marker is written.
+  assert.deepEqual(engine.copied(), ['/home/web_user/keep']);
+});
+
+test('startOptions reach engine.start() without losing args', async () => {
+  const life = lifecycle(1);
+  const engine = fakeEngine();
+  const canvas = { id: 'editor-canvas' };
+  const booting = runEditorBoot(bootOptions(engine, life, 1, {
+    projectFiles: null,
+    startOptions: { persistentDrops: false, canvas }
+  }));
+  engine.finishInit();
+  await Promise.resolve();
+  engine.finishStart();
+  await booting;
+
+  const [, options] = engine.calls.find(([kind]) => kind === 'start');
+  assert.deepEqual(options.args, ['--editor']);
+  assert.equal(options.persistentDrops, false, 'startOptions must override the default');
+  assert.equal(options.canvas, canvas);
+});

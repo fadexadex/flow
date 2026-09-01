@@ -323,3 +323,30 @@ test('a message is classified together with its "at:" location line', () => {
   assert.equal(real.errors.length, 1);
   assert.match(real.errors[0], /gdscript\.cpp/);
 });
+
+test('a WARNING: written to stderr is a warning, not a project error', () => {
+  // Godot writes WARNING: lines to stderr, so the console interceptor tags them level 'error'.
+  // Testing the level before the prefix counted every engine warning as an actionable project
+  // error; the live template simply happened not to emit one.
+  const result = classifyEngineDiagnostics([
+    { time: 1, level: 'error', generation: 1, msg: 'WARNING: Node has no shape defined.' },
+    { time: 2, level: 'error', generation: 1, msg: '   at: _notification (scene/3d/collision_shape_3d.cpp:60)' }
+  ], 1);
+  assert.deepEqual(result.errors, [], `a stderr WARNING was counted as a project error: ${JSON.stringify(result.errors)}`);
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0], /no shape defined/);
+});
+
+test('FATAL still outranks the WARNING prefix', () => {
+  const result = classifyEngineDiagnostics(
+    [{ time: 1, level: 'error', generation: 1, msg: 'WARNING: something then FATAL: Index p_index = -1 is out of bounds (size() = 0).' }], 1);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.warnings.length, 0);
+});
+
+test('a genuine stderr error is still an actionable project error', () => {
+  const result = classifyEngineDiagnostics(
+    [{ time: 1, level: 'error', generation: 1, msg: 'ERROR: SCRIPT ERROR: Parse Error: Unexpected identifier' }], 1);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.warnings.length, 0);
+});
