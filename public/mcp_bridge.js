@@ -1314,6 +1314,53 @@
       && !/leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked/i.test(String(entry.msg)));
   }
 
+  // A fresh, healthy session logs several `ERROR:` lines that are simply how this platform
+  // behaves: no TCP sockets in a browser, occlusion culling compiled out, Emscripten warning
+  // about blocking the main thread. Counting those as "session errors" next to
+  // `status: healthy` is confusing and trains people to ignore the number. Classified instead,
+  // so an actionable project error is visible among them.
+  const PLATFORM_DIAGNOSTIC_PATTERNS = [
+    /Occlusion culling is disabled/i,
+    // The browser has no TCP sockets, so the editor debugger listener always fails. Godot
+    // prints the message and its source location on SEPARATE lines, which is why entries are
+    // paired with their `at:` continuation before matching — the message alone
+    // (`Condition "err != OK" is true. Returning: ERR_CANT_CREATE`) carries no clue at all.
+    /tcp_server\.cpp|Unable to start(?: the)? debugger|remote debugger|Cannot bind/i,
+    /Blocking on the main thread is very dangerous/i,
+    /AudioWorkletNode|BaseAudioContext/i,
+    /WebGL.*(?:extension|not supported)/i,
+    /ServiceWorker/i,
+    /GDExtension support/i
+  ];
+  const TEARDOWN_NOISE_PATTERN = /leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked|RID allocations/i;
+
+  function classifyEngineDiagnostics(logs, generation, sinceTime = 0) {
+    const scoped = logs.filter(entry => entry.time >= sinceTime && entry.generation === generation);
+    // Godot emits "ERROR: <message>" and "   at: <function> (<file>:<line>)" as two entries.
+    // Classifying them independently loses the only identifying detail the pair carries, so
+    // each message absorbs its trailing location line first.
+    const merged = [];
+    for (const entry of scoped) {
+      const message = String(entry.msg);
+      if (/^\s*at:\s/.test(message) && merged.length > 0) {
+        merged[merged.length - 1].text += ' | ' + message.trim();
+        continue;
+      }
+      merged.push({ level: entry.level, text: message });
+    }
+    const errors = [];
+    const warnings = [];
+    const platform = [];
+    for (const entry of merged) {
+      if (TEARDOWN_NOISE_PATTERN.test(entry.text)) continue;
+      if (/\bFATAL:/.test(entry.text)) { errors.push(entry.text); continue; }
+      if (PLATFORM_DIAGNOSTIC_PATTERNS.some(pattern => pattern.test(entry.text))) { platform.push(entry.text); continue; }
+      if (entry.level === 'error') { errors.push(entry.text); continue; }
+      if (entry.level === 'warn' || /^WARNING:/.test(entry.text)) warnings.push(entry.text);
+    }
+    return { errors, warnings, platform_diagnostics: platform };
+  }
+
   // Teardown from a previous editor process logs RID/ObjectDB/WebGL leaks that are expected
   // and belong to a generation that no longer exists. Separate them from this session's.
   function currentGenerationErrors(sinceTime) {
@@ -4011,14 +4058,22 @@ func _aabb_of(node: Node) -> Array:
             action: editorRestartBlocked ? 'reload_page' : null,
             stale_lifecycle_events: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.stale || 0) : 0
           },
-          engine_health: {
-            // Fatal traps for the CURRENT editor generation only; teardown noise from a
-            // previous process is excluded rather than counted against this session.
-            fatal_errors: fatalGodotErrors(0, EditorCommandChannel.generation).slice(-3).map(entry => entry.msg),
-            session_errors: currentGenerationErrors(0).length,
-            generation: EditorCommandChannel.generation,
-            editor_lifecycle: EditorLifecycle.describe()
-          },
+          engine_health: (() => {
+            const classified = classifyEngineDiagnostics(activeLogs, EditorCommandChannel.generation);
+            return {
+              // Fatal traps for the CURRENT editor generation only; teardown noise from a
+              // previous process is excluded rather than counted against this session.
+              fatal_errors: fatalGodotErrors(0, EditorCommandChannel.generation).slice(-3).map(entry => entry.msg),
+              // Split so a real project error is not buried among the browser platform's
+              // normal complaints (no TCP sockets, occlusion culling compiled out, ...).
+              project_errors: classified.errors.length,
+              warnings: classified.warnings.length,
+              platform_diagnostics: classified.platform_diagnostics.length,
+              recent_project_errors: classified.errors.slice(-3),
+              generation: EditorCommandChannel.generation,
+              editor_lifecycle: EditorLifecycle.describe()
+            };
+          })(),
           camera: {
             auto_follow: CameraGuidance.autoFollowEnabled(),
             active_viewport: activeGodotViewport(),

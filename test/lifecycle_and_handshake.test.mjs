@@ -267,3 +267,59 @@ test('a page that cannot confirm an exit is reported as failed, not merely degra
   // The session flag alone is enough, even without the explicit input.
   assert.equal(deriveOverallStatus({ engine: 'loading', session: 'restart_required' }).reason, 'restart_required');
 });
+
+// ---------------------------------------------------------------- diagnostic classification
+
+const classifyEngineDiagnostics = new Function(`
+  ${slice('  const PLATFORM_DIAGNOSTIC_PATTERNS', '  function currentGenerationErrors')}
+  return classifyEngineDiagnostics;
+`)();
+
+test('platform noise is separated from actionable project errors', () => {
+  // A healthy fresh session reported `session_errors: 5`, all of which were the browser
+  // platform behaving normally. Presenting those next to `status: healthy` teaches people to
+  // ignore the number, which is how a real error gets missed.
+  const logs = [
+    { time: 1, level: 'error', generation: 2, msg: 'ERROR: Occlusion culling is disabled in this build.' },
+    { time: 2, level: 'error', generation: 2, msg: 'ERROR: Condition "err != OK" is true. Returning: ERR_CANT_CREATE' },
+    { time: 2.5, level: 'error', generation: 2, msg: '   at: listen (core/io/tcp_server.cpp:56)' },
+    { time: 3, level: 'error', generation: 2, msg: 'Blocking on the main thread is very dangerous, see emscripten docs' },
+    { time: 4, level: 'error', generation: 2, msg: 'ERROR: SCRIPT ERROR: Parse Error in res://main.gd' },
+    { time: 5, level: 'warn', generation: 2, msg: 'WARNING: node has no shape defined' },
+    { time: 6, level: 'error', generation: 2, msg: 'ERROR: 5 RID allocations were leaked at exit.' },
+    { time: 7, level: 'error', generation: 1, msg: 'ERROR: SCRIPT ERROR: belongs to a previous generation' }
+  ];
+  const result = classifyEngineDiagnostics(logs, 2);
+  assert.deepEqual(result.errors.length, 1, `expected one actionable error, got ${JSON.stringify(result.errors)}`);
+  assert.match(result.errors[0], /Parse Error/);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.platform_diagnostics.length, 3);
+});
+
+test('a FATAL is always an actionable error, never platform noise', () => {
+  const result = classifyEngineDiagnostics(
+    [{ time: 1, level: 'error', generation: 1, msg: 'ERROR: FATAL: Index p_index = -1 is out of bounds (size() = 0).' }], 1);
+  assert.equal(result.errors.length, 1);
+  assert.equal(result.platform_diagnostics.length, 0);
+});
+
+test('a message is classified together with its "at:" location line', () => {
+  // `ERROR: Condition "err != OK" is true. Returning: ERR_CANT_CREATE` is meaningless alone —
+  // only the following `at: listen (core/io/tcp_server.cpp:56)` identifies it as the browser
+  // having no TCP sockets. Classified apart, it showed up as an actionable project error in an
+  // otherwise healthy session.
+  const paired = classifyEngineDiagnostics([
+    { time: 1, level: 'error', generation: 1, msg: 'ERROR: Condition "err != OK" is true. Returning: ERR_CANT_CREATE' },
+    { time: 2, level: 'error', generation: 1, msg: '   at: listen (core/io/tcp_server.cpp:56)' }
+  ], 1);
+  assert.equal(paired.errors.length, 0, `expected no actionable errors, got ${JSON.stringify(paired.errors)}`);
+  assert.equal(paired.platform_diagnostics.length, 1);
+
+  // A genuine project error keeps its location line attached and stays actionable.
+  const real = classifyEngineDiagnostics([
+    { time: 1, level: 'error', generation: 1, msg: 'ERROR: SCRIPT ERROR: Parse Error: Unexpected token' },
+    { time: 2, level: 'error', generation: 1, msg: '   at: GDScript::reload (modules/gdscript/gdscript.cpp:100)' }
+  ], 1);
+  assert.equal(real.errors.length, 1);
+  assert.match(real.errors[0], /gdscript\.cpp/);
+});

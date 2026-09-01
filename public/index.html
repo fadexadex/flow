@@ -556,6 +556,7 @@ function closeWelcomeModal(dontShowAgain) { // eslint-disable-line no-unused-var
 	}
 }
 		</script>
+		<script src="editor_boot.js"></script>
 		<script src="mcp_bridge.js"></script>
 		<script src="godot.editor.js"></script>
 		<script>
@@ -1090,6 +1091,12 @@ function startEditor(zip, customArgs) {
 	const editorConfig = {
 		'unloadAfterInit': false,
 		'onProgress': function progressFunction(current, total) {
+			// A delayed progress event from a superseded Engine would otherwise overwrite the
+			// current boot's status text and bar.
+			if (!isCurrentGeneration()) {
+				noteStaleLifecycleEvent(myGeneration, 'onProgress');
+				return;
+			}
 			if (statusProgressInner && statusProgressInner.style) {
 				if (total > 0) {
 					statusProgressInner.style.width = `${(current / total) * 100}%`;
@@ -1140,11 +1147,15 @@ function startEditor(zip, customArgs) {
 	myGeneration = setEditorLifecycle('initializing');
 
 	function displayFailureNotice(err) {
-		console.error(err);
+		// The generation check comes FIRST. The bridge intercepts console output and tags each
+		// entry with the current generation, so logging a superseded boot's rejection here
+		// would file it against the live generation and contaminate generation-scoped
+		// validation. noteStaleLifecycleEvent records it as the stale event it is.
 		if (!isCurrentGeneration()) {
-			noteStaleLifecycleEvent(myGeneration, 'failure notice');
+			noteStaleLifecycleEvent(myGeneration, 'failure notice: ' + (err instanceof Error ? err.message : String(err)));
 			return;
 		}
+		console.error(err);
 		if (err instanceof Error) {
 			setStatusNotice(err.message);
 		} else if (typeof err === 'string') {
@@ -1165,67 +1176,38 @@ function startEditor(zip, customArgs) {
 	} else {
 		setStatusMode('indeterminate');
 		setBootPhase('Starting engine');
-		// NOTE: every reference below is to the captured `editorInstance`, never the global
-		// `editor`. A slow init() resolving after a newer generation replaced the global is
-		// precisely how copyToFS ended up being called on an uninitialized Engine.
-		editorInstance.init('godot.editor').then(function () {
-			if (!isCurrentGeneration()) {
-				noteStaleLifecycleEvent(myGeneration, 'init() continuation');
-				return;
-			}
-			setBootPhase('Mounting virtual filesystem');
-			const copyFailures = [];
-			if (window._mcpProjectFiles) {
-				const encoder = new TextEncoder();
-				const projName = window._mcpProjectName || 'astro_dodger';
-				for (const [relPath, content] of Object.entries(window._mcpProjectFiles)) {
-					const cleanPath = relPath.replace(/^\//, '');
-					const fullPath = '/home/web_user/projects/' + projName + '/' + cleanPath;
-					const bytes = typeof content === 'string' ? encoder.encode(content) : new Uint8Array(content);
-					try {
-						editorInstance.copyToFS(fullPath, bytes.buffer);
-					} catch(e) {
-						// Swallowing this used to leave the editor booting from stale or partial
-						// project contents, then failing 60 seconds later with no useful reason.
-						copyFailures.push({ path: cleanPath, error: e && e.message ? e.message : String(e) });
-					}
-				}
-			}
-			if (copyFailures.length > 0) {
-				const detail = copyFailures.map(function (f) { return f.path + ': ' + f.error; }).join('; ');
-				const failure = new Error('EDITOR_FS_COPY_FAILED: ' + copyFailures.length
-					+ ' project file(s) could not be written into the editor filesystem — ' + detail);
-				failure.code = 'EDITOR_FS_COPY_FAILED';
-				failure.failed_paths = copyFailures.map(function (f) { return f.path; });
-				window.__godotEditorLifecycle.lastError = failure.message;
-				displayFailureNotice(failure);
-				return;
-			}
-			if (zip) {
-				editorInstance.copyToFS('/tmp/preload.zip', zip);
-			}
-			try {
-				// Avoid user creating project in the persistent root folder.
-				editorInstance.copyToFS('/home/web_user/keep', new Uint8Array());
-			} catch (e) {
-				// File exists
-			}
-			showTab('editor');
-			setLoaderEnabled(false);
-			setBootPhase('Opening project');
-			const args = customArgs || (zip ? ['--path', '/home/web_user/preload', '--editor'] : ['--project-manager', '--single-window']);
-			editorInstance.start({ 'args': args, 'persistentDrops': true }).then(function () {
-				if (!isCurrentGeneration()) {
-					noteStaleLifecycleEvent(myGeneration, 'start() continuation');
-					return;
-				}
+		// Delegated to editor_boot.js so the ownership rules are testable with fake engines
+		// rather than only demonstrable by hand in a browser. It is one async sequence with a
+		// single catch: the previous promise-chain form created start()'s promise inside
+		// init().then(...) without returning it, so an async start() rejection escaped this
+		// catch entirely and left the lifecycle stuck in `initializing`.
+		window.GodotEditorBoot.runEditorBoot({
+			engine: editorInstance,
+			generation: myGeneration,
+			activeGeneration: function () { return window.__godotEditorLifecycle.generation; },
+			noteStale: noteStaleLifecycleEvent,
+			setPhase: setBootPhase,
+			projectFiles: window._mcpProjectFiles || null,
+			projectName: window._mcpProjectName || 'astro_dodger',
+			zip: zip,
+			args: customArgs || (zip ? ['--path', '/home/web_user/preload', '--editor'] : ['--project-manager', '--single-window']),
+			beforeStart: function () {
+				showTab('editor');
+				setLoaderEnabled(false);
+			},
+			onRunning: function () {
 				setStatusMode('hidden');
 				setEditorLifecycle('running');
 				initializing = false;
 				stopBootTicker();
 				window.dispatchEvent(new Event('godot-engine-ready'));
-			});
-		}).catch(displayFailureNotice);
+			}
+		}).catch(function (error) {
+			if (error && error.code === 'EDITOR_FS_COPY_FAILED') {
+				window.__godotEditorLifecycle.lastError = error.message;
+			}
+			displayFailureNotice(error);
+		});
 	}
 }
 
