@@ -607,3 +607,11 @@ test('switching projects persists the one being left, and never replays its undo
   assert.match(body, /undo_history: 'cleared_on_switch'/);
   assert.match(body, /SAVED_PROJECT_NOT_FOUND/);
 });
+
+test('the rail names the project on screen, not only the scene', () => {
+  const start = bridgeText.indexOf('// The project name, always visible.');
+  assert.ok(start > 0, 'the scene inspector header must name the project');
+  const body = bridgeText.slice(start, start + 1400);
+  assert.match(body, /DiagnosticState\.activeProject \|\| 'none'/);
+  assert.match(body, />Project</);
+});

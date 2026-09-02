@@ -10252,9 +10252,17 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     render() {
       if (!this.ensure()) return;
       const graph = sceneGraphFromFiles(activeFilesDict);
+      // The project name, always visible.
+      //
+      // The rail named the scene but never the project, so two projects with the same scene
+      // layout were indistinguishable on screen - and "I came back and there was a different
+      // character" had nothing on the page that could have told you which project you were
+      // looking at.
       const head = `<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">`
-        + `<span style="color:${RAIL_TOKENS.muted};text-transform:uppercase;letter-spacing:.06em;font-size:10px">Scene details</span>`
-        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(activeMainScene)}</span>`
+        + `<span style="color:${RAIL_TOKENS.muted};text-transform:uppercase;letter-spacing:.06em;font-size:10px">Project</span>`
+        + `<span style="flex:0 0 auto;font-weight:600">${escapeHtml(DiagnosticState.activeProject || 'none')}</span>`
+        + `<span aria-hidden="true" style="color:${RAIL_TOKENS.border}">/</span>`
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;color:${RAIL_TOKENS.muted}">${escapeHtml(activeMainScene)}</span>`
         + `<span style="margin-left:auto;color:${RAIL_TOKENS.muted};font:400 11px/1 ${RAIL_TOKENS.mono}">${graph.nodes.length} nodes</span>`
         + `<span aria-hidden="true" style="color:${RAIL_TOKENS.muted}">${this.expanded ? '⌄' : '⌃'}</span></div>`;
       if (!this.expanded) {
