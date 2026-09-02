@@ -541,3 +541,11 @@ test('a move is drawn from where the node actually was', () => {
   assert.match(body, /projectWorldPoint\(options\.from/,
     'the trail is two projected points, never an invented arc');
 });
+
+test('a camera that held still on purpose says so', () => {
+  const start = bridgeText.indexOf('auto_follow: CameraGuidance.autoFollowEnabled()');
+  const body = bridgeText.slice(start, start + 900);
+  assert.match(body, /last_follow_skipped/);
+  assert.match(body, /already_framed/);
+  assert.match(body, /agent_presence: AgentPresence\.describe\(\)/);
+});

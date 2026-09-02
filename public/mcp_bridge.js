@@ -5837,7 +5837,14 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           camera: {
             auto_follow: CameraGuidance.autoFollowEnabled(),
             active_viewport: activeGodotViewport(),
-            pose_source: resolveCameraPose()?.source || null
+            pose_source: resolveCameraPose()?.source || null,
+            // A camera that deliberately held still is indistinguishable from a broken follow
+            // unless it says so. This is the last time a follow was skipped because the work
+            // was already comfortably in frame.
+            last_follow_skipped: CameraGuidance.lastSkippedFollow
+              ? { node: CameraGuidance.lastSkippedFollow.node, at: CameraGuidance.lastSkippedFollow.at, reason: 'already_framed' }
+              : null,
+            agent_presence: AgentPresence.describe()
           },
           session: {
             state: DiagnosticState.session,
@@ -9137,9 +9144,15 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       // only when the editor reported an actual move, and only in screen space, so it cannot
       // claim a path through the world that the node did not take.
       const trail = options.trail
-        ? `<span aria-hidden="true" style="position:absolute;left:50%;top:50%;width:${Math.round(options.trail.length)}px;height:2px;`
-          + `transform-origin:0 50%;transform:rotate(${options.trail.angle.toFixed(2)}deg) translateX(0);`
-          + `background:linear-gradient(90deg, transparent 0%, ${accent} 90%);opacity:.55;border-radius:2px"></span>`
+        ? `<span aria-hidden="true" style="position:absolute;left:50%;top:50%;width:${Math.round(options.trail.length)}px;height:3px;`
+          + `margin-top:-1.5px;transform-origin:0 50%;transform:rotate(${options.trail.angle.toFixed(2)}deg);`
+          + `background:linear-gradient(90deg, transparent 0%, ${accent} 85%);opacity:.85;border-radius:3px;`
+          + `box-shadow:0 0 8px ${accent}"></span>`
+          // A dot at the far end marks where the node started, so the trail reads as "from
+          // there to here" rather than as an arbitrary tick.
+          + `<span aria-hidden="true" style="position:absolute;left:50%;top:50%;width:7px;height:7px;margin:-3.5px 0 0 -3.5px;`
+          + `transform-origin:3.5px 3.5px;transform:rotate(${options.trail.angle.toFixed(2)}deg) translateX(${Math.round(options.trail.length)}px);`
+          + `border:1.5px solid ${accent};border-radius:50%;opacity:.75"></span>`
         : '';
       this.overlay.innerHTML =
         `<div style="position:relative;width:0;height:0">`
