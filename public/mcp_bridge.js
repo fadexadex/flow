@@ -29,7 +29,17 @@
     // `dirty_unpersisted` when they diverge, rather than pretending they always agree.
     persistedRevision: 1,
     undoDepth: 0,
-    activeProject: 'neon_skyrail_3d'
+    activeProject: 'neon_skyrail_3d',
+    // True only while an unavoidable editor replacement is paused because the pane is hidden
+    // or unthrottled frames have stopped. It is a "waiting on you", not a failure.
+    shutdownWaiting: false,
+    // The evidence from the most recent editor replacement: how long the engine actually had
+    // frames, how long it was hidden, and what the exit did. Recorded whether or not it
+    // succeeded, so a later "the editor hung" report can be checked rather than believed.
+    lastShutdown: null,
+    // Set when the hot GDScript channel wrote to the running editor but could neither publish
+    // nor restore. Requires deliberate recovery; never resolved by starting a second Engine.
+    hotScriptDirty: null
   };
 
   const ResumeState = {
@@ -332,6 +342,16 @@
       booting_editor: 'Booting editor',
       validating_runtime: 'Validating runtime',
       persisting_commit: 'Persisting commit',
+      // The hot GDScript channel's phases. Deliberately plain language: these are what a
+      // non-technical collaborator reads in the shelf, with the raw tool calls kept in the
+      // expandable details rather than in the headline.
+      inspecting: 'Inspecting',
+      preparing_change: 'Preparing change',
+      updating_script: 'Updating script',
+      checking_code: 'Checking code',
+      restoring_script: 'Restoring previous version',
+      persisting: 'Persisting',
+      complete: 'Complete',
       ready: 'Ready',
       rolling_back: 'Rolling back',
       failed: 'Failed'
@@ -397,7 +417,12 @@
           operation_id: operation.id,
           phase: operation.phase,
           sequence: operation.sequence,
-          timeline: operation.timeline
+          timeline: operation.timeline,
+          // What the agent is working ON, not just what it is doing. The shelf needs the
+          // resource path and line range to say "Updating temple_run.gd · lines 84-137".
+          target: operation.target || null,
+          change: operation.change || null,
+          diagnostics: operation.diagnostics || null
         });
       }
     }
@@ -1152,6 +1177,91 @@
     };
   }
 
+  // A wall-clock deadline is meaningless in a hidden or throttled pane.
+  //
+  // Godot's main loop is driven by requestAnimationFrame, which browsers clamp to roughly 2fps
+  // in a backgrounded tab and pause entirely in a hidden one. A fixed 25-second shutdown
+  // deadline therefore expires while the engine has had perhaps fifty frames in which to
+  // acknowledge requestQuit() — and the ownership guard then correctly, but pointlessly,
+  // refuses to ever build another Engine in this page. The engine did not fail; it was never
+  // given the time.
+  //
+  // So the budget counts only time the engine could actually spend: the document visible AND
+  // the render heartbeat advancing. Hidden and stalled time is recorded separately rather than
+  // discarded, so "it took 4 minutes" and "it had 25 seconds of frames" are both reportable
+  // and a future diagnosis is evidence-based instead of a guess about tab focus.
+  const RenderHeartbeat = {
+    frames: 0,
+    lastFrameAt: 0,
+    started: false,
+    start() {
+      if (this.started || typeof requestAnimationFrame !== 'function') return false;
+      this.started = true;
+      const tick = () => {
+        this.frames += 1;
+        this.lastFrameAt = Date.now();
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      return true;
+    }
+  };
+
+  function documentIsVisible() {
+    if (typeof document === 'undefined') return true;
+    return document.visibilityState !== 'hidden';
+  }
+
+  function createActiveBudget(budgetMs, now = Date.now()) {
+    return { budgetMs, activeMs: 0, suspendedMs: 0, hiddenMs: 0, lastTickAt: now, status: 'running' };
+  }
+
+  // Pure so the suspend/resume decision is testable without a browser: `frameAdvanced` is
+  // whether the render heartbeat moved since the previous tick, `visible` is document
+  // visibility. Either being false suspends the budget — a foregrounded tab whose engine is
+  // not rendering is not spending the engine's time either.
+  function tickActiveBudget(budget, { now, visible, frameAdvanced }) {
+    const delta = Math.max(0, now - budget.lastTickAt);
+    budget.lastTickAt = now;
+    const active = Boolean(visible) && Boolean(frameAdvanced);
+    if (active) {
+      budget.activeMs += delta;
+    } else {
+      budget.suspendedMs += delta;
+      if (!visible) budget.hiddenMs += delta;
+    }
+    if (budget.activeMs >= budget.budgetMs) budget.status = 'expired';
+    else budget.status = active ? 'running' : 'waiting_for_foreground';
+    return budget;
+  }
+
+  // Runs `isDone` until it returns true or the budget's *active* time runs out. `onStatus`
+  // sees each transition between running and waiting_for_foreground, which is what puts
+  // "Keep this editor visible to finish the update" on screen instead of a silent stall.
+  async function awaitWithActiveBudget(isDone, budgetMs, onStatus = null, pollMs = 100) {
+    const budget = createActiveBudget(budgetMs);
+    let lastFrames = RenderHeartbeat.frames;
+    let announced = null;
+    for (;;) {
+      if (isDone()) return { ok: true, budget };
+      await new Promise(resolve => setTimeout(resolve, pollMs));
+      const frames = RenderHeartbeat.frames;
+      tickActiveBudget(budget, {
+        now: Date.now(),
+        visible: documentIsVisible(),
+        // With no rAF at all (a test harness, or a browser that never paints), fall back to
+        // visibility alone rather than suspending forever and never timing out.
+        frameAdvanced: RenderHeartbeat.started ? frames > lastFrames : true
+      });
+      lastFrames = frames;
+      if (budget.status !== announced && budget.status !== 'expired') {
+        announced = budget.status;
+        if (typeof onStatus === 'function') onStatus(budget.status, budget);
+      }
+      if (budget.status === 'expired') return { ok: isDone(), budget };
+    }
+  }
+
   const EditorLifecycle = {
     state() {
       if (typeof window === 'undefined') return 'idle';
@@ -1167,26 +1277,37 @@
       return window.__godotEditorLifecycle?.bootInFlight === true;
     },
 
-    async prepareForReplacement() {
+    // The budget is spent in ACTIVE time, not wall-clock. `onStatus` is how the shelf learns
+    // to say "Keep this editor visible to finish the update" rather than appearing to hang.
+    async prepareForReplacement(onStatus = null) {
       const state = this.state();
+      const generation = this.generation();
       const plan = editorReplacementPlan(state, this.bootInFlight());
-      if (!plan.mustAwaitExit) return { ok: true, state, awaited: false };
+      if (!plan.mustAwaitExit) {
+        return { ok: true, state, generation, awaited: false, active_ms: 0, hidden_ms: 0, suspended_ms: 0 };
+      }
       if (plan.requestQuit) {
         try {
           if (typeof window.closeEditor === 'function') window.closeEditor();
         } catch (_) {}
       }
-      let outcome = 'timeout';
-      if (typeof window.__godotAwaitEditorExit === 'function') {
-        outcome = await window.__godotAwaitEditorExit(plan.waitMs);
-      } else {
-        outcome = (await waitFor(() => EDITOR_TERMINAL_STATES.has(this.state()), plan.waitMs, 80)) ? this.state() : 'timeout';
-      }
       // A boot that started during the wait leaves an Engine live even if the state now reads
       // terminal, so the exit does not count until nothing is in flight.
-      const exited = outcome !== 'timeout' && !this.bootInFlight();
-      if (exited) return { ok: true, state, awaited: true, outcome };
-      return { ok: false, state, awaited: true, outcome: 'timeout' };
+      const exited = () => EDITOR_TERMINAL_STATES.has(this.state()) && !this.bootInFlight();
+      const startedAt = Date.now();
+      const waited = await awaitWithActiveBudget(exited, plan.waitMs, onStatus);
+      const outcome = waited.ok ? this.state() : 'timeout';
+      return {
+        ok: waited.ok,
+        state,
+        generation,
+        awaited: true,
+        outcome,
+        active_ms: Math.round(waited.budget.activeMs),
+        hidden_ms: Math.round(waited.budget.hiddenMs),
+        suspended_ms: Math.round(waited.budget.suspendedMs),
+        wall_ms: Date.now() - startedAt
+      };
     },
     describe() {
       if (typeof window === 'undefined') return { state: 'idle', generation: 0 };
@@ -1227,6 +1348,10 @@
       throw error;
     }
     editorReplacementInFlight = true;
+    // Published so the hot-script filesystem writer in index.html can refuse mid-teardown.
+    // The in-module flag is not enough: that writer lives in a different script and must be
+    // able to tell "the Engine is about to be replaced" from "the Engine is fine".
+    if (typeof window !== 'undefined') window.__godotEditorReplacementInFlight = true;
     try {
     if (typeof window !== 'undefined') holdRuntimeFrame();
     // A running game owns the same virtual project filesystem. Replacing the
@@ -1240,18 +1365,45 @@
     // was mid-construction, invalidating it ("Engine must be inited before copying files")
     // and leaving a black viewport with no recovery path.
     if (operation) await advancePhase(operation, 'replacing_editor');
-    const replacement = await EditorLifecycle.prepareForReplacement();
+    const replacement = await EditorLifecycle.prepareForReplacement((status, budget) => {
+      // Not a failure and not a stall — the engine simply is not being given frames. Say so
+      // plainly and keep waiting; the budget is not being spent.
+      if (status === 'waiting_for_foreground') {
+        DiagnosticState.shutdownWaiting = true;
+        AgentStatusRail.setFocusNote('Keep this editor visible to finish the update');
+      } else {
+        DiagnosticState.shutdownWaiting = false;
+        AgentStatusRail.setFocusNote(`Finishing the update · ${Math.round(budget.activeMs / 1000)}s`);
+      }
+    });
+    DiagnosticState.shutdownWaiting = false;
+    AgentStatusRail.setFocusNote('');
+    // Recorded separately and always, success or failure: without hidden vs foreground-active
+    // duration next to the outcome, every future report of "the editor hung" is unfalsifiable.
+    DiagnosticState.lastShutdown = {
+      state: replacement.state,
+      generation: replacement.generation,
+      outcome: replacement.outcome || (replacement.awaited ? 'exited' : 'not_awaited'),
+      active_ms: replacement.active_ms || 0,
+      hidden_ms: replacement.hidden_ms || 0,
+      suspended_ms: replacement.suspended_ms || 0,
+      wall_ms: replacement.wall_ms || 0,
+      at: Date.now()
+    };
     if (!replacement.ok) {
       // Latch. Another Engine in this JS context cannot be trusted after this, and a rollback
       // retrying through a weaker path is how the barrier was defeated last time.
       editorRestartBlocked = true;
       DiagnosticState.session = 'restart_required';
       DiagnosticState.engine = 'failed';
-      DiagnosticState.engineError = `The previous Godot editor (state: ${replacement.state}) never confirmed it exited.`;
+      DiagnosticState.engineError = `The previous Godot editor (state: ${replacement.state}) never confirmed it exited after ${Math.round((replacement.active_ms || 0) / 1000)}s of foreground-active time.`;
       DiagnosticHUD.render();
-      const error = new Error(`The previous Godot editor did not confirm it exited (state: ${replacement.state}). Refusing to construct another engine in this page; reload the page to recover — the project is safe in storage.`);
+      const error = new Error(`The previous Godot editor did not confirm it exited (state: ${replacement.state}) after ${Math.round((replacement.active_ms || 0) / 1000)}s of foreground-active time (${Math.round((replacement.hidden_ms || 0) / 1000)}s hidden). Refusing to construct another engine in this page; reload the page to recover — the project is safe in storage.`);
       error.code = 'EDITOR_EXIT_TIMEOUT';
       error.lifecycle_state = replacement.state;
+      error.lifecycle_generation = replacement.generation;
+      error.active_ms = replacement.active_ms;
+      error.hidden_ms = replacement.hidden_ms;
       error.recovery_action = 'reload_page';
       throw error;
     }
@@ -1307,6 +1459,7 @@
     return true;
     } finally {
       editorReplacementInFlight = false;
+      if (typeof window !== 'undefined') window.__godotEditorReplacementInFlight = false;
     }
   }
 
@@ -2891,6 +3044,11 @@ func _on_command(args: Array) -> String:
 		"save_scene": reply = _op_save_scene()
 		"inspect_property": reply = _op_inspect_property(payload)
 		"open_scene": reply = _op_open_scene(payload)
+		"script_preflight": reply = _op_script_preflight(payload)
+		"script_refresh": reply = _op_script_refresh(payload)
+		"script_job_status": reply = _op_script_job_status(payload)
+		"script_open": reply = _op_script_open(payload)
+		"node_script_attach": reply = _op_node_script_attach(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
 	return _reply(reply)
 
@@ -3450,6 +3608,204 @@ func _aabb_of(node: Node) -> Array:
 			box.size.x, box.size.y, box.size.z,
 		]
 	return []
+
+# ---------------------------------------------------------------------------
+# Hot GDScript channel
+# ---------------------------------------------------------------------------
+#
+# Why these are deferred jobs rather than plain ops.
+#
+# The same constraint that rules out EditorInterface.save_scene() applies here: a
+# JavaScriptBridge callback runs inline on whatever JS call stack invoked it, at an arbitrary
+# point in the frame. EditorFileSystem.update_file() and Script.reload() both walk editor
+# state that a settled main-loop iteration owns, and the script editor may be holding an open
+# buffer on the very resource being replaced. So script_refresh only *queues* the work and
+# returns a job id; the caller polls script_job_status until the job reports done. That keeps
+# the synchronous boundary trivial and puts the real work where the editor expects it.
+#
+# The job result is deliberately evidence, not reassurance: the sha256 Godot reads back off
+# its own filesystem, the Error code reload() returned, and whether the script can be
+# instantiated. The bridge publishes nothing until those agree with the bytes it wrote.
+
+var _script_jobs: Dictionary = {}
+var _script_job_counter: int = 0
+
+func _open_script_for_path(path: String) -> Script:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return null
+	for opened in script_editor.get_open_scripts():
+		if opened != null and opened.resource_path == path:
+			return opened
+	return null
+
+## Refuse to overwrite a human's unsaved work.
+##
+## Godot 4 exposes no per-buffer dirty flag, so "unsaved" is defined by evidence: the script
+## is open in the script editor AND its in-memory source differs from what is on disk. This
+## has to run BEFORE the bridge copies its candidate bytes in, because afterwards disk and
+## buffer differ by design and every edit would look like a conflict.
+func _op_script_preflight(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	var exists := FileAccess.file_exists(path)
+	var opened := _open_script_for_path(path)
+	var unsaved := false
+	if opened != null:
+		if exists:
+			unsaved = opened.source_code != FileAccess.get_file_as_string(path)
+		else:
+			unsaved = true
+	return {
+		"ok": not unsaved,
+		"conflict": "user_buffer" if unsaved else null,
+		"error": "%s has unsaved edits open in the script editor; save or close it first." % path if unsaved else null,
+		"path": path,
+		"exists": exists,
+		"open_in_script_editor": opened != null,
+		"disk_sha256": FileAccess.get_sha256(path) if exists else "",
+	}
+
+func _op_script_refresh(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
+	var job: Dictionary = _script_jobs.get(job_id, {})
+	job["state"] = "done"
+	job["finished_at"] = Time.get_ticks_msec()
+	job["ok"] = false
+	job["failure"] = null
+	job["error"] = null
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	if not FileAccess.file_exists(path):
+		job["failure"] = "refresh_failed"
+		job["error"] = "Godot's filesystem does not see %s after the write." % path
+		_script_jobs[job_id] = job
+		return
+	# Read back from Godot's own filesystem. This is the only fact that proves the bytes the
+	# bridge handed to copyToFS are the bytes the engine now holds.
+	job["sha256"] = FileAccess.get_sha256(path)
+	var disk_source := FileAccess.get_file_as_string(path)
+	# CACHE_MODE_REPLACE updates the cached Resource in place, so a script the human already
+	# has open in the script editor follows the new source instead of stranding a stale buffer.
+	var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+	if loaded == null or not (loaded is Script):
+		job["failure"] = "compile_failed"
+		job["error"] = "Godot could not load %s as a Script." % path
+		_script_jobs[job_id] = job
+		return
+	var script := loaded as Script
+	# Assign the disk source EXPLICITLY before reloading.
+	#
+	# Script.reload() re-parses the resource's in-memory source_code, and CACHE_MODE_REPLACE
+	# does not reliably refresh that from disk for a script the editor already has cached. So a
+	# deliberately broken file was written to disk, hashed correctly, and then "compiled"
+	# successfully — because reload() had re-parsed the previous, valid source and returned OK.
+	# The compile check was reporting on the wrong bytes. Assigning source_code first makes the
+	# Error code reload() returns an answer about the candidate that was actually written.
+	script.source_code = disk_source
+	var reload_error := script.reload(true)
+	job["reload_error"] = reload_error
+	job["reload_error_name"] = error_string(reload_error)
+	job["can_instantiate"] = script.can_instantiate()
+	if reload_error != OK:
+		job["failure"] = "compile_failed"
+		job["error"] = "GDScript did not compile: %s" % error_string(reload_error)
+		_script_jobs[job_id] = job
+		return
+	job["ok"] = true
+	if reveal:
+		var dock := EditorInterface.get_file_system_dock()
+		if dock != null:
+			dock.navigate_to_path(path)
+	_script_jobs[job_id] = job
+
+## Poll a deferred job. 'ok' here answers "did the poll succeed", which is not the same
+## question as "did the work succeed" — that is 'job_ok', and it is null while pending.
+func _op_script_job_status(payload: Dictionary) -> Dictionary:
+	var job_id := String(payload.get("job_id", ""))
+	if not _script_jobs.has(job_id):
+		return {"ok": false, "error": "Unknown script job: %s" % job_id, "job_state": "unknown"}
+	var job: Dictionary = _script_jobs[job_id]
+	var state := String(job.get("state", "pending"))
+	var reply := {
+		"ok": true,
+		"job_id": job_id,
+		"job_state": state,
+		"path": job.get("path", ""),
+		"queued_at": job.get("queued_at", 0),
+	}
+	if state != "done":
+		reply["job_ok"] = null
+		return reply
+	reply["job_ok"] = job.get("ok", false)
+	reply["failure"] = job.get("failure", null)
+	reply["job_error"] = job.get("error", null)
+	reply["sha256"] = job.get("sha256", "")
+	reply["reload_error"] = job.get("reload_error", null)
+	reply["reload_error_name"] = job.get("reload_error_name", null)
+	reply["can_instantiate"] = job.get("can_instantiate", null)
+	reply["finished_at"] = job.get("finished_at", 0)
+	return reply
+
+## Switches to the Script workspace at a line. Only ever called when the user has turned
+## Follow on, or asked for this one change explicitly.
+func _op_script_open(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not ResourceLoader.exists(path):
+		return {"ok": false, "error": "Script does not exist: %s" % path}
+	var loaded := ResourceLoader.load(path, "Script")
+	if loaded == null or not (loaded is Script):
+		return {"ok": false, "error": "Could not load %s as a Script." % path}
+	var line := int(payload.get("line", 1))
+	EditorInterface.set_main_screen_editor("Script")
+	EditorInterface.edit_script(loaded as Script, line, 0, true)
+	return {"ok": true, "path": path, "line": line, "workspace": "Script"}
+
+## Attach a script to an existing node through UndoRedo, so the human can undo it exactly as
+## if they had dragged the file onto the node — and so the editor's own scene state, not the
+## bridge's model of it, is what the .tscn is then serialized from.
+func _op_node_script_attach(payload: Dictionary) -> Dictionary:
+	var requested := String(payload.get("node_path", ""))
+	var node := _resolve_node(requested)
+	if node == null:
+		return _resolve_error(requested)
+	var path := String(payload.get("script_path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "script_path must be a res:// path."}
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+	if loaded == null or not (loaded is Script):
+		return {"ok": false, "error": "Could not load %s as a Script." % path}
+	var script := loaded as Script
+	var previous := node.get_script()
+	var root := EditorInterface.get_edited_scene_root()
+	var resolved_path := String(root.get_path_to(node))
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: attach %s to %s" % [path.get_file(), node.name], UndoRedo.MERGE_DISABLE, node)
+	undo.add_do_method(node, "set_script", script)
+	undo.add_undo_method(node, "set_script", previous)
+	undo.commit_action()
+	return {
+		"ok": node.get_script() == script,
+		"error": null if node.get_script() == script else "The editor did not report the script attached to %s." % resolved_path,
+		"node_path": resolved_path,
+		"requested_path": requested,
+		"script_path": path,
+		"previous_script": previous.resource_path if previous != null else null,
+	}
 `;
 
   const WEBMCP_PLUGIN_CFG_PATH = 'addons/webmcp/plugin.cfg';
@@ -3566,6 +3922,542 @@ func _aabb_of(node: Node) -> Array:
       };
     }
   };
+
+  // ==========================================
+  // 5b. Hot GDScript transaction channel
+  // ==========================================
+  //
+  // Why this exists.
+  //
+  // Every general file transaction replaced the whole Godot WASM editor. That is correct for
+  // project.godot, deletes, and binary assets, but for a one-line GDScript edit it means
+  // asking a running engine to quit, and a browser that has throttled its frame loop may not
+  // produce an exit acknowledgement in time. The ownership guard then — correctly — refuses to
+  // construct a second Engine, and the session is dead for a reason that had nothing to do
+  // with the edit. The guard is not the bug. Reaching for it on every script edit was.
+  //
+  // So GDScript edits take a different route entirely: write the candidate bytes into the
+  // RUNNING editor's filesystem, ask Godot to refresh and recompile, and publish only after
+  // Godot itself acknowledges the path, the source hash, and the compilation. No Engine is
+  // constructed, so the shutdown race is not merely survived — it is never entered.
+  //
+  // What is deliberately NOT eligible: project.godot (the editor reads it once, at boot),
+  // WebMCP's own plugin (rewriting the channel from inside the channel), deletes and renames
+  // (EditorFileSystem.update_file cannot express a removal), binary assets, and any mixed
+  // transaction. Those still replace the editor, because for those it is the honest thing.
+
+  const HOT_SCRIPT_EXTENSION = '.gd';
+
+  function isHotScriptEligiblePath(rawPath) {
+    const path = cleanProjectPath(rawPath);
+    if (!path.toLowerCase().endsWith(HOT_SCRIPT_EXTENSION)) return false;
+    // The command channel is published by this addon. Hot-reloading it from inside a call it
+    // is currently servicing is not a live edit, it is pulling the floor up.
+    if (path.startsWith('addons/')) return false;
+    return true;
+  }
+
+  // Every operation must be an eligible `.gd` write. One ineligible entry sends the WHOLE
+  // transaction down the restart path: a transaction that half-applied live and half-applied
+  // through a restart would not be atomic, and atomicity is the only reason to call it one.
+  function hotScriptTransactionPlan(operations) {
+    if (!Array.isArray(operations) || operations.length === 0) {
+      return { eligible: false, reason: 'no_operations' };
+    }
+    for (const op of operations) {
+      if (!op || op.kind !== 'write') return { eligible: false, reason: `operation_kind:${op?.kind || 'unknown'}` };
+      if (typeof op.content !== 'string') return { eligible: false, reason: 'binary_content' };
+      if (!isHotScriptEligiblePath(op.path)) return { eligible: false, reason: `ineligible_path:${cleanProjectPath(op.path)}` };
+    }
+    return { eligible: true, reason: null, paths: operations.map(op => cleanProjectPath(op.path)) };
+  }
+
+  // Hex SHA-256 of the UTF-8 bytes, framed exactly as Godot's FileAccess.get_sha256 reports
+  // it — no `sha256:` prefix — so the two values can be compared directly.
+  async function sha256HexOfText(text) {
+    const bytes = new TextEncoder().encode(String(text));
+    if (typeof crypto === 'undefined' || !crypto?.subtle?.digest) return null;
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  // The smallest honest description of what changed: a common-prefix/common-suffix line
+  // range. It is not a full diff and does not pretend to be one — it is what the shelf shows
+  // as "lines 84-137 · +31 -12" and what Follow scrolls the script editor to.
+  function lineChangeSummary(before, after) {
+    const previousLines = String(before ?? '').split('\n');
+    const nextLines = String(after ?? '').split('\n');
+    let start = 0;
+    while (start < previousLines.length && start < nextLines.length && previousLines[start] === nextLines[start]) start += 1;
+    let endPrevious = previousLines.length;
+    let endNext = nextLines.length;
+    while (endPrevious > start && endNext > start && previousLines[endPrevious - 1] === nextLines[endNext - 1]) {
+      endPrevious -= 1;
+      endNext -= 1;
+    }
+    const removed = endPrevious - start;
+    const added = endNext - start;
+    if (removed === 0 && added === 0) {
+      return { changed: false, start_line: null, end_line: null, added: 0, removed: 0 };
+    }
+    return {
+      changed: true,
+      start_line: start + 1,
+      end_line: start + Math.max(added, 1),
+      added,
+      removed
+    };
+  }
+
+  // Godot prints a parse failure as a message line plus a separate `at:` location line
+  // carrying the only thing an author can act on — the line number. Paired here for the same
+  // reason classifyEngineDiagnostics pairs them: the message alone is not actionable.
+  function scriptDiagnosticsFromLogs(logs, sinceTime, resPath, generation = null) {
+    const scoped = logs.filter(entry => entry.time >= sinceTime
+      && (generation === null || entry.generation === generation));
+    const merged = [];
+    for (const entry of scoped) {
+      const message = String(entry.msg);
+      if (/^\s*at:\s/.test(message) && merged.length > 0) {
+        merged[merged.length - 1].location = message.trim();
+        continue;
+      }
+      merged.push({ level: entry.level, text: message, location: null });
+    }
+    const fileName = String(resPath).replace(/^res:\/\//, '');
+    const diagnostics = [];
+    for (const entry of merged) {
+      const combined = `${entry.text} ${entry.location || ''}`;
+      if (!/SCRIPT ERROR|Parse Error|Compile Error|Failed to load script|Invalid|Expected/i.test(combined)) continue;
+      if (!combined.includes(fileName)) continue;
+      const lineMatch = combined.match(new RegExp(`${fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:(\\d+)`));
+      diagnostics.push({
+        path: `res://${fileName}`,
+        line: lineMatch ? Number(lineMatch[1]) : null,
+        message: entry.text.replace(/^\s*(?:SCRIPT )?ERROR:\s*/i, '').trim(),
+        location: entry.location
+      });
+    }
+    return diagnostics;
+  }
+
+  // A plain-language first line for a compile failure, with the compiler's own words kept
+  // underneath rather than replaced by them.
+  function summarizeScriptDiagnostics(diagnostics, path) {
+    if (!diagnostics.length) return `Godot could not compile ${path}, and printed no line-level reason.`;
+    const first = diagnostics[0];
+    const where = first.line ? ` on line ${first.line}` : '';
+    return `${path.replace(/^res:\/\//, '')} has a problem${where}: ${first.message}`;
+  }
+
+  const HotScriptChannel = {
+    // Poll a deferred plugin job. The budget is active-time, for the same reason the shutdown
+    // budget is: a hidden pane gives Godot ~2fps, and call_deferred work runs on frames.
+    async awaitJob(jobId, budgetMs = 12000) {
+      let finished = null;
+      let pollError = null;
+      const waited = await awaitWithActiveBudget(() => {
+        const reply = EditorCommandChannel.call('script_job_status', { job_id: jobId });
+        if (!reply.ok) {
+          pollError = reply;
+          return true;
+        }
+        if (reply.job_state === 'done') {
+          finished = reply;
+          return true;
+        }
+        return false;
+      }, budgetMs, null, 50);
+      if (pollError) return { ok: false, error: pollError.error, stale: pollError.stale === true, unsupported: pollError.unsupported === true };
+      if (!finished) {
+        return {
+          ok: false,
+          timedOut: true,
+          error: `Godot did not finish the script refresh within ${Math.round(waited.budget.activeMs / 1000)}s of active editor time.`
+        };
+      }
+      return { ok: true, job: finished };
+    },
+
+    // Copy candidate bytes in, then make Godot prove it saw them. `expected` maps a cleaned
+    // project path to its SHA-256, and nothing is believed until Godot's own hash agrees.
+    async writeAndRefresh(files, expected, generations, { reveal = true, budgetMs = 12000 } = {}) {
+      if (typeof window === 'undefined' || typeof window.__godotEditorWriteFiles !== 'function') {
+        return { ok: false, code: 'SCRIPT_REFRESH_FAILED', error: 'The live editor filesystem writer is unavailable in this page.' };
+      }
+      const write = window.__godotEditorWriteFiles(files, {
+        expectLifecycleGeneration: generations.lifecycle,
+        expectCommandGeneration: generations.command,
+        projectName: DiagnosticState.activeProject
+      });
+      if (!write.ok) {
+        return {
+          ok: false,
+          code: write.reason === 'generation_changed' ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_REFRESH_FAILED',
+          error: write.error,
+          write
+        };
+      }
+      const refreshed = [];
+      for (const path of Object.keys(files)) {
+        const resPath = `res://${path}`;
+        const queued = EditorCommandChannel.call('script_refresh', { path: resPath, reveal });
+        if (!queued.ok) {
+          return {
+            ok: false,
+            code: queued.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_REFRESH_FAILED',
+            error: queued.error,
+            path: resPath
+          };
+        }
+        const settled = await this.awaitJob(queued.job_id, budgetMs);
+        if (!settled.ok) {
+          return {
+            ok: false,
+            code: settled.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_REFRESH_FAILED',
+            error: settled.error,
+            path: resPath
+          };
+        }
+        const job = settled.job;
+        if (job.job_ok !== true) {
+          return {
+            ok: false,
+            code: job.failure === 'compile_failed' ? 'SCRIPT_COMPILE_FAILED' : 'SCRIPT_REFRESH_FAILED',
+            error: job.job_error || 'Godot rejected the script refresh.',
+            path: resPath,
+            job
+          };
+        }
+        // The whole point of the two-phase design. Godot read this hash off its own
+        // filesystem; if it disagrees, the bytes in the engine are not the bytes we staged and
+        // publishing the candidate would be a lie.
+        if (expected[path] && job.sha256 && job.sha256 !== expected[path]) {
+          return {
+            ok: false,
+            code: 'SCRIPT_REFRESH_FAILED',
+            error: `Godot acknowledged ${resPath} with source hash ${job.sha256}, not the ${expected[path]} that was written.`,
+            path: resPath,
+            job
+          };
+        }
+        refreshed.push({ path: resPath, sha256: job.sha256 || null, can_instantiate: job.can_instantiate === true });
+      }
+      return { ok: true, refreshed };
+    }
+  };
+
+  // Write `script = ExtResource("id")` into the authoritative .tscn text for a node.
+  //
+  // The attach itself happens in the live editor through UndoRedo — this keeps the bridge's
+  // authoritative source in step with it WITHOUT a restart. The two are then consistent: the
+  // editor holds the change in its scene tree, the bridge holds it in the text it stages into
+  // the playtest engine and reboots from. Pure, so the .tscn surgery is testable.
+  function attachScriptInSceneText(sceneText, nodePath, scriptResPath) {
+    const text = String(sceneText);
+    const segments = String(nodePath).split('/').filter(Boolean);
+    if (segments.length === 0) return { ok: false, error: 'node_path is empty.' };
+    const name = segments[segments.length - 1];
+    const parent = segments.length === 1 ? '.' : segments.slice(0, -1).join('/');
+
+    let resourceId = null;
+    let nextText = text;
+    let addedResource = false;
+    const existing = new RegExp(`\\[ext_resource type="Script"[^\\]]*path="${scriptResPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*id="([^"]+)"\\]`).exec(text);
+    if (existing) {
+      resourceId = existing[1];
+    } else {
+      const used = new Set([...text.matchAll(/\[ext_resource[^\]]*id="([^"]+)"\]/g)].map(match => match[1]));
+      let candidate = `${used.size + 1}_${name.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'script'}`;
+      let suffix = 1;
+      while (used.has(candidate)) candidate = `${used.size + 1 + suffix++}_${name.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'script'}`;
+      resourceId = candidate;
+      const line = `[ext_resource type="Script" path="${scriptResPath}" id="${resourceId}"]`;
+      const header = /^\[gd_scene[^\]]*\]\n/m.exec(nextText);
+      if (!header) return { ok: false, error: 'The scene text has no [gd_scene] header.' };
+      const insertAt = header.index + header[0].length;
+      nextText = `${nextText.slice(0, insertAt)}${line}\n${nextText.slice(insertAt)}`;
+      // load_steps counts sub_resources and ext_resources plus one. Leaving it short makes
+      // Godot stop reading resources partway through the file.
+      nextText = nextText.replace(/(\[gd_scene[^\]]*?load_steps=)(\d+)/, (_, prefix, count) => `${prefix}${Number(count) + 1}`);
+      addedResource = true;
+    }
+
+    const nodeHeader = new RegExp(`^\\[node name="${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*parent="${parent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*\\]$`, 'm');
+    const match = nodeHeader.exec(nextText);
+    if (!match) return { ok: false, error: `No [node name="${name}" parent="${parent}"] entry in the scene text.` };
+    const bodyStart = match.index + match[0].length;
+    const nextHeader = nextText.indexOf('\n[', bodyStart);
+    const bodyEnd = nextHeader === -1 ? nextText.length : nextHeader;
+    const body = nextText.slice(bodyStart, bodyEnd);
+    const assignment = `script = ExtResource("${resourceId}")`;
+    const nextBody = /^script = .*$/m.test(body)
+      ? body.replace(/^script = .*$/m, assignment)
+      : `${body.replace(/\n+$/, '')}\n${assignment}\n`;
+    nextText = nextText.slice(0, bodyStart) + nextBody + nextText.slice(bodyEnd);
+    return { ok: true, text: nextText, resource_id: resourceId, added_ext_resource: addedResource };
+  }
+
+  // Whether a Follow action may take over the workspace. Off by default and user-owned: the
+  // agent never decides to move someone's view for them.
+  const FollowAgent = {
+    enabled: false,
+    pausedUntil: 0,
+    active() {
+      return this.enabled && Date.now() >= this.pausedUntil;
+    },
+    set(enabled) {
+      this.enabled = Boolean(enabled);
+      if (this.enabled) this.pausedUntil = 0;
+      return this.enabled;
+    },
+    // Direct human interaction with the editor pauses following, so the agent does not fight
+    // the user for the workspace. Following resumes on its own; it is not switched off.
+    pause(ms = 8000) {
+      if (!this.enabled) return;
+      this.pausedUntil = Date.now() + ms;
+    },
+    describe() {
+      return { enabled: this.enabled, paused: this.enabled && Date.now() < this.pausedUntil };
+    }
+  };
+
+  // The two-phase hot GDScript transaction.
+  //
+  // 1. validate revision, patch occurrences, path eligibility, human-buffer conflicts
+  // 2. build candidate source and hashes
+  // 3. copy candidate bytes into the CURRENT editor Engine
+  // 4. ask the plugin to refresh and compile on a deferred editor frame
+  // 5. verify Godot's acknowledged path, source hash, and compilation
+  // 6. only then publish activeFilesDict, persist, and increment the revision
+  //
+  // Failure restores the previous bytes and reloads the previous script through the same
+  // channel. If the restore itself cannot be acknowledged the session is marked
+  // `dirty_unpersisted` and requires deliberate recovery — it NEVER starts a second Engine,
+  // which is the whole reason this path exists.
+  async function runHotScriptTransaction({ operations, label, operation, attach = null, reveal = true }) {
+    const generations = {
+      lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
+      command: EditorCommandChannel.generation
+    };
+    await advancePhase(operation, 'inspecting');
+
+    const previousFiles = cloneProjectFiles(activeFilesDict);
+    const staged = cloneProjectFiles(activeFilesDict);
+    const candidates = {};
+    const expectedHashes = {};
+    const restoreBytes = {};
+    const changes = [];
+
+    for (const op of operations) {
+      const path = cleanProjectPath(op.path);
+      const resPath = `res://${path}`;
+      const preflight = EditorCommandChannel.call('script_preflight', { path: resPath });
+      if (!preflight.ok) {
+        if (preflight.conflict === 'user_buffer') {
+          const error = new Error(preflight.error || `${resPath} has unsaved edits open in the script editor.`);
+          error.code = 'USER_BUFFER_CONFLICT';
+          error.path = resPath;
+          throw error;
+        }
+        if (preflight.unsupported || preflight.stale) {
+          return { hot: false, reason: preflight.error || 'The editor command channel is unavailable.' };
+        }
+        const error = new Error(preflight.error || `Preflight failed for ${resPath}.`);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        throw error;
+      }
+      const before = typeof staged[path] === 'string' ? staged[path] : null;
+      candidates[path] = op.content;
+      staged[path] = op.content;
+      // Only files that already existed can be restored to previous bytes; a created file is
+      // restored by writing back an empty stub, since copyToFS cannot delete.
+      if (before !== null) restoreBytes[path] = before;
+      expectedHashes[path] = await sha256HexOfText(op.content);
+      changes.push({
+        path: resPath,
+        created: before === null,
+        before_sha256: before === null ? null : await sha256HexOfText(before),
+        after_sha256: expectedHashes[path],
+        ...lineChangeSummary(before ?? '', op.content)
+      });
+    }
+
+    // Published on the operation so every subsequent phase event carries it: the shelf shows
+    // what is being changed, not only that something is.
+    if (operation) {
+      const primaryChange = changes[0] || null;
+      operation.target = {
+        kind: attach ? 'script_attachment' : 'script',
+        resource_path: primaryChange ? primaryChange.path : null,
+        node_path: attach ? attach.node_path : null,
+        resource_count: changes.length
+      };
+      operation.change = primaryChange
+        ? {
+            start_line: primaryChange.start_line,
+            end_line: primaryChange.end_line,
+            added: changes.reduce((sum, change) => sum + change.added, 0),
+            removed: changes.reduce((sum, change) => sum + change.removed, 0),
+            before_sha256: primaryChange.before_sha256,
+            after_sha256: primaryChange.after_sha256,
+            created: primaryChange.created
+          }
+        : null;
+    }
+    await advancePhase(operation, 'preparing_change');
+    const refreshStartedAt = Date.now();
+    await advancePhase(operation, 'updating_script');
+    const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, { reveal });
+    if (!applied.ok) {
+      await advancePhase(operation, 'restoring_script');
+      const restore = Object.keys(restoreBytes).length > 0
+        ? await HotScriptChannel.writeAndRefresh(
+            restoreBytes,
+            Object.fromEntries(await Promise.all(Object.entries(restoreBytes).map(async ([path, text]) => [path, await sha256HexOfText(text)]))),
+            generations,
+            { reveal: false })
+        : { ok: true, refreshed: [] };
+      const diagnostics = applied.path
+        ? scriptDiagnosticsFromLogs(activeLogs, refreshStartedAt, applied.path, generations.command)
+        : [];
+      if (operation) operation.diagnostics = diagnostics;
+      if (!restore.ok) {
+        // The candidate is in the engine, the previous bytes are not, and the only tool that
+        // would "fix" it is a second Engine — which is exactly what must not happen. Latch the
+        // divergence so it is visible rather than silently carried forward.
+        DiagnosticState.hotScriptDirty = {
+          paths: Object.keys(candidates).map(path => `res://${path}`),
+          at: Date.now(),
+          restore_error: restore.error || null
+        };
+        DiagnosticState.session = 'dirty_unpersisted';
+        DiagnosticHUD.render();
+      }
+      const error = new Error(applied.code === 'SCRIPT_COMPILE_FAILED'
+        ? summarizeScriptDiagnostics(diagnostics, applied.path || 'the script')
+        : applied.error);
+      error.code = applied.code;
+      error.path = applied.path || null;
+      error.diagnostics = diagnostics;
+      error.rolled_back = restore.ok;
+      error.compiler_output = applied.job?.job_error || null;
+      throw error;
+    }
+
+    await advancePhase(operation, 'checking_code');
+    let attachResult = null;
+    if (attach) {
+      const scenePath = cleanProjectPath(attach.scene_path || activeMainScene);
+      const scriptResPath = `res://${cleanProjectPath(attach.script_path)}`;
+      const live = EditorCommandChannel.call('node_script_attach', {
+        node_path: attach.node_path,
+        script_path: scriptResPath
+      });
+      if (!live.ok) {
+        const error = new Error(live.error || `Could not attach ${scriptResPath} to ${attach.node_path}.`);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        throw error;
+      }
+      const sceneText = staged[scenePath];
+      if (typeof sceneText !== 'string') {
+        const error = new Error(`Cannot synchronize the scene reference: res://${scenePath} is not a text file in the project.`);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        throw error;
+      }
+      // The editor resolved the node path; using its answer rather than the requested one is
+      // what keeps an ambiguous leaf name from writing the reference onto the wrong node.
+      const written = attachScriptInSceneText(sceneText, live.node_path, scriptResPath);
+      if (!written.ok) {
+        const error = new Error(written.error);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        throw error;
+      }
+      staged[scenePath] = written.text;
+      attachResult = {
+        node_path: live.node_path,
+        requested_path: live.requested_path,
+        script_path: scriptResPath,
+        scene_path: `res://${scenePath}`,
+        previous_script: live.previous_script || null,
+        ext_resource_id: written.resource_id,
+        source_synced: true
+      };
+    }
+
+    await advancePhase(operation, 'persisting');
+    const previousMainScene = activeMainScene;
+    activeFilesDict = staged;
+    DiagnosticState.sceneRevision += 1;
+    const undoId = `undo_script_${Date.now()}`;
+    undoStack.push({
+      undo_id: undoId,
+      revision: DiagnosticState.sceneRevision,
+      label: label || 'Live script edit',
+      project_before: DiagnosticState.activeProject,
+      main_scene_before: previousMainScene,
+      files_before: previousFiles,
+      project_after: DiagnosticState.activeProject,
+      main_scene_after: activeMainScene,
+      files_after: cloneProjectFiles(staged)
+    });
+    const persisted = await persistActiveProjectState();
+    DiagnosticHUD.render();
+    BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+
+    // Never launch or switch to the game because a script changed. If a preview is already
+    // running it is now out of date, and saying so is more useful than silently refreshing
+    // something the user is not looking at.
+    const previewRunning = typeof window !== 'undefined' && window.__godotGameState === 'running';
+    let previewState = previewRunning ? 'stale' : 'not_running';
+    if (previewRunning && activeGodotViewport() === 'game') {
+      // The preview IS the surface the user is on, so refresh the game Engine only — the
+      // editor Engine is not touched.
+      try {
+        await stopGameRuntime(10000);
+        await startGameRuntime({ visible: true, timeoutMs: 60000 });
+        previewState = 'refreshed';
+      } catch (previewError) {
+        previewState = 'refresh_failed';
+        activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Refresh] ${previewError.message || String(previewError)}` });
+        if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+      }
+    }
+
+    // Follow is user-owned. With it off, the FileSystem dock reveal that script_refresh
+    // already performed is the whole of the visual feedback in Godot: no tab switch, no
+    // stolen focus, no workspace change.
+    const primary = changes[0];
+    let followed = false;
+    if (FollowAgent.active() && primary) {
+      const opened = EditorCommandChannel.call('script_open', {
+        path: primary.path,
+        line: primary.start_line || 1
+      });
+      followed = opened.ok === true;
+    }
+
+    await advancePhase(operation, 'complete');
+    return {
+      hot: true,
+      success: true,
+      label: label || 'Live script edit',
+      scene_revision: DiagnosticState.sceneRevision,
+      undo_id: undoId,
+      editor_channel: 'script_command',
+      editor_restarted: false,
+      editor_restart_count: editorRestartCount,
+      changed_paths: changes.map(change => change.path),
+      changes,
+      compilation: { status: 'compiled', acknowledged: applied.refreshed },
+      diagnostics: [],
+      persisted,
+      persisted_revision: DiagnosticState.persistedRevision,
+      preview_state: previewState,
+      follow: { ...FollowAgent.describe(), followed },
+      ...(attachResult ? { script_attachment: attachResult } : {})
+    };
+  }
 
   // ==========================================
   // 6. Authoritative Native Tool Manifest
@@ -5044,6 +5936,33 @@ func _aabb_of(node: Node) -> Array:
 
         return runManagedMutation('godot_apply_file_transaction', `Applying file transaction: ${args.label || 'Project update'}`, async (operation) => {
           await advancePhase(operation, 'validating_request');
+          // A transaction that only writes project .gd scripts does not need a new editor.
+          // Routed here rather than at the tool boundary so godot_apply_text_patch, which
+          // delegates to this handler, gets the live channel for free. Anything else — a
+          // project.godot change, a delete, a binary asset, a mixed transaction — falls
+          // through to the editor replacement below, which for those is the honest path.
+          const hotPlan = hotScriptTransactionPlan(args.operations);
+          if (hotPlan.eligible && EditorCommandChannel.available()) {
+            const outcome = await runHotScriptTransaction({
+              operations: args.operations,
+              label: args.label || 'Project file transaction',
+              operation
+            });
+            if (outcome.hot) {
+              const hotResult = { ...outcome, label: args.label || 'Project file transaction' };
+              storeIdempotentResult(args.idempotency_key, fingerprint, hotResult);
+              return hotResult;
+            }
+            // The channel dropped out between the availability check and the preflight. Fall
+            // through to the replacement path rather than failing the caller's edit.
+            activeLogs.push({
+              level: 'warning',
+              time: Date.now(),
+              generation: EditorCommandChannel.generation,
+              msg: `[Hot script channel] falling back to editor replacement: ${outcome.reason}`
+            });
+            if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+          }
           const previousFiles = cloneProjectFiles(activeFilesDict);
         const previousMainScene = activeMainScene;
         const restorePlaytest = typeof window !== 'undefined' && window.__godotGameState === 'running';
@@ -5130,6 +6049,106 @@ func _aabb_of(node: Node) -> Array:
           } else {
             releaseRuntimeFrame();
           }
+          return result;
+        }, 10000, { key: args.idempotency_key, fingerprint }, context);
+      }
+    },
+    {
+      definition: {
+        name: 'godot_apply_script_patch',
+        description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. Never restarts the editor, never switches workspace or launches the game; with Follow off it only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, and preview freshness as independent facts.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            expected_revision: { type: 'integer', minimum: 1 },
+            path: { type: 'string', description: 'res:// path of the .gd script to create or edit.' },
+            content: { type: 'string', description: 'Complete script source. Use for creation or full replacement; mutually exclusive with patches.' },
+            patches: {
+              type: 'array', minItems: 1, maxItems: 32,
+              description: 'Exact search/replace patches applied to the existing script source.',
+              items: {
+                type: 'object',
+                properties: {
+                  find: { type: 'string', minLength: 1 },
+                  replace: { type: 'string' },
+                  expected_occurrences: { type: 'integer', minimum: 1, maximum: 100, default: 1 }
+                },
+                required: ['find', 'replace'],
+                additionalProperties: false
+              }
+            },
+            attach_to_node_path: { type: 'string', description: 'Optional scene-relative node path to attach the script to through the editor UndoRedo stack.' },
+            attach_scene_path: { type: 'string', description: 'Scene whose authoritative .tscn source records the attachment. Defaults to the main scene.' },
+            label: { type: 'string' },
+            idempotency_key: { type: 'string' }
+          },
+          required: ['expected_revision', 'path'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}, context = {}) => {
+        const fingerprint = mutationFingerprint('godot_apply_script_patch', args);
+        const replay = getIdempotentReplay(args.idempotency_key, fingerprint);
+        if (replay) return replay;
+        if (args.expected_revision !== DiagnosticState.sceneRevision) {
+          const error = new Error(`Revision conflict: expected ${args.expected_revision}, current ${DiagnosticState.sceneRevision}. Inspect before patching.`);
+          error.code = 'REVISION_CONFLICT';
+          throw error;
+        }
+        const path = cleanProjectPath(args.path);
+        if (!isHotScriptEligiblePath(path)) {
+          throw new Error(`godot_apply_script_patch only edits project .gd scripts; res://${path} is not one. Use godot_apply_file_transaction.`);
+        }
+        const hasContent = typeof args.content === 'string';
+        const hasPatches = Array.isArray(args.patches) && args.patches.length > 0;
+        if (hasContent === hasPatches) {
+          throw new Error('Provide exactly one of `content` (create or replace) or `patches` (exact edits).');
+        }
+
+        let nextSource;
+        const patchSummary = [];
+        if (hasContent) {
+          nextSource = args.content;
+        } else {
+          const current = activeFilesDict[path];
+          if (typeof current !== 'string') {
+            throw new Error(`Cannot patch res://${path}: it is not an existing text file. Pass \`content\` to create it.`);
+          }
+          nextSource = current;
+          for (const patch of args.patches) {
+            const expected = Number.isInteger(patch.expected_occurrences) ? patch.expected_occurrences : 1;
+            const occurrences = nextSource.split(patch.find).length - 1;
+            if (occurrences !== expected) {
+              const error = new Error(`Patch occurrence mismatch in res://${path}: expected ${expected}, found ${occurrences}. No files were changed.`);
+              error.code = 'PATCH_OCCURRENCE_MISMATCH';
+              throw error;
+            }
+            nextSource = nextSource.split(patch.find).join(patch.replace);
+            patchSummary.push({ path: `res://${path}`, occurrences });
+          }
+        }
+
+        const label = args.label || (hasContent && typeof activeFilesDict[path] !== 'string' ? `Creating ${path}` : `Editing ${path}`);
+        return runManagedMutation('godot_apply_script_patch', label, async (operation) => {
+          if (!EditorCommandChannel.available()) {
+            // No live channel means no live edit. Rather than silently replacing the editor
+            // under a tool that promises not to, say which tool does that.
+            throw new Error(`The WebMCP editor plugin is not available (${EditorCommandChannel.unavailableReason}); use godot_apply_file_transaction, which replaces the editor.`);
+          }
+          const outcome = await runHotScriptTransaction({
+            operations: [{ kind: 'write', path, content: nextSource }],
+            label,
+            operation,
+            attach: args.attach_to_node_path
+              ? { node_path: args.attach_to_node_path, script_path: path, scene_path: args.attach_scene_path }
+              : null
+          });
+          if (!outcome.hot) {
+            throw new Error(`The live script channel is unavailable (${outcome.reason}); use godot_apply_file_transaction.`);
+          }
+          const result = { ...outcome, ...(patchSummary.length ? { patch_summary: patchSummary } : {}) };
+          storeIdempotentResult(args.idempotency_key, fingerprint, result);
           return result;
         }, 10000, { key: args.idempotency_key, fingerprint }, context);
       }
@@ -6740,6 +7759,7 @@ func _aabb_of(node: Node) -> Array:
         godot_inspect_project_files: input.paths?.length ? `Inspecting ${input.paths.length} project files` : 'Inspecting authoritative project manifest',
         godot_apply_file_transaction: input.label ? `${input.label} (${input.operations?.length || 1} file${input.operations?.length === 1 ? '' : 's'})` : `Applying file transaction (${input.operations?.length || 0} operations)`,
         godot_apply_text_patch: input.label || `Patching ${input.target_path || 'file'}`,
+        godot_apply_script_patch: input.label || `${input.content ? 'Writing' : 'Editing'} ${String(input.path || 'script').replace(/^res:\/\//, '')}`,
         godot_undo_transaction: `Undoing transaction: ${input.undo_id || 'latest snapshot'}`,
         godot_run_game: 'Launching live game test viewport',
         godot_stop_game: 'Stopping game session',
@@ -6805,6 +7825,9 @@ func _aabb_of(node: Node) -> Array:
         if (extra.sequence) entry.sequence = extra.sequence;
         if (Array.isArray(extra.timeline)) entry.timeline = extra.timeline.map(event => ({ ...event }));
         if (typeof extra.terminal === 'boolean') entry.terminal = extra.terminal;
+        if (extra.target) entry.target = extra.target;
+        if (extra.change) entry.change = extra.change;
+        if (extra.diagnostics) entry.diagnostics = extra.diagnostics;
       } else {
         entry = {
           id: ++this.sequence,
@@ -6813,6 +7836,9 @@ func _aabb_of(node: Node) -> Array:
           sequence: extra.sequence || 0,
           terminal: extra.terminal || false,
           timeline: Array.isArray(extra.timeline) ? extra.timeline.map(event => ({ ...event })) : [],
+          target: extra.target || null,
+          change: extra.change || null,
+          diagnostics: extra.diagnostics || null,
           status,
           toolName,
           label,
@@ -6836,6 +7862,12 @@ func _aabb_of(node: Node) -> Array:
         sequence: entry.sequence || 0,
         terminal: entry.terminal || false,
         is_diagnostic: DIAGNOSTIC_TOOLS.has(toolName),
+        // Retained alongside the existing fields rather than replacing them, so an older
+        // consumer of this event keeps working while a newer one can render the change.
+        target: entry.target || null,
+        change: entry.change || null,
+        diagnostics: entry.diagnostics || null,
+        follow: FollowAgent.describe(),
         at: entry.at,
         duration_ms: entry.durationMs
       };
@@ -7547,13 +8579,79 @@ func _aabb_of(node: Node) -> Array:
     return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
   }
 
-  // Godot's own docks already fill a narrow screen, so below this width the rail folds to a
-  // single full-width status strip and the camera controls and scene list move inside its
-  // expanded panel. Three side-by-side panels at 493px overlap each other and the docks.
-  const RAIL_STACK_BREAKPOINT = 760;
+  // Three content-driven desktop modes, chosen from the CONTAINER's width rather than the
+  // window's. A Codex or browser split pane makes the window wide and the shelf narrow, and
+  // sizing off `window.innerWidth` is exactly how three side-by-side panels ended up
+  // overlapping each other and Godot's docks in a 493px pane.
+  //
+  //   wide  — camera controls, activity, and scene details as three columns
+  //   split — one compact activity row with Follow and View; the rest moves into the drawer
+  //   narrow— readiness dots, an abbreviated action, and Follow stay visible; everything
+  //           else moves into a full-width details drawer
+  const RAIL_WIDE_BREAKPOINT = 1100;
+  const RAIL_SPLIT_BREAKPOINT = 720;
 
+  function railContainerWidth() {
+    if (typeof window === 'undefined') return RAIL_WIDE_BREAKPOINT;
+    const measured = AgentRail.root?.clientWidth || 0;
+    return measured > 0 ? measured : window.innerWidth;
+  }
+
+  function railMode() {
+    const width = railContainerWidth();
+    if (width >= RAIL_WIDE_BREAKPOINT) return 'wide';
+    if (width >= RAIL_SPLIT_BREAKPOINT) return 'split';
+    return 'narrow';
+  }
+
+  // Retained name and meaning: "fold the secondary panels into the status strip".
   function isNarrowRail() {
-    return typeof window !== 'undefined' && window.innerWidth < RAIL_STACK_BREAKPOINT;
+    return railMode() !== 'wide';
+  }
+
+  function prefersReducedMotion() {
+    return typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  }
+
+  // A truthful, atomic summary of what just changed — never simulated typing, and never a
+  // claim the edit is still in progress once Godot has acknowledged it.
+  function activityChipMarkup(entry) {
+    const target = entry?.target;
+    if (!target?.resource_path) return '';
+    const file = String(target.resource_path).replace(/^res:\/\//, '');
+    const change = entry.change || null;
+    const lines = change?.start_line
+      ? ` · ${change.start_line === change.end_line ? `line ${change.start_line}` : `lines ${change.start_line}\u2013${change.end_line}`}`
+      : '';
+    const counts = change && (change.added || change.removed) ? ` · +${change.added} \u2212${change.removed}` : '';
+    const pulse = entry.status === 'running' && !prefersReducedMotion() ? 'animation:webmcp-chip-pulse 1.4s ease-in-out infinite;' : '';
+    // Not shrinkable: it is short, and half of "+3 -0" is worse than none of the label's
+    // tail, which already truncates with an ellipsis.
+    return `<span data-activity-chip style="display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;`
+      + `border:1px solid ${statusColor(entry.status)};border-radius:999px;padding:2px 9px;${pulse}`
+      + `color:${RAIL_TOKENS.text};font:500 11px/1.5 ${RAIL_TOKENS.mono};white-space:nowrap">`
+      + `${escapeHtml(file)}${escapeHtml(lines)}${escapeHtml(counts)}</span>`;
+  }
+
+  function followButtonMarkup() {
+    const state = FollowAgent.describe();
+    const label = state.paused ? 'Follow (paused)' : 'Follow agent';
+    const tint = state.enabled ? RAIL_TOKENS.accent : RAIL_TOKENS.muted;
+    return `<button type="button" data-follow-agent="1" aria-pressed="${state.enabled}" `
+      + `title="${state.enabled ? 'The Script workspace opens at each change. Touching the editor pauses this.' : 'Off: changes are revealed in the FileSystem dock without changing your workspace.'}" `
+      + `style="${BUTTON_STYLE};min-height:28px;border-color:${tint};color:${tint}">`
+      + `<span aria-hidden="true" style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;background:${tint}"></span>${label}</button>`;
+  }
+
+  function ensureRailKeyframes() {
+    if (typeof document === 'undefined' || document.getElementById('webmcp-rail-keyframes')) return;
+    const style = document.createElement('style');
+    style.id = 'webmcp-rail-keyframes';
+    style.textContent = '@keyframes webmcp-chip-pulse{0%,100%{opacity:1}50%{opacity:.55}}'
+      + '@media (prefers-reduced-motion: reduce){[data-activity-chip]{animation:none !important}}';
+    document.head.appendChild(style);
   }
 
   function cameraControlsMarkup() {
@@ -7602,6 +8700,8 @@ func _aabb_of(node: Node) -> Array:
   const AgentRail = {
     root: null,
     resizeBound: false,
+    lastShelfHeight: -1,
+    observer: null,
 
     ensure() {
       if (typeof document === 'undefined' || !document.body) return false;
@@ -7610,12 +8710,23 @@ func _aabb_of(node: Node) -> Array:
       this.root.id = 'webmcp-agent-rail';
       this.root.style.cssText = `position:fixed;left:0;right:0;bottom:0;z-index:var(--gd-z-rail, 900);display:flex;align-items:flex-end;gap:8px;padding:8px 10px;pointer-events:none;font:500 12px/1.35 ${RAIL_TOKENS.ui}`;
       document.body.appendChild(this.root);
+      ensureRailKeyframes();
       if (!this.resizeBound && typeof window !== 'undefined') {
         this.resizeBound = true;
         window.addEventListener('resize', () => {
           this.applyLayout();
           AgentStatusRail.render();
         });
+        // A split pane changes the shelf's width without changing the window's, so
+        // `resize` alone never fires and the layout stayed in its wide, overlapping form.
+        // The container's own box is the thing the layout depends on, so observe that.
+        if (typeof ResizeObserver === 'function') {
+          this.observer = new ResizeObserver(() => {
+            this.applyLayout();
+            AgentStatusRail.render();
+          });
+          this.observer.observe(this.root);
+        }
       }
       this.applyLayout();
       return true;
@@ -7623,10 +8734,11 @@ func _aabb_of(node: Node) -> Array:
 
     applyLayout() {
       if (!this.root) return;
-      const narrow = isNarrowRail();
+      const mode = railMode();
+      const narrow = mode !== 'wide';
       // The camera presets and scene inspector are editor-only affordances, and the playtest
       // canvas is full-bleed: during a playtest the rail shrinks to the status strip alone so
-      // it covers as little of the game as possible.
+      // it reserves as little of the game surface as possible.
       const playtesting = activeGodotViewport() === 'game';
       for (const [id, secondary] of [['webmcp-camera-slot', true], ['webmcp-status-slot', false], ['webmcp-inspector-slot', true]]) {
         const slot = document.getElementById(id);
@@ -7635,10 +8747,28 @@ func _aabb_of(node: Node) -> Array:
       this.root.style.padding = playtesting ? '4px 10px' : '8px 10px';
       const strip = document.getElementById('webmcp-agent-status-strip');
       if (strip) {
-        strip.style.maxWidth = narrow || playtesting ? 'calc(100vw - 20px)' : 'min(620px, calc(100vw - 32px))';
+        // In split and narrow modes the activity row owns the full width; only the wide,
+        // three-column layout constrains it, and even there it must not exceed the container.
+        strip.style.maxWidth = '100%';
+        strip.style.width = '100%';
         strip.style.opacity = playtesting ? '0.82' : '1';
         if (playtesting) AgentStatusRail.expanded = false;
       }
+      this.publishShelfHeight();
+    },
+
+    // The shelf is reserved space, not an overlay: its measured height is published so
+    // index.html can shrink the editor canvas to fit above it. Expansion therefore RESIZES
+    // the viewport rather than covering Godot's own controls, and collapsing gives the
+    // pixels back on the next frame.
+    publishShelfHeight() {
+      if (!this.root || typeof window === 'undefined') return;
+      const cap = Math.round((window.innerHeight || 0) * 0.35);
+      const measured = Math.min(this.root.offsetHeight || 0, cap);
+      if (measured === this.lastShelfHeight) return;
+      this.lastShelfHeight = measured;
+      window.__webmcpShelfHeight = measured;
+      document.documentElement.style.setProperty('--webmcp-shelf-height', `${measured}px`);
     },
 
     slot(id, alignment) {
@@ -7647,7 +8777,11 @@ func _aabb_of(node: Node) -> Array:
       if (!element) {
         element = document.createElement('div');
         element.id = id;
-        element.style.cssText = `display:flex;justify-content:${alignment};min-width:0;flex:1 1 0;pointer-events:none`;
+        // The activity column is the one that carries variable-length text, so it gets the
+        // flexible space and the two content-sized side panels do not. Three equal columns
+        // crushed the label to "Gi..." while the camera row sat half empty.
+        const grow = id === 'webmcp-status-slot' ? '1 1 0' : '0 0 auto';
+        element.style.cssText = `display:flex;justify-content:${alignment};min-width:0;flex:${grow};pointer-events:none`;
         this.root.appendChild(element);
       }
       return element;
@@ -7734,37 +8868,81 @@ func _aabb_of(node: Node) -> Array:
         + `</span>`;
     },
 
+    // A one-shot navigation that does NOT turn persistent following on. Someone who wants to
+    // look at one change should not have to accept the agent moving their workspace forever.
+    viewChange(entryId) {
+      const entry = AgentObservationHUD.entries.find(item => item.id === Number(entryId));
+      const path = entry?.target?.resource_path;
+      if (!path) return;
+      const reply = EditorCommandChannel.call('script_open', { path, line: entry.change?.start_line || 1 });
+      if (!reply.ok) {
+        this.setFocusNote(reply.unsupported ? 'Opening a script needs the editor command plugin' : `Could not open ${path}: ${reply.error}`);
+      }
+    },
+
     render() {
       if (!this.ensure()) return;
+      const mode = railMode();
       const entries = AgentObservationHUD.entries;
       const latest = entries[entries.length - 1] || null;
       const elapsed = latest ? ((latest.completedAt || Date.now()) - latest.startedAt) / 1000 : 0;
       const color = latest ? statusColor(latest.status) : RAIL_TOKENS.muted;
-      const label = latest ? latest.label : 'Waiting for a WebMCP action';
-      const detail = latest?.detail ? ` · ${latest.detail}` : '';
-      const note = this.focusNote ? ` · ${this.focusNote}` : '';
+      // Plain-language intent first. The tool name and its arguments are evidence, and
+      // evidence belongs in the expanded details, not in the headline a non-technical
+      // collaborator reads while the agent is working.
+      const phaseText = latest?.phase ? phaseLabel(latest.phase) : '';
+      const label = latest ? (phaseText && latest.status === 'running' ? phaseText : latest.label) : 'Waiting for a WebMCP action';
+      const abbreviated = mode === 'narrow' && latest ? (phaseText || latest.label) : label;
+      const detail = mode === 'narrow' ? '' : (latest?.detail ? ` \u00b7 ${latest.detail}` : '');
+      const note = this.focusNote ? ` \u00b7 ${this.focusNote}` : '';
+      const chip = mode === 'narrow' ? '' : activityChipMarkup(latest);
+      const canView = Boolean(latest?.target?.resource_path);
+      const actions = `<span style="display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;margin-left:auto">`
+        + (canView && mode !== 'narrow'
+          ? `<button type="button" data-view-change="${latest.id}" style="${BUTTON_STYLE};min-height:28px;padding:4px 8px">View change</button>` : '')
+        + followButtonMarkup()
+        + `</span>`;
+      // An unavoidable restart that is simply not being given frames is a "waiting on you",
+      // not a hang and not a failure. Said plainly, and never in colour alone.
+      const foreground = DiagnosticState.shutdownWaiting
+        ? `<div style="display:flex;align-items:center;gap:6px;margin-top:5px;padding:4px 7px;border-radius:4px;background:${RAIL_TOKENS.raised};color:${RAIL_TOKENS.warn};font:500 11px/1.4 ${RAIL_TOKENS.ui}">`
+          + `<span aria-hidden="true">\u25cf</span><span>Keep this editor visible to finish the update</span></div>`
+        : '';
       const head = `<div style="display:flex;align-items:center;gap:8px;min-width:0;white-space:nowrap">`
         + this.readinessDots()
         + `<span style="width:6px;height:6px;border-radius:50%;background:${color};flex:0 0 auto"></span>`
-        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(label)}${escapeHtml(detail)}${escapeHtml(note)}</span>`
-        + `<span style="flex:0 0 auto;color:${RAIL_TOKENS.muted};font:400 11px/1 ${RAIL_TOKENS.mono}">${latest ? `${elapsed.toFixed(1)}s · ` : ''}Rev #${DiagnosticState.sceneRevision}</span>`
-        + `<span aria-hidden="true" style="flex:0 0 auto;color:${RAIL_TOKENS.muted}">${this.expanded ? '⌄' : '⌃'}</span>`
-        + `</div>`;
+        + `<span style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(abbreviated)}${escapeHtml(detail)}${escapeHtml(note)}</span>`
+        + chip
+        + (mode === 'wide' ? `<span style="flex:0 0 auto;color:${RAIL_TOKENS.muted};font:400 11px/1 ${RAIL_TOKENS.mono}">${latest ? `${elapsed.toFixed(1)}s \u00b7 ` : ''}Rev #${DiagnosticState.sceneRevision}</span>` : '')
+        + actions
+        + `<span aria-hidden="true" style="flex:0 0 auto;color:${RAIL_TOKENS.muted}">${this.expanded ? '\u2304' : '\u2303'}</span>`
+        + `</div>${foreground}`;
       if (!this.expanded) {
         this.node.innerHTML = head;
+        this.wireActions();
+        AgentRail.publishShelfHeight();
         return;
       }
       const timeline = (latest?.timeline || []).slice(-7).map(event =>
         `<div style="display:flex;gap:8px;color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.mono}">`
-        + `<span style="color:${event.phase === latest.phase ? RAIL_TOKENS.accent : RAIL_TOKENS.muted}">${event.phase === latest.phase ? '●' : '·'}</span>`
+        + `<span style="color:${event.phase === latest.phase ? RAIL_TOKENS.accent : RAIL_TOKENS.muted}">${event.phase === latest.phase ? '\u25cf' : '\u00b7'}</span>`
         + `<span style="color:${RAIL_TOKENS.text}">${escapeHtml(event.label)}</span>`
         + `<span style="margin-left:auto">${(event.elapsed_ms / 1000).toFixed(1)}s</span></div>`).join('');
+      // Compiler output belongs here, in full, under a plain-language summary — not folded
+      // into a status word.
+      const diagnostics = (latest?.diagnostics || []).map(diagnostic =>
+        `<div style="display:flex;gap:8px;padding:2px 0;color:${RAIL_TOKENS.error};font:400 11px/1.5 ${RAIL_TOKENS.mono}">`
+        + `<span style="flex:0 0 auto">${escapeHtml(String(diagnostic.path).replace(/^res:\/\//, ''))}${diagnostic.line ? `:${diagnostic.line}` : ''}</span>`
+        + `<span style="min-width:0;color:${RAIL_TOKENS.text}">${escapeHtml(diagnostic.message)}</span></div>`).join('');
       const rows = entries.slice(-5).reverse().map(entry =>
-        `<div style="display:grid;grid-template-columns:64px 1fr;gap:8px;padding:3px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
+        `<div style="display:grid;grid-template-columns:64px 1fr auto;gap:8px;padding:3px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
         + `<span style="color:${statusColor(entry.status)};text-transform:uppercase;font:500 10px/1.6 ${RAIL_TOKENS.ui}">${escapeHtml(entry.status)}</span>`
-        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(entry.label)}${entry.detail ? ` <span style="color:${RAIL_TOKENS.muted}">${escapeHtml(entry.detail)}</span>` : ''}</span></div>`).join('');
-      const narrow = isNarrowRail();
-      const folded = narrow
+        + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(entry.label)}${entry.detail ? ` <span style="color:${RAIL_TOKENS.muted}">${escapeHtml(entry.detail)}</span>` : ''}</span>`
+        + (entry.target?.resource_path
+          ? `<button type="button" data-view-change="${entry.id}" style="${BUTTON_STYLE};padding:2px 7px;font-size:11px">View change</button>`
+          : '<span></span>')
+        + `</div>`).join('');
+      const folded = mode !== 'wide'
         ? `<div data-folded-camera style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:6px;padding-top:6px;border-top:1px solid ${RAIL_TOKENS.border}">${cameraControlsMarkup()}</div>`
           + (() => {
             const scene = sceneRowsMarkup(12);
@@ -7773,8 +8951,30 @@ func _aabb_of(node: Node) -> Array:
               + `${scene.rows}${scene.overflow}</div>`;
           })()
         : '';
-      this.node.innerHTML = `${head}<div style="margin-top:6px;max-height:min(40vh,240px);overflow-y:auto">${timeline}${rows}${folded}</div>`;
-      if (narrow) wireCameraControls(this.node.querySelector('[data-folded-camera]'));
+      // Capped so the drawer can never take more than the reserved shelf's share of the page.
+      this.node.innerHTML = `${head}<div style="margin-top:6px;max-height:min(28vh,220px);overflow-y:auto">${timeline}${diagnostics}${rows}${folded}</div>`;
+      if (mode !== 'wide') wireCameraControls(this.node.querySelector('[data-folded-camera]'));
+      this.wireActions();
+      AgentRail.publishShelfHeight();
+    },
+
+    wireActions() {
+      const follow = this.node.querySelector('[data-follow-agent]');
+      if (follow) {
+        follow.onclick = (event) => {
+          event.stopPropagation();
+          FollowAgent.set(!FollowAgent.enabled);
+          this.render();
+        };
+        follow.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); };
+      }
+      for (const button of this.node.querySelectorAll('[data-view-change]')) {
+        button.onclick = (event) => {
+          event.stopPropagation();
+          this.viewChange(button.dataset.viewChange);
+        };
+        button.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); };
+      }
     }
   };
 
@@ -7934,6 +9134,23 @@ func _aabb_of(node: Node) -> Array:
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
     BuildingBlocksHUD.ensure();
+    // The render heartbeat has to be running BEFORE anything needs an active-time budget:
+    // a budget started with no heartbeat history cannot tell "throttled" from "not started".
+    RenderHeartbeat.start();
+    // Direct human interaction with the editor pauses Follow so the agent does not fight the
+    // user for their workspace. Following is paused, not switched off — it resumes on its own,
+    // because turning off a toggle the user set is not the agent's decision to make.
+    for (const surface of ['editor-canvas', 'game-canvas']) {
+      const element = document.getElementById(surface);
+      if (!element) continue;
+      for (const eventName of ['pointerdown', 'keydown', 'wheel']) {
+        element.addEventListener(eventName, () => {
+          if (!FollowAgent.enabled) return;
+          FollowAgent.pause();
+          AgentStatusRail.render();
+        }, { passive: true });
+      }
+    }
     CameraGuidance.install();
     CameraGuidance.lastGeometrySignature = CameraGuidance.geometrySignature();
     projectHydrationPromise.then(() => {

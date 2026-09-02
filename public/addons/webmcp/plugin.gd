@@ -100,6 +100,11 @@ func _on_command(args: Array) -> String:
 		"save_scene": reply = _op_save_scene()
 		"inspect_property": reply = _op_inspect_property(payload)
 		"open_scene": reply = _op_open_scene(payload)
+		"script_preflight": reply = _op_script_preflight(payload)
+		"script_refresh": reply = _op_script_refresh(payload)
+		"script_job_status": reply = _op_script_job_status(payload)
+		"script_open": reply = _op_script_open(payload)
+		"node_script_attach": reply = _op_node_script_attach(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
 	return _reply(reply)
 
@@ -659,3 +664,201 @@ func _aabb_of(node: Node) -> Array:
 			box.size.x, box.size.y, box.size.z,
 		]
 	return []
+
+# ---------------------------------------------------------------------------
+# Hot GDScript channel
+# ---------------------------------------------------------------------------
+#
+# Why these are deferred jobs rather than plain ops.
+#
+# The same constraint that rules out EditorInterface.save_scene() applies here: a
+# JavaScriptBridge callback runs inline on whatever JS call stack invoked it, at an arbitrary
+# point in the frame. EditorFileSystem.update_file() and Script.reload() both walk editor
+# state that a settled main-loop iteration owns, and the script editor may be holding an open
+# buffer on the very resource being replaced. So script_refresh only *queues* the work and
+# returns a job id; the caller polls script_job_status until the job reports done. That keeps
+# the synchronous boundary trivial and puts the real work where the editor expects it.
+#
+# The job result is deliberately evidence, not reassurance: the sha256 Godot reads back off
+# its own filesystem, the Error code reload() returned, and whether the script can be
+# instantiated. The bridge publishes nothing until those agree with the bytes it wrote.
+
+var _script_jobs: Dictionary = {}
+var _script_job_counter: int = 0
+
+func _open_script_for_path(path: String) -> Script:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return null
+	for opened in script_editor.get_open_scripts():
+		if opened != null and opened.resource_path == path:
+			return opened
+	return null
+
+## Refuse to overwrite a human's unsaved work.
+##
+## Godot 4 exposes no per-buffer dirty flag, so "unsaved" is defined by evidence: the script
+## is open in the script editor AND its in-memory source differs from what is on disk. This
+## has to run BEFORE the bridge copies its candidate bytes in, because afterwards disk and
+## buffer differ by design and every edit would look like a conflict.
+func _op_script_preflight(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	var exists := FileAccess.file_exists(path)
+	var opened := _open_script_for_path(path)
+	var unsaved := false
+	if opened != null:
+		if exists:
+			unsaved = opened.source_code != FileAccess.get_file_as_string(path)
+		else:
+			unsaved = true
+	return {
+		"ok": not unsaved,
+		"conflict": "user_buffer" if unsaved else null,
+		"error": "%s has unsaved edits open in the script editor; save or close it first." % path if unsaved else null,
+		"path": path,
+		"exists": exists,
+		"open_in_script_editor": opened != null,
+		"disk_sha256": FileAccess.get_sha256(path) if exists else "",
+	}
+
+func _op_script_refresh(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
+	var job: Dictionary = _script_jobs.get(job_id, {})
+	job["state"] = "done"
+	job["finished_at"] = Time.get_ticks_msec()
+	job["ok"] = false
+	job["failure"] = null
+	job["error"] = null
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	if not FileAccess.file_exists(path):
+		job["failure"] = "refresh_failed"
+		job["error"] = "Godot's filesystem does not see %s after the write." % path
+		_script_jobs[job_id] = job
+		return
+	# Read back from Godot's own filesystem. This is the only fact that proves the bytes the
+	# bridge handed to copyToFS are the bytes the engine now holds.
+	job["sha256"] = FileAccess.get_sha256(path)
+	var disk_source := FileAccess.get_file_as_string(path)
+	# CACHE_MODE_REPLACE updates the cached Resource in place, so a script the human already
+	# has open in the script editor follows the new source instead of stranding a stale buffer.
+	var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+	if loaded == null or not (loaded is Script):
+		job["failure"] = "compile_failed"
+		job["error"] = "Godot could not load %s as a Script." % path
+		_script_jobs[job_id] = job
+		return
+	var script := loaded as Script
+	# Assign the disk source EXPLICITLY before reloading.
+	#
+	# Script.reload() re-parses the resource's in-memory source_code, and CACHE_MODE_REPLACE
+	# does not reliably refresh that from disk for a script the editor already has cached. So a
+	# deliberately broken file was written to disk, hashed correctly, and then "compiled"
+	# successfully — because reload() had re-parsed the previous, valid source and returned OK.
+	# The compile check was reporting on the wrong bytes. Assigning source_code first makes the
+	# Error code reload() returns an answer about the candidate that was actually written.
+	script.source_code = disk_source
+	var reload_error := script.reload(true)
+	job["reload_error"] = reload_error
+	job["reload_error_name"] = error_string(reload_error)
+	job["can_instantiate"] = script.can_instantiate()
+	if reload_error != OK:
+		job["failure"] = "compile_failed"
+		job["error"] = "GDScript did not compile: %s" % error_string(reload_error)
+		_script_jobs[job_id] = job
+		return
+	job["ok"] = true
+	if reveal:
+		var dock := EditorInterface.get_file_system_dock()
+		if dock != null:
+			dock.navigate_to_path(path)
+	_script_jobs[job_id] = job
+
+## Poll a deferred job. 'ok' here answers "did the poll succeed", which is not the same
+## question as "did the work succeed" — that is 'job_ok', and it is null while pending.
+func _op_script_job_status(payload: Dictionary) -> Dictionary:
+	var job_id := String(payload.get("job_id", ""))
+	if not _script_jobs.has(job_id):
+		return {"ok": false, "error": "Unknown script job: %s" % job_id, "job_state": "unknown"}
+	var job: Dictionary = _script_jobs[job_id]
+	var state := String(job.get("state", "pending"))
+	var reply := {
+		"ok": true,
+		"job_id": job_id,
+		"job_state": state,
+		"path": job.get("path", ""),
+		"queued_at": job.get("queued_at", 0),
+	}
+	if state != "done":
+		reply["job_ok"] = null
+		return reply
+	reply["job_ok"] = job.get("ok", false)
+	reply["failure"] = job.get("failure", null)
+	reply["job_error"] = job.get("error", null)
+	reply["sha256"] = job.get("sha256", "")
+	reply["reload_error"] = job.get("reload_error", null)
+	reply["reload_error_name"] = job.get("reload_error_name", null)
+	reply["can_instantiate"] = job.get("can_instantiate", null)
+	reply["finished_at"] = job.get("finished_at", 0)
+	return reply
+
+## Switches to the Script workspace at a line. Only ever called when the user has turned
+## Follow on, or asked for this one change explicitly.
+func _op_script_open(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not ResourceLoader.exists(path):
+		return {"ok": false, "error": "Script does not exist: %s" % path}
+	var loaded := ResourceLoader.load(path, "Script")
+	if loaded == null or not (loaded is Script):
+		return {"ok": false, "error": "Could not load %s as a Script." % path}
+	var line := int(payload.get("line", 1))
+	EditorInterface.set_main_screen_editor("Script")
+	EditorInterface.edit_script(loaded as Script, line, 0, true)
+	return {"ok": true, "path": path, "line": line, "workspace": "Script"}
+
+## Attach a script to an existing node through UndoRedo, so the human can undo it exactly as
+## if they had dragged the file onto the node — and so the editor's own scene state, not the
+## bridge's model of it, is what the .tscn is then serialized from.
+func _op_node_script_attach(payload: Dictionary) -> Dictionary:
+	var requested := String(payload.get("node_path", ""))
+	var node := _resolve_node(requested)
+	if node == null:
+		return _resolve_error(requested)
+	var path := String(payload.get("script_path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "script_path must be a res:// path."}
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+	if loaded == null or not (loaded is Script):
+		return {"ok": false, "error": "Could not load %s as a Script." % path}
+	var script := loaded as Script
+	var previous := node.get_script()
+	var root := EditorInterface.get_edited_scene_root()
+	var resolved_path := String(root.get_path_to(node))
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: attach %s to %s" % [path.get_file(), node.name], UndoRedo.MERGE_DISABLE, node)
+	undo.add_do_method(node, "set_script", script)
+	undo.add_undo_method(node, "set_script", previous)
+	undo.commit_action()
+	return {
+		"ok": node.get_script() == script,
+		"error": null if node.get_script() == script else "The editor did not report the script attached to %s." % resolved_path,
+		"node_path": resolved_path,
+		"requested_path": requested,
+		"script_path": path,
+		"previous_script": previous.resource_path if previous != null else null,
+	}

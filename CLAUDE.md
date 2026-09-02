@@ -27,6 +27,7 @@ There is no build step — `public/` is served as-is. There is no lint config. `
 | `test/lifecycle_and_handshake.test.mjs` | editor replacement sequencing, playtest handshake verification, generation-scoped errors, health derivation, diagnostic classification |
 | `test/editor_boot.test.mjs` | Engine ownership, with two controllable fake Engines: late `init()`/`start()` resolution, async `start()` rejection, fail-fast FS copy, concurrent generations |
 | `test/plugin_source_parity.test.mjs` | embedded vs on-disk plugin source, op coverage, project.godot patching |
+| `test/hot_script_channel.test.mjs` | hot-GDScript eligibility, line-change summaries, parse diagnostics, `.tscn` script attachment, the active-time shutdown budget |
 
 **Reading a result honestly.** A live mutation reports four independent facts; do not collapse
 them. `applied` is `editor_command` or `editor_restart`. `source_synced` is the answer to
@@ -62,6 +63,26 @@ listener by its `at: listen (core/io/tcp_server.cpp:56)` line) — so entries ar
 their location before matching. Godot also writes `WARNING:` lines to **stderr**, so they
 arrive tagged `level: 'error'` — the text is what identifies them, and testing the level first
 counted every engine warning as a project error. Only `FATAL:` outranks the prefix.
+
+**GDScript edits do not replace the editor.** A `.gd`-only write goes through the hot script
+channel: candidate bytes are copied into the *running* editor Engine
+(`window.__godotEditorWriteFiles`, fenced on both the lifecycle generation that identifies the
+Engine instance and the command generation the plugin echoes), the plugin refreshes and
+recompiles on a deferred editor frame, and nothing is published until Godot's own `sha256`
+and reload result agree with what was written. A compile failure restores the previous bytes
+through the same channel and leaves the revision untouched; if the restore cannot be
+acknowledged the session becomes `dirty_unpersisted`. It never constructs a second Engine —
+that is the entire point. `project.godot`, the WebMCP plugin itself, deletes, renames, binary
+assets, and mixed transactions still replace the editor, because for those it is honest.
+`godot_apply_file_transaction` and `godot_apply_text_patch` route through the hot channel
+automatically when every operation qualifies.
+
+**The shutdown budget is active time, not wall-clock.** An unavoidable replacement still waits
+for the previous Engine's real `onExit`, but the 25-second budget is spent only while the
+document is visible *and* the render heartbeat is advancing. Hidden and stalled durations are
+recorded separately (`DiagnosticState.lastShutdown`) so a later "the editor hung" report can be
+checked rather than believed. While suspended the session reports
+`waiting_for_foreground` and the shelf says *Keep this editor visible to finish the update*.
 
 **A warning about timing in a background tab.** Godot's main loop is driven by
 `requestAnimationFrame`, which browsers throttle to roughly 2fps in a hidden or backgrounded

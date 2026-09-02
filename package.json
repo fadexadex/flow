@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node verify_catalog_parity.mjs && node --test test/operation_state_machine.test.mjs test/scene_projection.test.mjs test/scene_roundtrip.test.mjs test/lifecycle_and_handshake.test.mjs test/editor_boot.test.mjs test/plugin_source_parity.test.mjs test/project_text_normalization.test.mjs",
+    "test": "node verify_catalog_parity.mjs && node --test test/operation_state_machine.test.mjs test/scene_projection.test.mjs test/scene_roundtrip.test.mjs test/lifecycle_and_handshake.test.mjs test/editor_boot.test.mjs test/plugin_source_parity.test.mjs test/project_text_normalization.test.mjs test/hot_script_channel.test.mjs",
     "verify:catalog": "node verify_catalog_parity.mjs",
     "verify:plugin": "python3 scripts/embed_plugin.py && node --test test/plugin_source_parity.test.mjs"
   },

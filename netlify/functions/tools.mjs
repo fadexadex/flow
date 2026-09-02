@@ -199,6 +199,39 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
+    name: 'godot_apply_script_patch',
+    description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. Never restarts the editor, never switches workspace or launches the game; with Follow off it only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, and preview freshness as independent facts.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        expected_revision: { type: 'integer', minimum: 1 },
+        path: { type: 'string', description: 'res:// path of the .gd script to create or edit.' },
+        content: { type: 'string', description: 'Complete script source. Use for creation or full replacement; mutually exclusive with patches.' },
+        patches: {
+          type: 'array', minItems: 1, maxItems: 32,
+          description: 'Exact search/replace patches applied to the existing script source.',
+          items: {
+            type: 'object',
+            properties: {
+              find: { type: 'string', minLength: 1 },
+              replace: { type: 'string' },
+              expected_occurrences: { type: 'integer', minimum: 1, maximum: 100, default: 1 }
+            },
+            required: ['find', 'replace'],
+            additionalProperties: false
+          }
+        },
+        attach_to_node_path: { type: 'string', description: 'Optional scene-relative node path to attach the script to through the editor UndoRedo stack.' },
+        attach_scene_path: { type: 'string', description: 'Scene whose authoritative .tscn source records the attachment. Defaults to the main scene.' },
+        label: { type: 'string' },
+        idempotency_key: { type: 'string' }
+      },
+      required: ['expected_revision', 'path'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_apply_text_patch',
     description: 'Applies exact revision-checked search/replace patches and validates them through the acknowledged editor/runtime transaction path',
     input_schema: {

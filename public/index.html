@@ -167,7 +167,9 @@ a:active {
 
 #tab-game #game-canvas {
 	width: 100vw;
-	height: calc(100vh - 38px);
+	/* The shelf shrinks to a single status row during a playtest and is reserved rather than
+	   drawn over the game, so the canvas never has agent UI floating on top of it. */
+	height: calc(100vh - 38px - var(--webmcp-shelf-height, 0px));
 	max-width: 100%;
 }
 
@@ -667,6 +669,74 @@ function copyFilesIntoEngine(engine, files, projectName) {
 	return { ok: failed.length === 0, written: written.length, failed, copied };
 }
 
+// Write files into the *currently running editor* Engine without replacing it.
+//
+// This is the hot GDScript channel's only way into Godot's filesystem, and it is the exact
+// operation that made "Engine must be inited before copying files" possible, so every
+// precondition the ownership barrier cares about is checked here rather than at the call
+// site: the Engine must be the one the caller captured (both the lifecycle generation that
+// identifies the Engine instance and the command generation the plugin echoes), it must be
+// past init and actually `running`, no boot may be in flight, and no replacement may have
+// begun. A caller that cannot satisfy those gets a refusal with a machine-readable `reason`
+// — never a partial write, and never a second Engine.
+//
+// Writes are all-or-nothing at the caller's level, not this one's: copyToFS has no
+// transaction, so this reports exactly which paths landed and the caller restores previous
+// bytes through this same function on failure.
+window.__godotEditorWriteFiles = function (files, options) {
+	const opts = options || {};
+	const lifecycle = window.__godotEditorLifecycle;
+	const refuse = function (reason, error) {
+		return {
+			ok: false, reason: reason, error: error,
+			written: [], failed: [],
+			lifecycle_generation: lifecycle.generation,
+			command_generation: window.__godotEditorGeneration || 0,
+			lifecycle_state: lifecycle.state
+		};
+	};
+	if (window.__godotEditorReplacementInFlight === true) {
+		return refuse('replacement_in_flight', 'An editor replacement is in flight; refusing to write into an Engine that is being torn down.');
+	}
+	if (lifecycle.bootInFlight === true) {
+		return refuse('boot_in_flight', 'An editor boot is in flight; the filesystem is not settled.');
+	}
+	if (lifecycle.state !== 'running') {
+		return refuse('editor_not_running', 'The editor Engine is ' + lifecycle.state + ', not running.');
+	}
+	if (opts.expectLifecycleGeneration != null && Number(opts.expectLifecycleGeneration) !== lifecycle.generation) {
+		return refuse('generation_changed', 'The editor Engine was replaced (lifecycle generation '
+			+ opts.expectLifecycleGeneration + ' -> ' + lifecycle.generation + ').');
+	}
+	if (opts.expectCommandGeneration != null && Number(opts.expectCommandGeneration) !== Number(window.__godotEditorGeneration || 0)) {
+		return refuse('generation_changed', 'The editor command generation changed ('
+			+ opts.expectCommandGeneration + ' -> ' + (window.__godotEditorGeneration || 0) + ').');
+	}
+	if (!editor || typeof editor.copyToFS !== 'function') {
+		return refuse('engine_unavailable', 'No initialized editor Engine is available.');
+	}
+	const projectName = opts.projectName || window._mcpProjectName;
+	if (!projectName) {
+		return refuse('no_project', 'No active project name; cannot resolve a filesystem path.');
+	}
+	const result = copyFilesIntoEngine(editor, files, projectName);
+	// Re-check afterwards. copyToFS is synchronous, but the caller's decision to publish must
+	// rest on the Engine still being the same one when the last byte landed.
+	if (opts.expectLifecycleGeneration != null && Number(opts.expectLifecycleGeneration) !== lifecycle.generation) {
+		return refuse('generation_changed', 'The editor Engine was replaced while files were being written.');
+	}
+	return {
+		ok: result.ok,
+		reason: result.ok ? null : 'copy_failed',
+		error: result.ok ? null : (result.failed[0] && result.failed[0].error) || 'copyToFS rejected one or more paths.',
+		written: Object.keys(result.copied || {}),
+		failed: result.failed,
+		lifecycle_generation: lifecycle.generation,
+		command_generation: window.__godotEditorGeneration || 0,
+		lifecycle_state: lifecycle.state
+	};
+};
+
 // Consume the staged snapshot exactly once and acknowledge it by fingerprint and launch
 // token, not just by revision. Clearing on read matters because Execute() also runs when a
 // human presses Play in Godot: a stale WebMCP snapshot must never be silently applied to a
@@ -904,7 +974,13 @@ function startEditor(zip, customArgs) {
 		const scale = window.devicePixelRatio || 1;
 		const headerHeight = headerDiv.offsetHeight + 1;
 		const width = window.innerWidth;
-		const height = window.innerHeight - headerHeight;
+		// The collaboration shelf is RESERVED, not overlaid. It publishes its measured height
+		// here and the editor viewport shrinks to fit above it, so expanding the shelf can
+		// never cover Godot's Output panel, its camera controls, or the scene viewport — and
+		// collapsing it gives the pixels straight back. This runs every animation frame, so a
+		// height change is picked up without any coordination between the two scripts.
+		const shelfHeight = Math.max(0, Math.min(Number(window.__webmcpShelfHeight) || 0, Math.round(window.innerHeight * 0.35)));
+		const height = window.innerHeight - headerHeight - shelfHeight;
 		if (lastScale !== scale || lastWidth !== width || lastHeight !== height) {
 			editorCanvas.width = width * scale;
 			editorCanvas.height = height * scale;
