@@ -4751,13 +4751,14 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // of reporting a failure the editor never actually refused.
     if (!EditorCommandChannel.available()) await EditorCommandChannel.waitForReady(5000);
     const reply = EditorCommandChannel.call('workspace_3d', { node_path: nodePath || '' });
+    const confirmed = reply.ok === true && reply.workspace_confirmed === true;
     return {
-      followed: reply.ok === true,
-      workspace: reply.ok === true ? '3D' : null,
+      followed: confirmed,
+      workspace: confirmed ? '3D' : null,
       // Observed from the editor's visible main-screen control, not inferred from the request.
       workspace_confirmed: reply.workspace_confirmed ?? null,
       selected: reply.selected ?? null,
-      reason: reply.ok === true ? null : (reply.error || 'workspace_unavailable')
+      reason: confirmed ? null : (reply.ok === true ? 'workspace_unconfirmed' : (reply.error || 'workspace_unavailable'))
     };
   }
 
@@ -5062,7 +5063,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       navigation.revealed = retried.ok === true && retried.reveal?.revealed === true;
       navigation.reveal_retried = true;
     }
-    const followed = following ? navigation.arrived : false;
+    // A newly-created script cannot be opened before its bytes exist. In that case the
+    // refresh job performs the first real open after compilation; a confirmed workspace or
+    // reveal is evidence that following succeeded even though the pre-write arrival was
+    // necessarily false.
+    const followed = following
+      ? (navigation.arrived || navigation.workspace_confirmed === true || navigation.revealed === true)
+      : false;
 
     await advancePhase(operation, 'complete');
     return {
@@ -6532,7 +6539,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     {
       definition: {
         name: 'godot_apply_file_transaction',
-        description: 'Revision-checked atomic project edit. Writes or deletes text files, restarts the real Godot Editor, commits only after readiness acknowledgement, and records an undo snapshot',
+        description: 'Revision-checked atomic project edit. Eligible GDScript-only writes use the running editor hot channel; deletes and other project-file edits replace the editor. It commits only after the applicable acknowledgement and records an undo snapshot.',
         input_schema: {
           type: 'object',
           properties: {
@@ -6691,7 +6698,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     {
       definition: {
         name: 'godot_apply_script_patch',
-        description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. Never restarts the editor, never switches workspace or launches the game; with Follow off it only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, and preview freshness as independent facts.",
+        description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. It never launches the game or restarts the editor. With workspace follow enabled it opens the Script workspace at the changed lines; with follow disabled it preserves the current workspace and only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, navigation, and preview freshness as independent facts.",
         input_schema: {
           type: 'object',
           properties: {
@@ -6857,7 +6864,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     {
       definition: {
         name: 'godot_undo_transaction',
-        description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction and restarts the Godot Editor',
+        description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction. Hot GDScript transactions undo through the running editor without a restart; transactions that changed other project files may replace the editor.',
         input_schema: {
           type: 'object',
           properties: { undo_id: { type: 'string' } },

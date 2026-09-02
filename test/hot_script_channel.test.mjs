@@ -347,7 +347,7 @@ test('refreshing an already-visible playtest keeps the session in playtesting st
 // The channel's visible half is driven entirely by the payload it hands the plugin, so the
 // payload is what is asserted here. The plugin's own half (a real CodeEdit, a real Tween) is
 // browser-only and is verified against a running page.
-function hotChannelHarness({ viewport = 'editor', jobFields = {} } = {}) {
+function hotChannelHarness({ viewport = 'editor', jobFields = {}, workspaceConfirmed = true } = {}) {
   const calls = [];
   const EditorCommandChannel = {
     available: () => true,
@@ -365,6 +365,7 @@ function hotChannelHarness({ viewport = 'editor', jobFields = {} } = {}) {
           ...jobFields
         };
       }
+      if (op === 'workspace_3d') return { ok: true, workspace_confirmed: workspaceConfirmed, selected: payload.node_path || null };
       return { ok: true };
     }
   };
@@ -466,6 +467,20 @@ test('following a 3D change with the editor visible switches the workspace and r
   assert.equal(harness.calls.some(entry => entry.op === 'workspace_3d'), true);
   assert.equal(followed.workspace, '3D');
   assert.equal(followed.followed, true);
+});
+
+test('an accepted but unconfirmed 3D switch is not reported as visibly followed', async () => {
+  const harness = hotChannelHarness({ viewport: 'editor', workspaceConfirmed: false });
+  const followed = await harness.follow3DWorkspace('SkyrailDeck');
+  assert.equal(followed.followed, false);
+  assert.equal(followed.workspace, null);
+  assert.equal(followed.reason, 'workspace_unconfirmed');
+});
+
+test('post-write reveal can confirm following for a script that did not exist at arrival time', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  assert.match(body, /navigation\.arrived \|\| navigation\.workspace_confirmed === true \|\| navigation\.revealed === true/);
 });
 
 test('the human arrives at the script before the bytes are written, not after', () => {

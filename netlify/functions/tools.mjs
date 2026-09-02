@@ -172,7 +172,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_apply_file_transaction',
-    description: 'Revision-checked atomic project edit that restarts the real Godot Editor and records an undo snapshot',
+    description: 'Revision-checked atomic project edit. Eligible GDScript-only writes use the running editor hot channel; deletes and other project-file edits replace the editor. It commits only after the applicable acknowledgement and records an undo snapshot.',
     input_schema: {
       type: 'object',
       properties: {
@@ -200,7 +200,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_apply_script_patch',
-    description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. Never restarts the editor, never switches workspace or launches the game; with Follow off it only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, and preview freshness as independent facts.",
+    description: "Revision-checked GDScript creation or exact-patch editing applied to the RUNNING Godot editor without replacing it. Copies candidate bytes into the live editor filesystem, has Godot refresh and recompile the script on a deferred editor frame, and publishes only after Godot acknowledges the path, source hash, and compilation. A compile failure restores the previous bytes and leaves the revision untouched. It never launches the game or restarts the editor. With workspace follow enabled it opens the Script workspace at the changed lines; with follow disabled it preserves the current workspace and only reveals the file in the FileSystem dock. Reports changed line ranges, before/after hashes, compilation result, diagnostics, persistence, navigation, and preview freshness as independent facts.",
     input_schema: {
       type: 'object',
       properties: {
@@ -262,7 +262,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_undo_transaction',
-    description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction',
+    description: 'Restores the exact project snapshot captured by the most recent acknowledged authoring transaction. Hot GDScript transactions undo through the running editor without a restart; transactions that changed other project files may replace the editor.',
     input_schema: { type: 'object', properties: { undo_id: { type: 'string' } }, additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
