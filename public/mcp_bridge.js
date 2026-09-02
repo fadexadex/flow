@@ -455,6 +455,72 @@
     });
   }
 
+  const SAVED_PROJECT_PREFIX = 'project:';
+  const SAVED_PROJECT_LIMIT = 12;
+
+  function savedProjectSummary(row) {
+    return {
+      project_name: row.project_name,
+      main_scene: row.main_scene,
+      scene_revision: row.scene_revision,
+      file_count: Object.keys(row.files || {}).length,
+      updated_at: row.updated_at || 0,
+      content_fingerprint: row.content_fingerprint || null
+    };
+  }
+
+  async function readSavedProjectRows(database) {
+    return new Promise((resolve, reject) => {
+      const request = database.transaction('projects', 'readonly').objectStore('projects').getAll();
+      request.onsuccess = () => resolve((request.result || []).filter(row => typeof row?.id === 'string'
+        && row.id.startsWith(SAVED_PROJECT_PREFIX) && row.project_name));
+      request.onerror = () => reject(request.error || new Error('Failed to read the saved project library.'));
+    });
+  }
+
+  // Bounded, oldest-first. A library that grows forever is a storage-quota failure waiting to
+  // happen in a tab that also holds a WASM editor and its virtual filesystem.
+  async function pruneSavedProjects(database) {
+    const rows = await readSavedProjectRows(database);
+    if (rows.length <= SAVED_PROJECT_LIMIT) return [];
+    const doomed = rows
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
+      .slice(SAVED_PROJECT_LIMIT);
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction('projects', 'readwrite');
+      for (const row of doomed) transaction.objectStore('projects').delete(row.id);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error('Failed to prune the saved project library.'));
+    });
+    return doomed.map(row => row.project_name);
+  }
+
+  async function listSavedProjects() {
+    const database = await openRecordingDatabase();
+    try {
+      const rows = await readSavedProjectRows(database);
+      return rows
+        .map(savedProjectSummary)
+        .sort((a, b) => b.updated_at - a.updated_at);
+    } finally {
+      database.close();
+    }
+  }
+
+  async function readSavedProject(projectName) {
+    const database = await openRecordingDatabase();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = database.transaction('projects', 'readonly').objectStore('projects')
+          .get(`${SAVED_PROJECT_PREFIX}${projectName}`);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error || new Error('Failed to read the saved project.'));
+      });
+    } finally {
+      database.close();
+    }
+  }
+
   async function persistActiveProjectState(candidate = null) {
     // `candidate` lets a mutation persist the state it is ABOUT to publish, so the stored
     // snapshot is written before `sceneRevision` advances rather than after.
@@ -478,10 +544,26 @@
       };
       await new Promise((resolve, reject) => {
         const transaction = database.transaction('projects', 'readwrite');
-        transaction.objectStore('projects').put(snapshot);
+        const store = transaction.objectStore('projects');
+        store.put(snapshot);
+        // The library row.
+        //
+        // 'active' is a single slot: authoring or opening anything else overwrote it, and the
+        // project you had before was simply gone - which is why a project you stopped working
+        // on could never be returned to. Every persist now also writes a row keyed by project
+        // name, so the slot stays the "what is open" pointer and the library keeps the work.
+        // Undo history and idempotency records are deliberately left out of the library row:
+        // they are session state, and carrying them would make the store grow without bound.
+        store.put({
+          ...snapshot,
+          id: `${SAVED_PROJECT_PREFIX}${DiagnosticState.activeProject}`,
+          undo_stack: [],
+          idempotent_mutations: []
+        });
         transaction.oncomplete = resolve;
         transaction.onerror = () => reject(transaction.error || new Error('Failed to persist project state.'));
       });
+      await pruneSavedProjects(database);
       database.close();
       persistedProjectAvailable = Object.keys(snapshot.files).length > 0;
       hydratedSnapshot = snapshot;
@@ -4093,10 +4175,15 @@ func _run_script_refresh_job(job_id: String, path: String, reveal: Dictionary) -
 	job["buffer"] = _sync_open_script_buffer(script, disk_source, focus, maxi(start_line, 1))
 	if focus and bool(job["buffer"].get("synced", false)):
 		job["reveal"] = _reveal_script_change(maxi(start_line, 1), maxi(end_line, start_line), bool(reveal.get("animate", true)))
+	# Revealing the file in the FileSystem dock is the whole of the visible feedback in the
+	# default follow mode: it points at what the agent touched without taking the screen. It is
+	# reported rather than assumed, because "we told the dock" and "the dock exists" differ.
+	job["dock_revealed"] = false
 	if bool(reveal.get("reveal", true)):
 		var dock := EditorInterface.get_file_system_dock()
 		if dock != null:
 			dock.navigate_to_path(path)
+			job["dock_revealed"] = true
 	_script_jobs[job_id] = job
 
 ## Poll a deferred job. 'ok' here answers "did the poll succeed", which is not the same
@@ -4127,6 +4214,7 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["finished_at"] = job.get("finished_at", 0)
 	reply["exists"] = job.get("exists", null)
 	reply["buffer"] = job.get("buffer", null)
+	reply["dock_revealed"] = job.get("dock_revealed", null)
 	reply["reveal"] = job.get("reveal", null)
 	reply["screen"] = job.get("screen", null)
 	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
@@ -4595,6 +4683,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           // whether the human actually saw the change rather than assuming it.
           buffer: job.buffer || null,
           revealed: job.reveal || null,
+          dock_revealed: job.dock_revealed === true,
           workspace: job.screen || null
         });
       }
@@ -4699,14 +4788,29 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
   }
 
   const WORKSPACE_FOLLOW_PREFERENCE_KEY = 'webmcp.workspace-follow';
+  const WORKSPACE_FOLLOW_MODE_KEY = 'webmcp.workspace-follow-mode';
 
   // Whether a Follow action may take over the workspace. Off by default and user-owned: an
   // agent may request it explicitly, and the visible rail control remains the source of truth.
   // Persisting the choice for this tab prevents a reload from silently disabling collaboration.
+  //
+  // Following has two strengths, because a script edit and a 3D edit are not the same request.
+  // Seeing a node move means being in the 3D workspace. Seeing that a script was edited does
+  // NOT mean being dropped into the code: most of the time the useful fact is "the agent
+  // touched player_runner.gd", which the FileSystem dock can say by revealing the file without
+  // taking over the screen. 'file' is therefore the default, and 'script' - open the code at
+  // the changed lines - is the stronger opt-in.
+  const FOLLOW_MODES = ['file', 'script'];
   const FollowAgent = {
     enabled: (() => {
       try { return sessionStorage?.getItem(WORKSPACE_FOLLOW_PREFERENCE_KEY) === 'on'; }
       catch (_) { return false; }
+    })(),
+    mode: (() => {
+      try {
+        const stored = sessionStorage?.getItem(WORKSPACE_FOLLOW_MODE_KEY);
+        return FOLLOW_MODES.includes(stored) ? stored : 'file';
+      } catch (_) { return 'file'; }
     })(),
     pausedUntil: 0,
     active() {
@@ -4719,6 +4823,16 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       catch (_) {}
       return this.enabled;
     },
+    setMode(mode) {
+      if (!FOLLOW_MODES.includes(mode)) return this.mode;
+      this.mode = mode;
+      try { sessionStorage?.setItem(WORKSPACE_FOLLOW_MODE_KEY, mode); } catch (_) {}
+      return this.mode;
+    },
+    // Whether a script edit may take the whole screen. Only ever true on the explicit opt-in.
+    opensScriptWorkspace() {
+      return this.active() && this.mode === 'script';
+    },
     // Direct human interaction with the editor pauses following, so the agent does not fight
     // the user for the workspace. Following resumes on its own; it is not switched off.
     pause(ms = 8000) {
@@ -4726,7 +4840,11 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       this.pausedUntil = Date.now() + ms;
     },
     describe() {
-      return { enabled: this.enabled, paused: this.enabled && Date.now() < this.pausedUntil };
+      return {
+        enabled: this.enabled,
+        mode: this.mode,
+        paused: this.enabled && Date.now() < this.pausedUntil
+      };
     }
   };
 
@@ -4891,9 +5009,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // happens: you are looking at the file, and the agent's lines appear in it.
     const primary = changes[0] || null;
     const following = FollowAgent.active() && Boolean(primary);
+    // In 'file' mode the change is announced by revealing the file in the FileSystem dock and
+    // by the rail; the workspace is left exactly as the human had it. Only the 'script' opt-in
+    // takes over the screen.
+    const opensScript = following && FollowAgent.mode === 'script';
     const animate = !prefersReducedMotion();
     let arrival = null;
-    if (following) {
+    if (opensScript) {
       const opened = EditorCommandChannel.call('script_open', {
         path: primary.path,
         line: primary.start_line || 1,
@@ -4907,8 +5029,10 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     const refreshStartedAt = Date.now();
     await advancePhase(operation, 'updating_script');
     const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, {
+      // The dock reveal happens in both modes: it is the file-map answer to "what did the
+      // agent touch", and it costs the human nothing.
       reveal,
-      focus: following
+      focus: opensScript
         ? {
             path: cleanProjectPath(primary.path),
             start_line: primary.start_line || 1,
@@ -5040,8 +5164,9 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     const acknowledged = following
       ? (applied.refreshed || []).find(entry => entry.path === `res://${cleanProjectPath(primary.path)}`) || null
       : null;
-    let navigation = following
+    let navigation = opensScript
       ? {
+          mode: 'script',
           arrived: Boolean(arrival && arrival.ok),
           workspace: 'Script',
           workspace_confirmed: acknowledged?.workspace?.workspace_confirmed ?? arrival?.workspace_confirmed ?? null,
@@ -5052,8 +5177,21 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
             ? [acknowledged.revealed.first_line, acknowledged.revealed.last_line]
             : null
         }
-      : { arrived: false, reason: 'follow_disabled' };
-    if (following && !navigation.revealed) {
+      : following
+        ? {
+            // Following is on, but this mode deliberately does not move the human. What it
+            // claims is only what it did: the file was revealed where the human can see it,
+            // and the workspace was left alone.
+            mode: 'file',
+            arrived: false,
+            workspace_preserved: true,
+            file_revealed: acknowledged ? acknowledged.dock_revealed === true : false,
+            buffer_synced: acknowledged?.buffer?.synced === true,
+            buffer_stale: acknowledged?.buffer?.stale === true,
+            reason: null
+          }
+        : { mode: FollowAgent.mode, arrived: false, reason: 'follow_disabled' };
+    if (opensScript && !navigation.revealed) {
       const retried = EditorCommandChannel.call('script_open', {
         path: primary.path,
         line: primary.start_line || 1,
@@ -5067,9 +5205,9 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // refresh job performs the first real open after compilation; a confirmed workspace or
     // reveal is evidence that following succeeded even though the pre-write arrival was
     // necessarily false.
-    const followed = following
+    const followed = opensScript
       ? (navigation.arrived || navigation.workspace_confirmed === true || navigation.revealed === true)
-      : false;
+      : (following ? navigation.file_revealed === true : false);
 
     await advancePhase(operation, 'complete');
     return {
@@ -5796,6 +5934,9 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         const isWebGL = typeof WebGLRenderingContext !== 'undefined';
         const autoResumeEnabled = typeof localStorage !== 'undefined' ? localStorage.getItem('godot-webmcp-auto-resume') !== 'false' : true;
         const lastValidatedRev = hydratedSnapshot?.last_validated_revision ?? DiagnosticState.sceneRevision;
+        // Never let a storage read fail a status call: status is what you reach for when
+        // something is already wrong.
+        const savedProjects = await listSavedProjects().catch(() => []);
         const overall = deriveOverallStatus({
           engine: DiagnosticState.engine,
           session: DiagnosticState.session,
@@ -5884,7 +6025,11 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
             last_restore_error: ResumeState.lastRestoreError,
             auto_resume_enabled: autoResumeEnabled,
             last_validated_revision: lastValidatedRev,
-            last_error: projectPersistenceError
+            last_error: projectPersistenceError,
+            // What else is in this browser. Discoverable here so an agent does not have to
+            // know the library exists to find the project the human was working on before.
+            saved_projects: savedProjects.map(project => project.project_name),
+            saved_project_limit: SAVED_PROJECT_LIMIT
           },
           transport: {
             type: 'NativeInPageWebMCP + OptionalWSS',
@@ -5908,6 +6053,85 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       },
       handler: async (args = {}, context = {}) => {
         return executeRestoreOperation('validate_runtime', `Restoring persisted project: ${DiagnosticState.activeProject}`, context);
+      }
+    },
+    {
+      definition: {
+        name: 'godot_list_saved_projects',
+        description: 'Lists the projects kept in this browser, newest first. Every acknowledged persist writes a row keyed by project name, so a project you stopped working on can be returned to instead of being overwritten by the next one. Reports name, main scene, revision, file count, and when it was last saved.',
+        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async () => {
+        const projects = await listSavedProjects();
+        return {
+          success: true,
+          active_project: DiagnosticState.activeProject,
+          limit: SAVED_PROJECT_LIMIT,
+          count: projects.length,
+          projects: projects.map(project => ({ ...project, active: project.project_name === DiagnosticState.activeProject }))
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_open_saved_project',
+        description: 'Opens a project kept in this browser by name, replacing the editor with it. The current project is persisted to the library first, so switching away never loses it. Restores that project\'s files, main scene, and revision; undo history is session state and does not travel with the library row.',
+        input_schema: {
+          type: 'object',
+          properties: { project_name: { type: 'string', description: 'A name from godot_list_saved_projects' } },
+          required: ['project_name'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}, context = {}) => {
+        const requested = String(args.project_name || '').trim();
+        if (!requested) throw new Error('project_name is required.');
+        if (requested === DiagnosticState.activeProject
+          && DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
+          return {
+            success: true,
+            opened: false,
+            reason: 'already_active',
+            active_project: DiagnosticState.activeProject,
+            scene_revision: DiagnosticState.sceneRevision
+          };
+        }
+        const row = await readSavedProject(requested);
+        if (!row || !row.files || Object.keys(row.files).length === 0) {
+          const available = (await listSavedProjects()).map(project => project.project_name);
+          const error = new Error(`No saved project named ${requested}. Available: ${available.join(', ') || 'none'}.`);
+          error.code = 'SAVED_PROJECT_NOT_FOUND';
+          throw error;
+        }
+        // Persist what is open before replacing it, so switching away is never how work is
+        // lost. A project with no files has nothing worth keeping and nothing to overwrite.
+        if (Object.keys(activeFilesDict).length > 0) await persistActiveProjectState();
+        const previous = DiagnosticState.activeProject;
+        activeFilesDict = cloneProjectFiles(row.files);
+        activeMainScene = row.main_scene || activeMainScene;
+        DiagnosticState.activeProject = row.project_name;
+        DiagnosticState.sceneRevision = Number(row.scene_revision) || 1;
+        DiagnosticState.persistedRevision = DiagnosticState.sceneRevision;
+        // The undo stack belongs to the session that built it; replaying it against a
+        // different project's files would restore snapshots that never existed here.
+        undoStack.length = 0;
+        DiagnosticState.session = 'restoring';
+        DiagnosticHUD.render();
+        const restored = await executeRestoreOperation('validate_runtime', `Opening saved project: ${row.project_name}`, context);
+        await persistActiveProjectState();
+        BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+        return {
+          ...restored,
+          opened: true,
+          previous_project: previous,
+          active_project: DiagnosticState.activeProject,
+          scene_revision: DiagnosticState.sceneRevision,
+          file_count: Object.keys(activeFilesDict).length,
+          undo_stack_depth: 0,
+          undo_history: 'cleared_on_switch'
+        };
       }
     },
     {
@@ -7816,10 +8040,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     {
       definition: {
         name: 'godot_workspace_follow',
-        description: 'Enables or disables visible workspace following for this browser tab. When enabled, live script changes open at their changed lines and 3D node changes switch to the 3D workspace and select the edited node. The state is persisted in sessionStorage and mirrored by the Follow agent control.',
+        description: "Enables or disables visible workspace following for this browser tab, and chooses how strongly a script edit follows. In mode 'file' (the default) a script edit never takes the screen: the changed file is revealed in the FileSystem dock and the current workspace is preserved. In mode 'script' a script edit also opens the Script workspace at the changed lines. 3D node changes switch to the 3D workspace and select the edited node in both modes. The state is persisted in sessionStorage and mirrored by the Follow agent control.",
         input_schema: {
           type: 'object',
-          properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+          properties: {
+            enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' },
+            mode: { type: 'string', enum: ['file', 'script'], description: "'file' reveals the edited script in the FileSystem dock and leaves the workspace alone; 'script' opens the code at the changed lines" }
+          },
           additionalProperties: false
         },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
@@ -7828,10 +8055,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         const enabled = typeof args.enabled === 'boolean'
           ? FollowAgent.set(args.enabled)
           : FollowAgent.enabled;
+        const mode = typeof args.mode === 'string' ? FollowAgent.setMode(args.mode) : FollowAgent.mode;
         DiagnosticHUD.render();
         return {
           success: true,
           workspace_follow: enabled,
+          mode,
+          opens_script_workspace: FollowAgent.opensScriptWorkspace(),
           active: FollowAgent.active(),
           paused: FollowAgent.describe().paused,
           persistence: 'sessionStorage'
@@ -9635,12 +9865,23 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       + `${escapeHtml(pieces.join(' \u00b7 '))}</span>`;
   }
 
+  // Three states, not two, because "follow me into the code" is a different request from
+  // "tell me which file changed" and the second is what most edits actually want.
   function followButtonMarkup() {
     const state = FollowAgent.describe();
-    const label = state.paused ? 'Follow (paused)' : 'Follow agent';
     const tint = state.enabled ? RAIL_TOKENS.accent : RAIL_TOKENS.muted;
+    const label = state.paused
+      ? 'Follow (paused)'
+      : !state.enabled
+        ? 'Follow off'
+        : state.mode === 'script' ? 'Follow \u00b7 code' : 'Follow \u00b7 file';
+    const title = !state.enabled
+      ? 'Off: the workspace never changes. Click to follow which file the agent edits.'
+      : state.mode === 'file'
+        ? 'The edited script is revealed in the FileSystem dock and your workspace is left alone. Click to also open the code.'
+        : 'The Script workspace opens at each change. Touching the editor pauses this. Click to turn following off.';
     return `<button type="button" data-follow-agent="1" aria-pressed="${state.enabled}" `
-      + `title="${state.enabled ? 'The Script workspace opens at each change. Touching the editor pauses this.' : 'Off: changes are revealed in the FileSystem dock without changing your workspace.'}" `
+      + `title="${title}" `
       + `style="${BUTTON_STYLE};min-height:28px;border-color:${tint};color:${tint}">`
       + `<span aria-hidden="true" style="display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;background:${tint}"></span>${label}</button>`;
   }
@@ -9963,7 +10204,10 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       if (follow) {
         follow.onclick = (event) => {
           event.stopPropagation();
-          FollowAgent.set(!FollowAgent.enabled);
+          // off -> file -> code -> off
+          if (!FollowAgent.enabled) { FollowAgent.set(true); FollowAgent.setMode('file'); }
+          else if (FollowAgent.mode === 'file') FollowAgent.setMode('script');
+          else FollowAgent.set(false);
           this.render();
         };
         follow.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); };

@@ -1111,10 +1111,15 @@ func _run_script_refresh_job(job_id: String, path: String, reveal: Dictionary) -
 	job["buffer"] = _sync_open_script_buffer(script, disk_source, focus, maxi(start_line, 1))
 	if focus and bool(job["buffer"].get("synced", false)):
 		job["reveal"] = _reveal_script_change(maxi(start_line, 1), maxi(end_line, start_line), bool(reveal.get("animate", true)))
+	# Revealing the file in the FileSystem dock is the whole of the visible feedback in the
+	# default follow mode: it points at what the agent touched without taking the screen. It is
+	# reported rather than assumed, because "we told the dock" and "the dock exists" differ.
+	job["dock_revealed"] = false
 	if bool(reveal.get("reveal", true)):
 		var dock := EditorInterface.get_file_system_dock()
 		if dock != null:
 			dock.navigate_to_path(path)
+			job["dock_revealed"] = true
 	_script_jobs[job_id] = job
 
 ## Poll a deferred job. 'ok' here answers "did the poll succeed", which is not the same
@@ -1145,6 +1150,7 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["finished_at"] = job.get("finished_at", 0)
 	reply["exists"] = job.get("exists", null)
 	reply["buffer"] = job.get("buffer", null)
+	reply["dock_revealed"] = job.get("dock_revealed", null)
 	reply["reveal"] = job.get("reveal", null)
 	reply["screen"] = job.get("screen", null)
 	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made

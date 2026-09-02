@@ -509,3 +509,48 @@ test('waiting for a hidden page to paint is reported as waiting, not as a runtim
   assert.match(body, /waiting_for_foreground/);
   assert.doesNotMatch(body, /waitFor\(/, 'a wall-clock wait declares a throttled quit failed');
 });
+
+// ---------------------------------------------------------------------------
+// Following a script edit without taking the screen
+// ---------------------------------------------------------------------------
+
+test('file mode is the default, and it never opens the Script workspace', () => {
+  assert.match(bridgeSource, /const FOLLOW_MODES = \['file', 'script'\]/);
+  const start = bridgeSource.indexOf('  const FollowAgent = {');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('async function follow3DWorkspace', start));
+  assert.match(body, /FOLLOW_MODES\.includes\(stored\) \? stored : 'file'/, "an unknown stored mode falls back to 'file'");
+  assert.match(body, /opensScriptWorkspace\(\)[\s\S]*this\.mode === 'script'/);
+});
+
+test('a script edit only takes the screen on the explicit opt-in', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  assert.match(body, /const opensScript = following && FollowAgent\.mode === 'script'/);
+  assert.match(body, /if \(opensScript\) \{/, 'the pre-write arrival is gated on the opt-in');
+  assert.match(body, /focus: opensScript/, 'the plugin is only asked to focus in script mode');
+  // The dock reveal is unconditional: it is the answer to "which file did the agent touch".
+  assert.match(body, /reveal,/);
+});
+
+test('file mode reports what it did, and does not claim an arrival', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  assert.match(body, /mode: 'file'/);
+  assert.match(body, /workspace_preserved: true/);
+  assert.match(body, /file_revealed: acknowledged \? acknowledged\.dock_revealed === true : false/,
+    'the reveal is read back from the editor, not assumed from the request');
+});
+
+test('the dock reveal is carried back from the refresh job', async () => {
+  const harness = hotChannelHarness({ jobFields: { dock_revealed: true } });
+  const applied = await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 }, {});
+  assert.equal(applied.refreshed[0].dock_revealed, true);
+});
+
+test('an editor with no FileSystem dock does not report a reveal', async () => {
+  const harness = hotChannelHarness({ jobFields: { dock_revealed: false } });
+  const applied = await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 }, {});
+  assert.equal(applied.refreshed[0].dock_revealed, false);
+});

@@ -12,6 +12,23 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
+    name: 'godot_list_saved_projects',
+    description: 'Lists the projects kept in this browser, newest first. Every acknowledged persist writes a row keyed by project name, so a project you stopped working on can be returned to instead of being overwritten by the next one. Reports name, main scene, revision, file count, and when it was last saved.',
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_open_saved_project',
+    description: "Opens a project kept in this browser by name, replacing the editor with it. The current project is persisted to the library first, so switching away never loses it. Restores that project's files, main scene, and revision; undo history is session state and does not travel with the library row.",
+    input_schema: {
+      type: 'object',
+      properties: { project_name: { type: 'string', description: 'A name from godot_list_saved_projects' } },
+      required: ['project_name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_get_operation_status',
     description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
     input_schema: {
@@ -472,10 +489,13 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_workspace_follow',
-    description: 'Enables or disables visible workspace following for this browser tab. Script changes open at their changed lines; 3D node changes switch to 3D and select the edited node.',
+    description: "Enables or disables visible workspace following for this browser tab, and chooses how strongly a script edit follows. In mode 'file' (the default) a script edit never takes the screen: the changed file is revealed in the FileSystem dock and the current workspace is preserved. In mode 'script' a script edit also opens the Script workspace at the changed lines. 3D node changes switch to the 3D workspace and select the edited node in both modes.",
     input_schema: {
       type: 'object',
-      properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+      properties: {
+        enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' },
+        mode: { type: 'string', enum: ['file', 'script'], description: "'file' reveals the edited script in the FileSystem dock and leaves the workspace alone; 'script' opens the code at the changed lines" }
+      },
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: false }

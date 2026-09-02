@@ -549,3 +549,61 @@ test('a camera that held still on purpose says so', () => {
   assert.match(body, /already_framed/);
   assert.match(body, /agent_presence: AgentPresence\.describe\(\)/);
 });
+
+// ---------------------------------------------------------------------------
+// The saved project library
+// ---------------------------------------------------------------------------
+
+const { savedProjectSummary, SAVED_PROJECT_PREFIX, SAVED_PROJECT_LIMIT } = new Function(`
+  ${bridgeSlice('  const SAVED_PROJECT_PREFIX', '  async function readSavedProjectRows')}
+  return { savedProjectSummary, SAVED_PROJECT_PREFIX, SAVED_PROJECT_LIMIT };
+`)();
+
+test('a library row is summarised by what identifies the work, not by its bytes', () => {
+  const summary = savedProjectSummary({
+    id: `${SAVED_PROJECT_PREFIX}neon_skyrail_3d`,
+    project_name: 'neon_skyrail_3d',
+    main_scene: 'res://main_3d.tscn',
+    scene_revision: 43,
+    files: { 'project.godot': 'x', 'main_3d.tscn': 'y' },
+    updated_at: 1700,
+    content_fingerprint: 'sha256:abc'
+  });
+  assert.deepEqual(summary, {
+    project_name: 'neon_skyrail_3d',
+    main_scene: 'res://main_3d.tscn',
+    scene_revision: 43,
+    file_count: 2,
+    updated_at: 1700,
+    content_fingerprint: 'sha256:abc'
+  });
+});
+
+test('every persist writes a library row beside the active slot', () => {
+  const start = bridgeText.indexOf('async function persistActiveProjectState');
+  const body = bridgeText.slice(start, bridgeText.indexOf('function isFreshStartRequested', start));
+  assert.match(body, /id: 'active'/);
+  assert.match(body, /id: `\$\{SAVED_PROJECT_PREFIX\}\$\{DiagnosticState\.activeProject\}`/);
+  // Session state must not travel with the library row, or the store grows without bound.
+  assert.match(body, /undo_stack: \[\],\s*\n\s*idempotent_mutations: \[\]/);
+  assert.match(body, /pruneSavedProjects\(database\)/);
+});
+
+test('the library is bounded and evicts the oldest', () => {
+  const start = bridgeText.indexOf('async function pruneSavedProjects');
+  const body = bridgeText.slice(start, bridgeText.indexOf('async function listSavedProjects', start));
+  assert.equal(SAVED_PROJECT_LIMIT, 12);
+  assert.match(body, /rows\.length <= SAVED_PROJECT_LIMIT/);
+  assert.match(body, /\(b\.updated_at \|\| 0\) - \(a\.updated_at \|\| 0\)/);
+  assert.match(body, /\.slice\(SAVED_PROJECT_LIMIT\)/);
+});
+
+test('switching projects persists the one being left, and never replays its undo stack', () => {
+  const start = bridgeText.indexOf("name: 'godot_open_saved_project'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_operation_status'", start));
+  assert.match(body, /if \(Object\.keys\(activeFilesDict\)\.length > 0\) await persistActiveProjectState\(\)/,
+    'the outgoing project is saved before it is replaced');
+  assert.match(body, /undoStack\.length = 0/);
+  assert.match(body, /undo_history: 'cleared_on_switch'/);
+  assert.match(body, /SAVED_PROJECT_NOT_FOUND/);
+});
