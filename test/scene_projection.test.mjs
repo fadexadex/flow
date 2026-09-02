@@ -172,3 +172,55 @@ test('projection uses CSS pixels only, so devicePixelRatio never doubles the coo
   assert.deepEqual([first.x, first.y], [second.x, second.y]);
   assert.ok(first.x >= cssRect.left && first.x <= cssRect.left + cssRect.width);
 });
+
+// ---------------------------------------------------------------------------
+// Framing comfort: when the camera should move, and when it must hold still
+// ---------------------------------------------------------------------------
+
+const { framingComfort } = new Function(
+  `${slice('  function framingComfort', '  const AgentPresence = {')}\n  return { framingComfort };`)();
+
+const FRAME = { left: 0, top: 0, width: 1200, height: 700 };
+
+test('a node already centred and legible does not move the camera', () => {
+  const verdict = framingComfort({ onScreen: true, x: 600, y: 350 }, 90, FRAME);
+  assert.equal(verdict.comfortable, true);
+  assert.equal(verdict.reason, null);
+});
+
+test('a node crowded against the frame edge is reframed', () => {
+  const verdict = framingComfort({ onScreen: true, x: 40, y: 350 }, 90, FRAME);
+  assert.equal(verdict.comfortable, false);
+  assert.equal(verdict.reason, 'near_edge');
+});
+
+test('a node that has become a speck is reframed', () => {
+  const verdict = framingComfort({ onScreen: true, x: 600, y: 350 }, 6, FRAME);
+  assert.equal(verdict.comfortable, false);
+  assert.equal(verdict.reason, 'too_small');
+});
+
+test('a node filling the whole view is reframed', () => {
+  const verdict = framingComfort({ onScreen: true, x: 600, y: 350 }, 600, FRAME);
+  assert.equal(verdict.comfortable, false);
+  assert.equal(verdict.reason, 'too_close');
+});
+
+test('a node outside the frustum is never comfortable', () => {
+  assert.equal(framingComfort({ onScreen: false, x: 600, y: 350 }, 90, FRAME).reason, 'off_screen');
+});
+
+// An unmeasurable frame must not read as comfortable: "we could not tell" and "it is fine
+// where it is" are different answers, and only one of them may leave the work off-screen.
+test('a viewport with no laid-out size is not comfortable', () => {
+  const verdict = framingComfort({ onScreen: true, x: 0, y: 0 }, 90, { left: 0, top: 0, width: 0, height: 0 });
+  assert.equal(verdict.comfortable, false);
+  assert.equal(verdict.reason, 'no_viewport');
+});
+
+test('the comfort margin scales with the frame, not with fixed pixels', () => {
+  const wide = framingComfort({ onScreen: true, x: 150, y: 350 }, 90, FRAME);
+  const narrow = framingComfort({ onScreen: true, x: 150, y: 350 }, 90, { left: 0, top: 0, width: 600, height: 700 });
+  assert.equal(wide.comfortable, false, '150px into a 1200px frame is inside the edge margin');
+  assert.equal(narrow.comfortable, true, 'the same 150px is comfortably inside a 600px frame');
+});

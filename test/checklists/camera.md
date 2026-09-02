@@ -1,11 +1,12 @@
 # Checklist: camera
 
-Verifies camera-focus behavior and the targeting-reticle/arrow HUD state for a spawned node.
+Verifies camera-focus behavior and the agent work-light / edge-arrow HUD state for a spawned node.
 
 # STATUS: implemented. `godot_camera_focus` and `godot_camera_follow` ship in the tool catalog, and
 # `window.__webmcpFocusState` is published by `AgentFocusOverlay.publish()` on every focus attempt.
-# `mode` is one of `reticle` (node projects inside the frame), `arrow` (outside the frustum, so an
-# edge-clamped direction arrow with a distance label is drawn instead), or `hidden` with a `reason`.
+# `mode` is one of `anchored` (node projects inside the frame, so a work light is anchored to it and
+# `phase` is `working` or `settled`), `arrow` (outside the frustum, so an edge-clamped direction arrow
+# with a distance label is drawn instead), or `hidden` with a `reason`.
 # `hidden` is a FAIL only when a camera pose was available: `reason: "no_camera_pose"` is the honest
 # answer when the editor plugin is absent and the playtest is not running, and
 # `reason: "canvas_not_laid_out"` is expected when the canvas has zero size, which is the normal state
@@ -55,7 +56,7 @@ Prerequisite: complete the bootstrap sequence in `test/webmcp-harness.md` first.
    If `'NOT_IMPLEMENTED'`: report this row as NOT_IMPLEMENTED, not FAIL.
    Otherwise assert the object has shape `{mode, x, y, nodeName, offscreen}` and:
    - `mode !== 'hidden'`
-   - if `mode === 'reticle'`: `x` and `y` fall inside the middle 60% of the canvas bounding rect. Get the rect with:
+   - if `mode === 'anchored'`: `x` and `y` fall inside the middle 60% of the canvas bounding rect. Get the rect with:
      ```js
      document.querySelector('canvas')?.getBoundingClientRect()
      ```

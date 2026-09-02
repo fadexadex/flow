@@ -473,3 +473,71 @@ test('a genuine project error is still an error even beside a bridge note', () =
   assert.equal(result.errors.length, 1);
   assert.match(result.errors[0], /Parse Error/);
 });
+
+// ---------------------------------------------------------------------------
+// Agent presence: a collaborator you can see, not a marker that blinks
+// ---------------------------------------------------------------------------
+
+const bridgeText = fs.readFileSync(new URL('../public/mcp_bridge.js', import.meta.url), 'utf8');
+
+function bridgeSlice(startMarker, endMarker) {
+  const start = bridgeText.indexOf(startMarker);
+  const end = bridgeText.indexOf(endMarker, start);
+  assert.ok(start >= 0 && end > start, `Could not slice ${startMarker} .. ${endMarker}`);
+  return bridgeText.slice(start, end);
+}
+
+const { AgentPresence } = new Function('ActivityBeam', `
+  ${bridgeSlice('  const AgentPresence = {', '  // A two-pixel line across the top')}
+  return { AgentPresence };
+`)({ sync() {} });
+
+test('presence counts landed changes, not attempts', () => {
+  AgentPresence.state = 'attached';
+  AgentPresence.completed = 0;
+  AgentPresence.begin('Recolouring SkyrailDeck', 'SkyrailDeck');
+  assert.equal(AgentPresence.describe().state, 'working');
+  AgentPresence.settle(true);
+  AgentPresence.begin('Moving SkyrailDeck', 'SkyrailDeck');
+  AgentPresence.settle(false);
+  assert.equal(AgentPresence.describe().completed, 1, 'a failed operation is not a change');
+  assert.equal(AgentPresence.describe().state, 'attached');
+});
+
+test('the held node outlives the operation that touched it', () => {
+  AgentPresence.state = 'attached';
+  AgentPresence.target = null;
+  AgentPresence.begin('Moving PlayerRunner', 'PlayerRunner');
+  AgentPresence.settle(true);
+  assert.equal(AgentPresence.describe().target, 'PlayerRunner',
+    'after an edit settles, the agent is still holding that node');
+});
+
+test('presence is derived in the one funnel every tool call passes through', () => {
+  const start = bridgeText.indexOf('    update(status, toolName, input, detail');
+  const body = bridgeText.slice(start, bridgeText.indexOf('  // 8B2. Agent presence', start));
+  assert.match(body, /DIAGNOSTIC_TOOLS\.has\(toolName\)/,
+    'reading the session status is not "working on your model"');
+  assert.match(body, /AgentPresence\.begin/);
+  assert.match(body, /AgentPresence\.settle/);
+});
+
+test('the work light is anchored and settles; it is never a bounding box that expires', () => {
+  const start = bridgeText.indexOf('    renderWorkLight(');
+  const body = bridgeText.slice(start, bridgeText.indexOf('    renderEdgeArrow(', start));
+  assert.doesNotMatch(body, /border-top:2px solid|border-left:2px solid/, 'the corner-bracket box is gone');
+  assert.match(body, /radial-gradient/);
+  assert.match(body, /webmcp-halo-breathe/);
+  assert.match(body, /mode: 'anchored'/);
+  const focusStart = bridgeText.indexOf("    focus(nodeName, pos = null");
+  const focusBody = bridgeText.slice(focusStart, bridgeText.indexOf('    fade(reason', focusStart));
+  assert.match(focusBody, /if \(phase !== 'working'\)/,
+    'a light must not start fading while the agent is still working there');
+});
+
+test('a move is drawn from where the node actually was', () => {
+  const start = bridgeText.indexOf("    focus(nodeName, pos = null");
+  const body = bridgeText.slice(start, bridgeText.indexOf('    fade(reason', start));
+  assert.match(body, /projectWorldPoint\(options\.from/,
+    'the trail is two projected points, never an invented arc');
+});

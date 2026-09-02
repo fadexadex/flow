@@ -7916,7 +7916,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
 
         const navigation = await follow3DWorkspace(res.commandReply?.node_path || nodeName);
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(nodeName, pos, meshType, 'SPAWNED');
+          AgentFocusOverlay.settleWork(nodeName, pos, 'Added', res.ok !== false);
           CameraGuidance.noteSceneChanged(nodeName);
         }
 
@@ -7953,6 +7953,9 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         // to BranchB/TwinOrb land on BranchA/TwinOrb in the serialized scene.
         const requestedPath = args.node_path;
         const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : null;
+        // The light goes on before the edit, anchored to where the node is now, so the move is
+        // something you watch happen instead of something you are told about afterwards.
+        if (typeof window !== 'undefined') AgentFocusOverlay.beginWork(requestedPath, 'Moving');
         // Rotation was never serialized and `relative` was never implemented, so a
         // rotation-only edit lived in the editor and died on reload. Both are handled by
         // applyTransformToSceneText now, and Godot's own result overrides it when available.
@@ -7976,7 +7979,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         const navigation = await follow3DWorkspace(res.commandReply?.node_path || requestedPath);
         if (typeof window !== 'undefined') {
           const focusPath = res.commandReply?.node_path || requestedPath;
-          AgentFocusOverlay.focus(focusPath, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
+          AgentFocusOverlay.settleWork(focusPath, pos || null, 'Moved', res.ok !== false);
           CameraGuidance.noteSceneChanged(focusPath);
         }
 
@@ -8013,6 +8016,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       },
       handler: async (args = {}) => {
         const requestedPath = args.node_path;
+        if (typeof window !== 'undefined') AgentFocusOverlay.beginWork(requestedPath, 'Recolouring');
         const res = await liveMutateSceneFile((source, commandReply) => applyMaterialToSceneText(
           source,
           resolvedNodePath(commandReply, requestedPath),
@@ -8035,7 +8039,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         // A material tweak is not a geometry change: no auto-follow, and the reticle is
         // anchored to the node's real position rather than the origin.
         if (typeof window !== 'undefined') {
-          AgentFocusOverlay.focus(res.commandReply?.node_path || requestedPath, null, 'StandardMaterial3D', 'MATERIAL');
+          AgentFocusOverlay.settleWork(res.commandReply?.node_path || requestedPath, null, 'Recoloured', res.ok !== false);
         }
 
         return liveMutationResult(res, {
@@ -8561,6 +8565,15 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         };
         this.entries.push(entry);
       }
+      // Presence is derived here rather than tracked separately: this is the one funnel every
+      // tool call passes through, so the two can never disagree about whether an agent is
+      // working. Read-only tools are deliberately excluded - inspecting the session is not
+      // "working on your model", and saying so would make the signal meaningless.
+      if (!DIAGNOSTIC_TOOLS.has(toolName)) {
+        if (status === 'running') AgentPresence.begin(label, extra.target?.node_path || AgentPresence.target);
+        else if (status !== 'pending') AgentPresence.settle(status === 'succeeded');
+      }
+      AgentPresence.attach();
       activeLogs.push({ level: status === 'failed' ? 'error' : 'info', time: entry.at, msg: `[Agent #${entry.id}] ${status}: ${label}${detail ? ` — ${detail}` : ''}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
       this.renderFeed();
@@ -8761,6 +8774,132 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
   }
 
   // ==========================================
+  // ==========================================
+  // 8B2. Agent presence
+  // ==========================================
+  //
+  // The difference between a marker and a collaborator.
+  //
+  // The overlay this replaces drew a bracketed box at the place a change had just happened,
+  // held it for 3.2 seconds, and vanished. Every edit therefore read as an isolated event: a
+  // box blinked somewhere, then nothing, and between edits there was no sign that anything
+  // was attached at all. Presence is a *state* - attached, working on this node, this many
+  // changes so far - and it is what makes a run of edits read as one agent at work.
+  // Whether the work is already comfortably in frame.
+  //
+  // Re-framing on every edit is what makes agent-driven camera work feel twitchy: the camera
+  // lurches to a node that was already perfectly visible, and a run of small tweaks turns into
+  // a series of jolts. The camera should move when the work would otherwise be hard to see -
+  // outside the frame, crowded against an edge, a speck, or so close it fills the view - and
+  // hold still the rest of the time. Pure, so the policy is testable without a camera.
+  function framingComfort(projection, radius, rect, options = {}) {
+    if (!projection || projection.onScreen !== true) return { comfortable: false, reason: 'off_screen' };
+    if (!rect || !rect.width || !rect.height) return { comfortable: false, reason: 'no_viewport' };
+    const margin = typeof options.margin === 'number' ? options.margin : 0.16;
+    const minRadius = typeof options.minRadius === 'number' ? options.minRadius : 18;
+    const maxRadius = typeof options.maxRadius === 'number'
+      ? options.maxRadius
+      : Math.min(rect.width, rect.height) * 0.62;
+    const insetX = rect.width * margin;
+    const insetY = rect.height * margin;
+    const withinX = projection.x >= rect.left + insetX && projection.x <= rect.left + rect.width - insetX;
+    const withinY = projection.y >= rect.top + insetY && projection.y <= rect.top + rect.height - insetY;
+    if (!withinX || !withinY) return { comfortable: false, reason: 'near_edge' };
+    if (radius < minRadius) return { comfortable: false, reason: 'too_small' };
+    if (radius > maxRadius) return { comfortable: false, reason: 'too_close' };
+    return { comfortable: true, reason: null };
+  }
+
+  const AgentPresence = {
+    state: 'detached',
+    target: null,
+    action: '',
+    completed: 0,
+    startedAt: 0,
+    settledAt: 0,
+
+    attach() {
+      if (this.state === 'detached') this.state = 'attached';
+    },
+
+    begin(action, target) {
+      this.state = 'working';
+      this.action = action || 'Working';
+      if (target) this.target = target;
+      this.startedAt = Date.now();
+      ActivityBeam.sync();
+    },
+
+    settle(ok = true) {
+      if (this.state === 'working' && ok) this.completed += 1;
+      this.state = 'attached';
+      this.settledAt = Date.now();
+      ActivityBeam.sync();
+    },
+
+    // The node the agent is holding, which outlives any single operation: after an edit
+    // settles, "still on SkyrailDeck" is true and useful until it moves somewhere else.
+    hold(target) {
+      if (target) this.target = target;
+    },
+
+    describe() {
+      return {
+        state: this.state,
+        target: this.target,
+        action: this.action,
+        completed: this.completed,
+        working_ms: this.state === 'working' ? Date.now() - this.startedAt : 0
+      };
+    }
+  };
+
+  // A two-pixel line across the top of the page while an operation is in flight. It is the
+  // only always-visible "something is happening" signal that does not need the rail to be
+  // read, and it costs no layout: nothing on the page moves when it appears.
+  const ActivityBeam = {
+    node: null,
+
+    ensure() {
+      if (typeof document === 'undefined' || !document.body) return false;
+      if (!this.node) {
+        this.node = document.createElement('div');
+        this.node.id = 'webmcp-activity-beam';
+        this.node.setAttribute('aria-hidden', 'true');
+        this.node.style.cssText = [
+          'position:fixed', 'left:0', 'right:0', 'top:0', 'height:2px',
+          'z-index:var(--gd-z-return, 1000)', 'pointer-events:none',
+          'opacity:0', 'transition:opacity .22s ease',
+          'background:linear-gradient(90deg, transparent 0%, var(--gd-accent, #538dda) 18%, #8fc0ff 50%, var(--gd-accent, #538dda) 82%, transparent 100%)',
+          'background-size:220% 100%'
+        ].join(';');
+        document.body.appendChild(this.node);
+        this.ensureKeyframes();
+      }
+      return true;
+    },
+
+    ensureKeyframes() {
+      if (document.getElementById('webmcp-beam-keyframes')) return;
+      const style = document.createElement('style');
+      style.id = 'webmcp-beam-keyframes';
+      style.textContent = '@keyframes webmcp-beam-sweep{0%{background-position:120% 0}100%{background-position:-120% 0}}'
+        + '@keyframes webmcp-halo-breathe{0%,100%{transform:scale(1);opacity:.55}50%{transform:scale(1.08);opacity:.85}}'
+        + '@media (prefers-reduced-motion: reduce){#webmcp-activity-beam{animation:none !important}'
+        + '[data-webmcp-halo]{animation:none !important}}';
+      document.head.appendChild(style);
+    },
+
+    sync() {
+      if (!this.ensure()) return;
+      const working = AgentPresence.state === 'working';
+      this.node.style.opacity = working ? '1' : '0';
+      this.node.style.animation = working && !prefersReducedMotion()
+        ? 'webmcp-beam-sweep 1.1s linear infinite'
+        : 'none';
+    }
+  };
+
   // 8C. Agent 3D Focus Overlay — anchored, eased, edge-clamped
   // ==========================================
   // The previous version drew a reticle at a hard-coded `top:44%; left:50%`, so it sat dead
@@ -8803,8 +8942,32 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       if (publishState) this.publish({ mode: 'hidden', reason });
     },
 
+    pendingFrom: null,
+
+    // Called BEFORE the mutation, with the node's current position, so the light is already on
+    // the node while the edit is in flight instead of appearing once it is over. A node that
+    // does not exist yet (a spawn) has nothing to anchor to, so only presence is set - an
+    // anchor over a guessed position would be worse than no anchor.
+    beginWork(nodeName, action) {
+      AgentPresence.begin(action, nodeName);
+      AgentStatusRail.render();
+      const previous = findSceneNode(activeFilesDict, nodeName)?.world_position || null;
+      this.pendingFrom = Array.isArray(previous) ? previous.slice() : null;
+      if (!previous) return { mode: 'presence_only' };
+      return this.focus(nodeName, previous, 'Node3D', action, { phase: 'working' });
+    },
+
+    settleWork(nodeName, position, action, ok = true) {
+      AgentPresence.settle(ok);
+      AgentPresence.hold(nodeName);
+      const from = this.pendingFrom;
+      this.pendingFrom = null;
+      AgentStatusRail.render();
+      return this.focus(nodeName, position, 'Node3D', action, { phase: 'settled', from });
+    },
+
     // Read by the verification harness (test/checklists/camera.md) so a check can assert
-    // where the reticle actually landed rather than eyeballing a screenshot.
+    // where the work light actually landed rather than eyeballing a screenshot.
     publish(state) {
       if (typeof window === 'undefined') return;
       window.__webmcpFocusState = { ...state, at: Date.now() };
@@ -8821,7 +8984,8 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       };
     },
 
-    focus(nodeName, pos = null, type = 'Node3D', action = 'SPAWNED') {
+    focus(nodeName, pos = null, type = 'Node3D', action = 'Working on', options = {}) {
+      const phase = options.phase === 'working' ? 'working' : 'settled';
       if (!this.ensure()) return { mode: 'hidden', reason: 'no_document' };
       if (!editorSurfaceLive()) {
         // Neither the editor nor the playtest is on screen; there is nothing to point at.
@@ -8872,13 +9036,43 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       }
 
       const radius = projectedRadius(target.halfExtents, projection, rect);
+      // A move is shown as a move. `from` is the node's own previous world position, projected
+      // through the same camera, so the trail is the screen-space path between two points the
+      // editor actually reported - never an invented arc.
+      let trail = null;
+      if (Array.isArray(options.from) && options.from.length >= 3 && projection.onScreen) {
+        const origin = projectWorldPoint(options.from.map(Number), pose, rect);
+        if (origin && origin.onScreen) {
+          const dx = origin.x - projection.x;
+          const dy = origin.y - projection.y;
+          const length = Math.hypot(dx, dy);
+          if (length > 12) trail = { length, angle: Math.atan2(dy, dx) * 180 / Math.PI };
+        }
+      }
       const state = projection.onScreen
-        ? this.renderReticle(nodeName, type, action, target, projection, radius, rect, pose)
-        : this.renderEdgeArrow(nodeName, type, action, target, projection, rect, pose);
+        ? this.renderWorkLight(nodeName, type, action, target, projection, radius, rect, pose, { phase, trail })
+        : this.renderEdgeArrow(nodeName, type, action, target, projection, rect, pose, phase);
 
       clearTimeout(this.hideTimer);
-      this.hideTimer = setTimeout(() => this.hide('expired'), 3200);
+      // While the agent is working the light stays. It only starts fading once the change has
+      // settled, and it fades rather than blinking out.
+      if (phase !== 'working') {
+        this.hideTimer = setTimeout(() => this.fade('settled'), 2600);
+      }
       return state;
+    },
+
+    // A fade, not a disappearance. `hide()` still exists for the cases where the anchor became
+    // meaningless (no camera, editor gone) and holding a light there would be a lie.
+    fade(reason = 'settled') {
+      if (!this.overlay) return;
+      this.overlay.style.transition = 'opacity .55s ease';
+      this.overlay.style.opacity = '0';
+      clearTimeout(this.hideTimer);
+      this.hideTimer = setTimeout(() => {
+        this.overlay.style.transition = 'opacity .16s ease';
+        this.hide(reason);
+      }, 560);
     },
 
     // Eased over MAX_FOCUS_FRAMES, or snapped for reduced-motion users.
@@ -8908,10 +9102,14 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       this.animation = requestAnimationFrame(step);
     },
 
-    label(nodeName, type, action, detail) {
-      return `<div style="margin-top:10px;display:flex;align-items:center;gap:8px;padding:4px 10px;border:1px solid var(--gd-border,#484848);border-radius:6px;background:var(--gd-panel,#1b1b1b);color:var(--gd-text,#d0d0d0);font:600 12px/1.3 var(--gd-font-ui,Inter,system-ui,sans-serif);white-space:nowrap;transform:translateX(-50%)">`
-        + `<span style="color:var(--gd-accent,#538dda);text-transform:uppercase;letter-spacing:.06em;font-size:10px">${this.escape(action)}</span>`
-        + `<span>${this.escape(nodeName)}</span>`
+    label(nodeName, type, action, detail, phase = 'settled') {
+      // Sentence case, not a shouting all-caps verb. The label reads as a person describing
+      // what they are doing, which is the register the rest of these surfaces use.
+      const dot = phase === 'working' ? 'var(--gd-accent,#538dda)' : 'var(--gd-ok,#6cc36c)';
+      return `<div style="margin-top:${Math.round(28)}px;display:flex;align-items:center;gap:7px;padding:4px 10px;border:1px solid var(--gd-border,#484848);border-radius:999px;background:var(--gd-panel,#1b1b1b);color:var(--gd-text,#d0d0d0);font:500 12px/1.3 var(--gd-font-ui,Inter,system-ui,sans-serif);white-space:nowrap;transform:translateX(-50%);box-shadow:0 6px 18px rgba(0,0,0,.45)">`
+        + `<span aria-hidden="true" style="width:6px;height:6px;border-radius:50%;background:${dot};flex:0 0 auto"></span>`
+        + `<span>${this.escape(action)}</span>`
+        + `<span style="color:var(--gd-text,#d0d0d0);font-weight:600">${this.escape(nodeName)}</span>`
         + `<span style="color:var(--gd-text-muted,#9a9a9a);font:400 11px/1.3 var(--gd-font-mono,ui-monospace,monospace)">${this.escape(detail)}</span>`
         + `</div>`;
     },
@@ -8920,22 +9118,45 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
     },
 
-    renderReticle(nodeName, type, action, target, projection, radius, rect, pose) {
-      const size = Math.round(radius * 2);
+    // The work light.
+    //
+    // Not a bounding box. A box says "a thing happened inside this rectangle" and then has to
+    // leave, because a permanent rectangle over someone's model is intolerable. A soft light
+    // anchored on the node can stay for as long as the agent is actually there, breathe while
+    // it works, and settle rather than vanish - which is what makes a sequence of edits read
+    // as one collaborator rather than as a series of blinks.
+    renderWorkLight(nodeName, type, action, target, projection, radius, rect, pose, options = {}) {
+      const phase = options.phase === 'working' ? 'working' : 'settled';
+      const diameter = Math.round(Math.max(radius * 2.4, 54));
       const coordinates = target.worldPosition.map(value => Number(value).toFixed(1)).join(', ');
+      const accent = phase === 'working' ? 'var(--gd-accent, #538dda)' : 'var(--gd-ok, #6cc36c)';
+      const breathe = phase === 'working' && !prefersReducedMotion()
+        ? 'animation:webmcp-halo-breathe 1.6s ease-in-out infinite;'
+        : '';
+      // The trail is the part a box could never show: where the node came FROM. It is drawn
+      // only when the editor reported an actual move, and only in screen space, so it cannot
+      // claim a path through the world that the node did not take.
+      const trail = options.trail
+        ? `<span aria-hidden="true" style="position:absolute;left:50%;top:50%;width:${Math.round(options.trail.length)}px;height:2px;`
+          + `transform-origin:0 50%;transform:rotate(${options.trail.angle.toFixed(2)}deg) translateX(0);`
+          + `background:linear-gradient(90deg, transparent 0%, ${accent} 90%);opacity:.55;border-radius:2px"></span>`
+        : '';
       this.overlay.innerHTML =
-        `<div style="position:relative;width:${size}px;height:${size}px;margin-left:${-size / 2}px;margin-top:${-size / 2}px;border:1px solid var(--gd-accent,#538dda);border-radius:4px">`
-        + ['top:-1px;left:-1px;border-top:2px solid var(--gd-accent,#538dda);border-left:2px solid var(--gd-accent,#538dda)',
-           'top:-1px;right:-1px;border-top:2px solid var(--gd-accent,#538dda);border-right:2px solid var(--gd-accent,#538dda)',
-           'bottom:-1px;left:-1px;border-bottom:2px solid var(--gd-accent,#538dda);border-left:2px solid var(--gd-accent,#538dda)',
-           'bottom:-1px;right:-1px;border-bottom:2px solid var(--gd-accent,#538dda);border-right:2px solid var(--gd-accent,#538dda)']
-          .map(style => `<span style="position:absolute;width:10px;height:10px;${style}"></span>`).join('')
+        `<div style="position:relative;width:0;height:0">`
+        + trail
+        + `<span data-webmcp-halo="1" aria-hidden="true" style="position:absolute;left:50%;top:50%;width:${diameter}px;height:${diameter}px;`
+        + `margin-left:${-diameter / 2}px;margin-top:${-diameter / 2}px;border-radius:50%;${breathe}`
+        + `background:radial-gradient(circle, color-mix(in srgb, ${accent} 34%, transparent) 0%, transparent 70%)"></span>`
+        + `<span aria-hidden="true" style="position:absolute;left:50%;top:50%;width:${Math.round(diameter * 0.52)}px;height:${Math.round(diameter * 0.52)}px;`
+        + `margin-left:${-Math.round(diameter * 0.52) / 2}px;margin-top:${-Math.round(diameter * 0.52) / 2}px;`
+        + `border:1.5px solid ${accent};border-radius:50%;opacity:.9"></span>`
         + `</div>`
-        + this.label(nodeName, type, action, `[${coordinates}]`);
+        + this.label(nodeName, type, action, `[${coordinates}]`, phase);
       this.overlay.style.opacity = '1';
       this.moveTo(projection.x, projection.y);
       const state = {
-        mode: 'reticle',
+        mode: 'anchored',
+        phase,
         x: projection.x,
         y: projection.y,
         canvas_rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
@@ -8943,18 +9164,19 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         radius,
         nodeName,
         offscreen: false,
+        trail: options.trail ? { length: options.trail.length, angle: options.trail.angle } : null,
         camera_source: pose.source,
         world_position: target.worldPosition
       };
       this.publish(state);
-      // "framed" would overstate this: the reticle being anchored to the node says where the
+      // "framed" would overstate this: the light being anchored to the node says where the
       // node is on screen, not that the camera moved to it. Camera motion is reported
       // separately, and only when measured.
-      AgentStatusRail.setFocusNote(`${nodeName} · on screen`);
+      AgentStatusRail.setFocusNote(`${nodeName} · ${phase === 'working' ? 'in progress' : 'on screen'}`);
       return state;
     },
 
-    renderEdgeArrow(nodeName, type, action, target, projection, rect, pose) {
+    renderEdgeArrow(nodeName, type, action, target, projection, rect, pose, phase = 'settled') {
       const margin = 26;
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
@@ -8972,7 +9194,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       const detail = `off-screen · ${projection.distance.toFixed(1)}m · [${coordinates}]`;
       this.overlay.innerHTML =
         `<div style="width:0;height:0;margin-left:-9px;margin-top:-9px;border-left:14px solid var(--gd-accent,#538dda);border-top:9px solid transparent;border-bottom:9px solid transparent;transform:rotate(${angle}deg)"></div>`
-        + this.label(nodeName, type, action, detail);
+        + this.label(nodeName, type, action, detail, phase);
       this.overlay.style.opacity = '1';
       this.moveTo(clampedX, clampedY);
       const state = {
@@ -9032,6 +9254,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     pending: null,
     followTimer: null,
     lastGeometrySignature: null,
+    lastSkippedFollow: null,
     installed: false,
 
     autoFollowEnabled() {
@@ -9129,7 +9352,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         return { status: 'failed', reason: 'unknown_node', error: `Node '${nodeName}' is not in the active scene.`, transient: true };
       }
 
-      const overlayState = AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
+      const overlayState = AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
       const base = {
         transient: true,
         node_path: node.node_path,
@@ -9179,7 +9402,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           return { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
         }
         if (this.withinCooldown()) return this.yieldedToUser();
-        AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'FOCUS');
+        AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
         framesPresented += 1;
         after = this.readPose() || after;
         if (this.poseDelta(before, after) > 0.001) moved = true;
@@ -9248,8 +9471,31 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       const signature = this.geometrySignature();
       const changed = signature !== this.lastGeometrySignature;
       this.lastGeometrySignature = signature;
-      if (changed && nodeName) this.queueFollow(nodeName);
+      if (!changed || !nodeName) return changed;
+      // Hold still when the work is already comfortably in frame. This is the difference
+      // between a camera that follows the work and one that twitches at every edit.
+      const comfort = this.comfortOf(nodeName);
+      if (comfort.comfortable) {
+        this.lastSkippedFollow = { node: nodeName, at: Date.now() };
+        return changed;
+      }
+      this.lastSkippedFollow = null;
+      this.queueFollow(nodeName);
       return changed;
+    },
+
+    // The measured version of the pure policy: project the node through the real camera and
+    // ask whether it is comfortably framed. Anything it cannot measure is not comfortable,
+    // so an unknown state moves the camera rather than silently leaving the work off-screen.
+    comfortOf(nodeName) {
+      const surface = resolveGodotCanvas('editor');
+      const pose = editorViewportCameraPose();
+      const node = findSceneNode(activeFilesDict, nodeName);
+      if (!surface || !pose || !node?.world_position) return { comfortable: false, reason: 'unmeasurable' };
+      const rect = surface.canvas.getBoundingClientRect();
+      const projection = projectWorldPoint(node.world_position, pose, rect);
+      if (!projection) return { comfortable: false, reason: 'projection_failed' };
+      return framingComfort(projection, projectedRadius(node.aabb?.half_extents || [0.5, 0.5, 0.5], projection, rect), rect);
     }
   };
 
@@ -9345,6 +9591,28 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       + `border:1px solid ${statusColor(entry.status)};border-radius:999px;padding:2px 9px;${pulse}`
       + `color:${RAIL_TOKENS.text};font:500 11px/1.5 ${RAIL_TOKENS.mono};white-space:nowrap">`
       + `${escapeHtml(file)}${escapeHtml(lines)}${escapeHtml(counts)}</span>`;
+  }
+
+  // Presence, stated once, in the same place, always. "Agent attached · SkyrailDeck · 12
+  // changes" is a different claim from "here is the last thing that happened", and the rail
+  // was only ever making the second one.
+  function presenceMarkup(mode) {
+    const presence = AgentPresence.describe();
+    if (presence.state === 'detached') return '';
+    const working = presence.state === 'working';
+    const tint = working ? RAIL_TOKENS.accent : RAIL_TOKENS.muted;
+    const target = presence.target ? String(presence.target).split('/').pop() : null;
+    const pieces = [working ? 'Working' : 'Attached'];
+    if (target && mode !== 'narrow') pieces.push(target);
+    if (presence.completed > 0 && mode === 'wide') {
+      pieces.push(`${presence.completed} change${presence.completed === 1 ? '' : 's'}`);
+    }
+    const pulse = working && !prefersReducedMotion() ? 'animation:webmcp-chip-pulse 1.4s ease-in-out infinite;' : '';
+    return `<span data-agent-presence style="display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;${pulse}`
+      + `border:1px solid ${tint};border-radius:999px;padding:2px 9px;color:${RAIL_TOKENS.text};`
+      + `font:500 11px/1.5 ${RAIL_TOKENS.mono};white-space:nowrap">`
+      + `<span aria-hidden="true" style="width:5px;height:5px;border-radius:50%;background:${tint}"></span>`
+      + `${escapeHtml(pieces.join(' \u00b7 '))}</span>`;
   }
 
   function followButtonMarkup() {
@@ -9621,6 +9889,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         : '';
       const head = `<div style="display:flex;align-items:center;gap:8px;min-width:0;white-space:nowrap">`
         + this.readinessDots()
+        + presenceMarkup(mode)
         + `<span style="width:6px;height:6px;border-radius:50%;background:${color};flex:0 0 auto"></span>`
         + `<span style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis">${escapeHtml(abbreviated)}${escapeHtml(detail)}${escapeHtml(note)}</span>`
         + chip
