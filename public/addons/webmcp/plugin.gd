@@ -90,6 +90,7 @@ func _on_command(args: Array) -> String:
 		"select": reply = _op_select(payload)
 		"focus": reply = _op_focus(payload)
 		"focus_dispatch": reply = _op_focus_dispatch()
+		"workspace_3d": reply = _op_workspace_3d(payload)
 		"view_preset": reply = _op_view_preset(payload)
 		"viewport_tree": reply = _op_viewport_tree()
 		"node_add": reply = _op_node_add(payload)
@@ -102,9 +103,11 @@ func _on_command(args: Array) -> String:
 		"open_scene": reply = _op_open_scene(payload)
 		"script_preflight": reply = _op_script_preflight(payload)
 		"script_refresh": reply = _op_script_refresh(payload)
+		"script_delete": reply = _op_script_delete(payload)
 		"script_job_status": reply = _op_script_job_status(payload)
 		"script_open": reply = _op_script_open(payload)
 		"node_script_attach": reply = _op_node_script_attach(payload)
+		"node_script_restore": reply = _op_node_script_restore(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
 	return _reply(reply)
 
@@ -318,6 +321,7 @@ func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
 	return {"ok": true, "mechanism": mechanism}
 
 func _op_focus(payload: Dictionary) -> Dictionary:
+	EditorInterface.set_main_screen_editor("3D")
 	var selected := _op_select(payload)
 	if not selected.get("ok", false):
 		return selected
@@ -326,6 +330,17 @@ func _op_focus(payload: Dictionary) -> Dictionary:
 	selected["mechanism"] = dispatched.get("mechanism", "")
 	selected["shortcut"] = "spatial_editor/focus_selection"
 	selected["camera_moved"] = dispatched.get("camera_moved", false)
+	return selected
+
+func _op_workspace_3d(payload: Dictionary) -> Dictionary:
+	EditorInterface.set_main_screen_editor("3D")
+	var node_path := String(payload.get("node_path", ""))
+	if node_path == "":
+		return {"ok": true, "workspace": "3D", "selected": null}
+	var selected := _op_select({"node_path": node_path})
+	if not selected.get("ok", false):
+		return selected
+	selected["workspace"] = "3D"
 	return selected
 
 ## Dispatch only, no selection. Node3DEditor reacts to EditorSelection changes on a deferred
@@ -707,12 +722,10 @@ func _op_script_preflight(payload: Dictionary) -> Dictionary:
 		return {"ok": false, "error": "path must be a res:// path."}
 	var exists := FileAccess.file_exists(path)
 	var opened := _open_script_for_path(path)
-	var unsaved := false
-	if opened != null:
-		if exists:
-			unsaved = opened.source_code != FileAccess.get_file_as_string(path)
-		else:
-			unsaved = true
+	# ScriptEditor owns the authoritative dirty-buffer list. Comparing source_code with disk is
+	# racy during a refresh and can both miss editor state and flag our own acknowledged write.
+	var unsaved_files := EditorInterface.get_script_editor().get_unsaved_files()
+	var unsaved := path in unsaved_files
 	return {
 		"ok": not unsaved,
 		"conflict": "user_buffer" if unsaved else null,
@@ -732,6 +745,40 @@ func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
 	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
 	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _op_script_delete(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	call_deferred("_run_script_delete_job", job_id, path)
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _run_script_delete_job(job_id: String, path: String) -> void:
+	var job: Dictionary = _script_jobs.get(job_id, {})
+	job["state"] = "done"
+	job["finished_at"] = Time.get_ticks_msec()
+	job["failure"] = null
+	job["error"] = null
+	if FileAccess.file_exists(path):
+		var remove_error := DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+		if remove_error != OK:
+			job["ok"] = false
+			job["failure"] = "delete_failed"
+			job["error"] = "Godot could not remove %s: %s" % [path, error_string(remove_error)]
+			_script_jobs[job_id] = job
+			return
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	job["exists"] = FileAccess.file_exists(path)
+	job["ok"] = not bool(job["exists"])
+	if not bool(job["ok"]):
+		job["failure"] = "delete_failed"
+		job["error"] = "Godot still sees %s after removal." % path
+	_script_jobs[job_id] = job
 
 func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
 	var job: Dictionary = _script_jobs.get(job_id, {})
@@ -812,6 +859,10 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["reload_error_name"] = job.get("reload_error_name", null)
 	reply["can_instantiate"] = job.get("can_instantiate", null)
 	reply["finished_at"] = job.get("finished_at", 0)
+	reply["exists"] = job.get("exists", null)
+	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
+	# long authoring sessions grow without bound.
+	_script_jobs.erase(job_id)
 	return reply
 
 ## Switches to the Script workspace at a line. Only ever called when the user has turned
@@ -854,11 +905,40 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
 	undo.add_do_method(node, "set_script", script)
 	undo.add_undo_method(node, "set_script", previous)
 	undo.commit_action()
+	var attached: bool = node.get_script() == script
+	# A failed command must not leave a half-applied scene mutation behind. This direct restore
+	# only runs when UndoRedo did not produce the requested state.
+	if not attached:
+		node.set_script(previous)
 	return {
-		"ok": node.get_script() == script,
-		"error": null if node.get_script() == script else "The editor did not report the script attached to %s." % resolved_path,
+		"ok": attached,
+		"error": null if attached else "The editor did not report the script attached to %s." % resolved_path,
 		"node_path": resolved_path,
 		"requested_path": requested,
 		"script_path": path,
 		"previous_script": previous.resource_path if previous != null else null,
+	}
+
+## Restore the node-side half of a previously acknowledged WebMCP attachment during hot undo.
+## This deliberately does not add a second UndoRedo action: the WebMCP transaction is the undo
+## unit, and recording its rollback as another user action would make Ctrl-Z reapply stale state.
+func _op_node_script_restore(payload: Dictionary) -> Dictionary:
+	var requested := String(payload.get("node_path", ""))
+	var node := _resolve_node(requested)
+	if node == null:
+		return _resolve_error(requested)
+	var path := String(payload.get("script_path", ""))
+	var script: Script = null
+	if path != "":
+		var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+		if loaded == null or not (loaded is Script):
+			return {"ok": false, "error": "Could not restore script %s." % path}
+		script = loaded as Script
+	node.set_script(script)
+	var root := EditorInterface.get_edited_scene_root()
+	return {
+		"ok": node.get_script() == script,
+		"error": null if node.get_script() == script else "The editor did not restore the script on %s." % requested,
+		"node_path": String(root.get_path_to(node)),
+		"script_path": path if path != "" else null,
 	}

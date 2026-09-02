@@ -352,6 +352,43 @@ test('a genuine stderr error is still an actionable project error', () => {
   assert.equal(result.warnings.length, 0);
 });
 
+test('the browser filesystem sync limitation is classified as platform noise, not a project error', () => {
+  const result = classifyEngineDiagnostics([
+    { time: 1, generation: 1, level: 'error', msg: 'Failed to save IDB file system: No such file or directory' }
+  ], 1);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.platform_diagnostics.length, 1);
+});
+
+test('rolled-back script diagnostics remain auditable but are not active project errors', () => {
+  const result = classifyEngineDiagnostics([
+    { time: 1, generation: 1, level: 'error', resolved: true, msg: 'SCRIPT ERROR: Parse Error: Expected parameter name.' },
+    { time: 2, generation: 1, level: 'error', resolved: true, msg: 'at: GDScript::reload (res://broken.gd:3)' }
+  ], 1);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.resolved_diagnostics.length, 1);
+});
+
+test('a fatal remains active even if a rollback window tried to mark it resolved', () => {
+  const result = classifyEngineDiagnostics([
+    { time: 1, generation: 1, level: 'error', resolved: true, msg: 'FATAL: engine invariant failed' }
+  ], 1);
+  assert.equal(result.errors.length, 1);
+});
+
+test('game-engine WebGL teardown noise is not attributed to the still-running editor project', () => {
+  const messages = [
+    'ERROR: Pages in use exist at exit in PagedAllocator: GeometryInstanceGLES3',
+    'ERROR: 2 shaders of type SceneShaderGLES3 were never freed',
+    'ERROR: Buffer with GL ID of 894: leaked 480 bytes.',
+    'WARNING: Leaked instance dependency: Bug - did not call instance_notify_deleted when freeing.',
+    'ERROR: 8 resources still in use at exit (run with --verbose for details).'
+  ];
+  const result = classifyEngineDiagnostics(messages.map((msg, index) => ({ time: index, generation: 1, level: 'error', msg })), 1);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.warnings.length, 0);
+});
+
 test('session diagnosis explains the Web DAP socket failure without blaming the project', () => {
   const result = diagnoseEngineSession([
     { time: 1, level: 'error', generation: 1, msg: 'ERROR: Condition "err != OK" is true. Returning: ERR_CANT_CREATE' },

@@ -25,9 +25,13 @@ const {
   scriptDiagnosticsFromLogs,
   summarizeScriptDiagnostics,
   attachScriptInSceneText,
+  exactSourceHashAcknowledged,
+  hotScriptRollbackPlan,
   createActiveBudget,
   tickActiveBudget
+  , activityHeadline
 } = new Function(`
+  ${slice('  function phaseLabel', '  function holdRuntimeFrame')}
   ${slice('  function cleanProjectPath', '  function cleanProjectName')}
   ${slice('  function createActiveBudget', '  // Runs \`isDone\` until it returns true')}
   ${slice('  const HOT_SCRIPT_EXTENSION', '  async function sha256HexOfText')}
@@ -36,7 +40,9 @@ const {
   return {
     cleanProjectPath, isHotScriptEligiblePath, hotScriptTransactionPlan, lineChangeSummary,
     scriptDiagnosticsFromLogs, summarizeScriptDiagnostics, attachScriptInSceneText,
-    createActiveBudget, tickActiveBudget
+    exactSourceHashAcknowledged,
+    hotScriptRollbackPlan,
+    createActiveBudget, tickActiveBudget, activityHeadline
   };
 `)();
 
@@ -144,6 +150,27 @@ test('a compile failure with no line-level output says so rather than inventing 
   assert.match(summarizeScriptDiagnostics([], 'res://a.gd'), /printed no line-level reason/);
 });
 
+test('publication requires a present exact source hash acknowledgement', () => {
+  assert.equal(exactSourceHashAcknowledged('abc123', 'abc123'), true);
+  assert.equal(exactSourceHashAcknowledged('abc123', 'different'), false);
+  assert.equal(exactSourceHashAcknowledged('abc123', ''), false);
+  assert.equal(exactSourceHashAcknowledged('abc123', null), false);
+});
+
+test('rollback restores existing scripts and deletes scripts created by the failed transaction', () => {
+  const plan = hotScriptRollbackPlan(
+    { 'existing.gd': 'extends Node\n' },
+    ['existing.gd', 'newly_created.gd']
+  );
+  assert.deepEqual(plan.restore, { 'existing.gd': 'extends Node\n' });
+  assert.deepEqual(plan.remove, ['newly_created.gd']);
+});
+
+test('the compact activity rail keeps a completed change label instead of collapsing to Ready', () => {
+  assert.equal(activityHeadline({ status: 'running', phase: 'checking_code', label: 'Tune speed' }), 'Checking code');
+  assert.equal(activityHeadline({ status: 'succeeded', phase: 'ready', label: 'Tune speed' }), 'Tune speed');
+});
+
 // ---------------------------------------------------------------------------
 // Scene attachment: keeping the authoritative .tscn in step without a restart
 // ---------------------------------------------------------------------------
@@ -184,6 +211,16 @@ test('a node the scene text does not contain is refused rather than silently ski
   const result = attachScriptInSceneText(SCENE, 'Ghost', 'res://runner.gd');
   assert.equal(result.ok, false);
   assert.match(result.error, /No \[node name="Ghost"/);
+});
+
+test('the scene root accepts a script attachment through the canonical dot path', () => {
+  const result = attachScriptInSceneText(SCENE, '.', 'res://main.gd');
+  assert.equal(result.ok, true);
+  const rootBlock = result.text.slice(
+    result.text.indexOf('[node name="Main"'),
+    result.text.indexOf('[node name="Runner"')
+  );
+  assert.match(rootBlock, /script = ExtResource/);
 });
 
 // ---------------------------------------------------------------------------
@@ -248,8 +285,55 @@ test('a failed hot transaction never constructs a second Engine', () => {
 
 test('every hot-channel op the bridge calls is dispatched by the plugin', () => {
   const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
-  for (const op of ['script_preflight', 'script_refresh', 'script_job_status', 'script_open', 'node_script_attach']) {
+  for (const op of ['script_preflight', 'script_refresh', 'script_delete', 'script_job_status', 'script_open', 'node_script_attach', 'node_script_restore']) {
     assert.ok(plugin.includes(`"${op}": reply = _op_`), `plugin.gd does not dispatch '${op}'.`);
     assert.ok(bridgeSource.includes(`'${op}'`), `The bridge never calls '${op}'.`);
   }
+});
+
+test('preflight trusts Godot script editor dirty state and terminal jobs are consumed', () => {
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  assert.match(plugin, /get_unsaved_files\(\)/);
+  assert.match(plugin, /_script_jobs\.erase\(job_id\)/);
+});
+
+test('a hot edit whose snapshot cannot be persisted is surfaced as dirty', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('\n  // ====', start));
+  assert.match(body, /if \(!persisted\) \{\s*DiagnosticState\.session = 'dirty_unpersisted'/);
+});
+
+test('undo routes script-command transactions through the live channel without restarting the editor', () => {
+  const start = bridgeSource.indexOf("name: 'godot_undo_transaction'");
+  const body = bridgeSource.slice(start, bridgeSource.indexOf("name: 'godot_run_game'", start));
+  assert.match(body, /transaction\.editor_channel === 'script_command'/);
+  assert.match(body, /rollbackHotScripts/);
+  assert.match(body, /editor_restarted: false/);
+  assert.match(body, /refreshVisiblePlaytest/);
+});
+
+test('Follow navigation routes 3D edits back to the 3D workspace without launching a game', () => {
+  assert.match(bridgeSource, /function follow3DWorkspace/);
+  assert.match(bridgeSource, /EditorCommandChannel\.call\('workspace_3d'/);
+  assert.doesNotMatch(
+    bridgeSource.slice(bridgeSource.indexOf('function follow3DWorkspace'), bridgeSource.indexOf('async function refreshVisiblePlaytest')),
+    /startGameRuntime|showTab\('game'\)/
+  );
+});
+
+test('workspace follow is WebMCP-controllable and survives a same-tab reload', () => {
+  assert.match(bridgeSource, /name: 'godot_workspace_follow'/);
+  assert.match(bridgeSource, /FollowAgent\.set\(args\.enabled\)/);
+  assert.match(bridgeSource, /sessionStorage\?\.setItem\(WORKSPACE_FOLLOW_PREFERENCE_KEY/);
+  assert.match(bridgeSource, /sessionStorage\?\.getItem\(WORKSPACE_FOLLOW_PREFERENCE_KEY\)/);
+  const toolStart = bridgeSource.indexOf("name: 'godot_workspace_follow'");
+  const toolBody = bridgeSource.slice(toolStart, bridgeSource.indexOf("name: 'godot_node_spawn'", toolStart));
+  assert.match(toolBody, /DiagnosticHUD\.render\(\)/);
+  assert.doesNotMatch(toolBody, /AgentRail\.render\(\)/);
+});
+
+test('refreshing an already-visible playtest keeps the session in playtesting state', () => {
+  const start = bridgeSource.indexOf('async function refreshVisiblePlaytest');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('async function runHotScriptTransaction', start));
+  assert.match(body, /DiagnosticState\.session = 'playtesting'/);
 });

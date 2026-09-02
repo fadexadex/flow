@@ -471,6 +471,16 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
+    name: 'godot_workspace_follow',
+    description: 'Enables or disables visible workspace following for this browser tab. Script changes open at their changed lines; 3D node changes switch to 3D and select the edited node.',
+    input_schema: {
+      type: 'object',
+      properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: false }
+  },
+  {
     name: 'godot_node_spawn',
     description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
     input_schema: {

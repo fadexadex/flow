@@ -359,6 +359,12 @@
     return labels[phase] || phase;
   }
 
+  function activityHeadline(latest) {
+    if (!latest) return 'Waiting for a WebMCP action';
+    if (latest.status === 'running' && latest.phase) return phaseLabel(latest.phase);
+    return latest.label;
+  }
+
   function holdRuntimeFrame() {
     if (typeof document === 'undefined') return false;
     const canvas = resolveGodotCanvas('auto')?.canvas;
@@ -1560,9 +1566,13 @@
     /AudioWorkletNode|BaseAudioContext/i,
     /WebGL.*(?:extension|not supported)/i,
     /ServiceWorker/i,
-    /GDExtension support/i
+    /GDExtension support/i,
+    // Godot's Web export may attempt to sync its desktop-style virtual filesystem after the
+    // project directory has been replaced. The bridge persists the authoritative project in
+    // its own IndexedDB transaction, so this does not describe a project-source failure.
+    /Failed to save IDB file system/i
   ];
-  const TEARDOWN_NOISE_PATTERN = /leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked|RID allocations/i;
+  const TEARDOWN_NOISE_PATTERN = /leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked|RID allocations|Pages in use exist at exit|shaders? .* never freed|resources? still in use at exit|Buffer with GL ID .* leaked|Leaked instance dependency/i;
 
   function classifyEngineDiagnostics(logs, generation, sinceTime = 0) {
     const scoped = logs.filter(entry => entry.time >= sinceTime && entry.generation === generation);
@@ -1574,16 +1584,19 @@
       const message = String(entry.msg);
       if (/^\s*at:\s/.test(message) && merged.length > 0) {
         merged[merged.length - 1].text += ' | ' + message.trim();
+        merged[merged.length - 1].resolved = merged[merged.length - 1].resolved || entry.resolved === true;
         continue;
       }
-      merged.push({ level: entry.level, text: message });
+      merged.push({ level: entry.level, text: message, resolved: entry.resolved === true });
     }
     const errors = [];
     const warnings = [];
     const platform = [];
+    const resolved = [];
     for (const entry of merged) {
       if (TEARDOWN_NOISE_PATTERN.test(entry.text)) continue;
       if (/\bFATAL:/.test(entry.text)) { errors.push(entry.text); continue; }
+      if (entry.resolved) { resolved.push(entry.text); continue; }
       if (PLATFORM_DIAGNOSTIC_PATTERNS.some(pattern => pattern.test(entry.text))) { platform.push(entry.text); continue; }
       // Godot writes WARNING: lines to stderr, so they arrive tagged level 'error'. The text
       // is what says what it is; testing the level first counted every engine warning as a
@@ -1591,7 +1604,7 @@
       if (/^\s*WARNING:/.test(entry.text) || entry.level === 'warn') { warnings.push(entry.text); continue; }
       if (entry.level === 'error') errors.push(entry.text);
     }
-    return { errors, warnings, platform_diagnostics: platform };
+    return { errors, warnings, platform_diagnostics: platform, resolved_diagnostics: resolved };
   }
 
   // Converts the raw Godot stream into causes an agent can act on. This stays pure so the
@@ -3034,6 +3047,7 @@ func _on_command(args: Array) -> String:
 		"select": reply = _op_select(payload)
 		"focus": reply = _op_focus(payload)
 		"focus_dispatch": reply = _op_focus_dispatch()
+		"workspace_3d": reply = _op_workspace_3d(payload)
 		"view_preset": reply = _op_view_preset(payload)
 		"viewport_tree": reply = _op_viewport_tree()
 		"node_add": reply = _op_node_add(payload)
@@ -3046,9 +3060,11 @@ func _on_command(args: Array) -> String:
 		"open_scene": reply = _op_open_scene(payload)
 		"script_preflight": reply = _op_script_preflight(payload)
 		"script_refresh": reply = _op_script_refresh(payload)
+		"script_delete": reply = _op_script_delete(payload)
 		"script_job_status": reply = _op_script_job_status(payload)
 		"script_open": reply = _op_script_open(payload)
 		"node_script_attach": reply = _op_node_script_attach(payload)
+		"node_script_restore": reply = _op_node_script_restore(payload)
 		_: reply = {"ok": false, "error": "Unsupported op: %s" % op}
 	return _reply(reply)
 
@@ -3262,6 +3278,7 @@ func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
 	return {"ok": true, "mechanism": mechanism}
 
 func _op_focus(payload: Dictionary) -> Dictionary:
+	EditorInterface.set_main_screen_editor("3D")
 	var selected := _op_select(payload)
 	if not selected.get("ok", false):
 		return selected
@@ -3270,6 +3287,17 @@ func _op_focus(payload: Dictionary) -> Dictionary:
 	selected["mechanism"] = dispatched.get("mechanism", "")
 	selected["shortcut"] = "spatial_editor/focus_selection"
 	selected["camera_moved"] = dispatched.get("camera_moved", false)
+	return selected
+
+func _op_workspace_3d(payload: Dictionary) -> Dictionary:
+	EditorInterface.set_main_screen_editor("3D")
+	var node_path := String(payload.get("node_path", ""))
+	if node_path == "":
+		return {"ok": true, "workspace": "3D", "selected": null}
+	var selected := _op_select({"node_path": node_path})
+	if not selected.get("ok", false):
+		return selected
+	selected["workspace"] = "3D"
 	return selected
 
 ## Dispatch only, no selection. Node3DEditor reacts to EditorSelection changes on a deferred
@@ -3651,12 +3679,10 @@ func _op_script_preflight(payload: Dictionary) -> Dictionary:
 		return {"ok": false, "error": "path must be a res:// path."}
 	var exists := FileAccess.file_exists(path)
 	var opened := _open_script_for_path(path)
-	var unsaved := false
-	if opened != null:
-		if exists:
-			unsaved = opened.source_code != FileAccess.get_file_as_string(path)
-		else:
-			unsaved = true
+	# ScriptEditor owns the authoritative dirty-buffer list. Comparing source_code with disk is
+	# racy during a refresh and can both miss editor state and flag our own acknowledged write.
+	var unsaved_files := EditorInterface.get_script_editor().get_unsaved_files()
+	var unsaved := path in unsaved_files
 	return {
 		"ok": not unsaved,
 		"conflict": "user_buffer" if unsaved else null,
@@ -3676,6 +3702,40 @@ func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
 	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
 	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _op_script_delete(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	call_deferred("_run_script_delete_job", job_id, path)
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _run_script_delete_job(job_id: String, path: String) -> void:
+	var job: Dictionary = _script_jobs.get(job_id, {})
+	job["state"] = "done"
+	job["finished_at"] = Time.get_ticks_msec()
+	job["failure"] = null
+	job["error"] = null
+	if FileAccess.file_exists(path):
+		var remove_error := DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+		if remove_error != OK:
+			job["ok"] = false
+			job["failure"] = "delete_failed"
+			job["error"] = "Godot could not remove %s: %s" % [path, error_string(remove_error)]
+			_script_jobs[job_id] = job
+			return
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem != null:
+		filesystem.update_file(path)
+	job["exists"] = FileAccess.file_exists(path)
+	job["ok"] = not bool(job["exists"])
+	if not bool(job["ok"]):
+		job["failure"] = "delete_failed"
+		job["error"] = "Godot still sees %s after removal." % path
+	_script_jobs[job_id] = job
 
 func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
 	var job: Dictionary = _script_jobs.get(job_id, {})
@@ -3756,6 +3816,10 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["reload_error_name"] = job.get("reload_error_name", null)
 	reply["can_instantiate"] = job.get("can_instantiate", null)
 	reply["finished_at"] = job.get("finished_at", 0)
+	reply["exists"] = job.get("exists", null)
+	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
+	# long authoring sessions grow without bound.
+	_script_jobs.erase(job_id)
 	return reply
 
 ## Switches to the Script workspace at a line. Only ever called when the user has turned
@@ -3798,13 +3862,42 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
 	undo.add_do_method(node, "set_script", script)
 	undo.add_undo_method(node, "set_script", previous)
 	undo.commit_action()
+	var attached: bool = node.get_script() == script
+	# A failed command must not leave a half-applied scene mutation behind. This direct restore
+	# only runs when UndoRedo did not produce the requested state.
+	if not attached:
+		node.set_script(previous)
 	return {
-		"ok": node.get_script() == script,
-		"error": null if node.get_script() == script else "The editor did not report the script attached to %s." % resolved_path,
+		"ok": attached,
+		"error": null if attached else "The editor did not report the script attached to %s." % resolved_path,
 		"node_path": resolved_path,
 		"requested_path": requested,
 		"script_path": path,
 		"previous_script": previous.resource_path if previous != null else null,
+	}
+
+## Restore the node-side half of a previously acknowledged WebMCP attachment during hot undo.
+## This deliberately does not add a second UndoRedo action: the WebMCP transaction is the undo
+## unit, and recording its rollback as another user action would make Ctrl-Z reapply stale state.
+func _op_node_script_restore(payload: Dictionary) -> Dictionary:
+	var requested := String(payload.get("node_path", ""))
+	var node := _resolve_node(requested)
+	if node == null:
+		return _resolve_error(requested)
+	var path := String(payload.get("script_path", ""))
+	var script: Script = null
+	if path != "":
+		var loaded := ResourceLoader.load(path, "Script", ResourceLoader.CACHE_MODE_REPLACE)
+		if loaded == null or not (loaded is Script):
+			return {"ok": false, "error": "Could not restore script %s." % path}
+		script = loaded as Script
+	node.set_script(script)
+	var root := EditorInterface.get_edited_scene_root()
+	return {
+		"ok": node.get_script() == script,
+		"error": null if node.get_script() == script else "The editor did not restore the script on %s." % requested,
+		"node_path": String(root.get_path_to(node)),
+		"script_path": path if path != "" else null,
 	}
 `;
 
@@ -4038,6 +4131,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         location: entry.location
       });
     }
+
     return diagnostics;
   }
 
@@ -4048,6 +4142,32 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     const first = diagnostics[0];
     const where = first.line ? ` on line ${first.line}` : '';
     return `${path.replace(/^res:\/\//, '')} has a problem${where}: ${first.message}`;
+  }
+
+  function markRolledBackDiagnosticsResolved(logs, sinceTime, generation) {
+    for (const entry of logs) {
+      if (entry.time < sinceTime || entry.generation !== generation) continue;
+      if (entry.level !== 'error' && entry.level !== 'warn') continue;
+      if (/\bFATAL:/.test(String(entry.msg))) continue;
+      entry.resolved = true;
+      entry.resolution = 'hot_script_rollback';
+    }
+  }
+
+  function exactSourceHashAcknowledged(expected, actual) {
+    return typeof expected === 'string' && expected.length > 0
+      && typeof actual === 'string' && actual.length > 0
+      && actual === expected;
+  }
+
+  function hotScriptRollbackPlan(previousFiles, candidatePaths) {
+    const restore = {};
+    const remove = [];
+    for (const path of candidatePaths) {
+      if (typeof previousFiles[path] === 'string') restore[path] = previousFiles[path];
+      else remove.push(path);
+    }
+    return { restore, remove };
   }
 
   const HotScriptChannel = {
@@ -4132,7 +4252,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         // The whole point of the two-phase design. Godot read this hash off its own
         // filesystem; if it disagrees, the bytes in the engine are not the bytes we staged and
         // publishing the candidate would be a lie.
-        if (expected[path] && job.sha256 && job.sha256 !== expected[path]) {
+        if (!exactSourceHashAcknowledged(expected[path], job.sha256)) {
           return {
             ok: false,
             code: 'SCRIPT_REFRESH_FAILED',
@@ -4144,8 +4264,48 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         refreshed.push({ path: resPath, sha256: job.sha256 || null, can_instantiate: job.can_instantiate === true });
       }
       return { ok: true, refreshed };
+    },
+
+    async deleteAndRefresh(paths, generations, { budgetMs = 12000 } = {}) {
+      const removed = [];
+      for (const path of paths) {
+        const resPath = `res://${path}`;
+        const queued = EditorCommandChannel.call('script_delete', { path: resPath });
+        if (!queued.ok) {
+          return { ok: false, code: queued.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_ROLLBACK_FAILED', error: queued.error, path: resPath };
+        }
+        const settled = await this.awaitJob(queued.job_id, budgetMs);
+        if (!settled.ok || settled.job?.job_ok !== true || settled.job?.exists !== false) {
+          return {
+            ok: false,
+            code: settled.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_ROLLBACK_FAILED',
+            error: settled.error || settled.job?.job_error || `Godot did not confirm removal of ${resPath}.`,
+            path: resPath,
+            job: settled.job || null
+          };
+        }
+        removed.push(resPath);
+      }
+      return { ok: true, removed };
     }
   };
+
+  async function rollbackHotScripts(previousFiles, candidatePaths, generations) {
+    const plan = hotScriptRollbackPlan(previousFiles, candidatePaths);
+    const restored = Object.keys(plan.restore).length > 0
+      ? await HotScriptChannel.writeAndRefresh(
+          plan.restore,
+          Object.fromEntries(await Promise.all(Object.entries(plan.restore).map(async ([path, source]) => [path, await sha256HexOfText(source)]))),
+          generations,
+          { reveal: false })
+      : { ok: true, refreshed: [] };
+    if (!restored.ok) return { ...restored, stage: 'restore_existing' };
+    const removed = plan.remove.length > 0
+      ? await HotScriptChannel.deleteAndRefresh(plan.remove, generations)
+      : { ok: true, removed: [] };
+    if (!removed.ok) return { ...removed, stage: 'remove_created' };
+    return { ok: true, restored: restored.refreshed, removed: removed.removed };
+  }
 
   // Write `script = ExtResource("id")` into the authoritative .tscn text for a node.
   //
@@ -4156,9 +4316,12 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
   function attachScriptInSceneText(sceneText, nodePath, scriptResPath) {
     const text = String(sceneText);
     const segments = String(nodePath).split('/').filter(Boolean);
-    if (segments.length === 0) return { ok: false, error: 'node_path is empty.' };
-    const name = segments[segments.length - 1];
-    const parent = segments.length === 1 ? '.' : segments.slice(0, -1).join('/');
+    const targetsRoot = String(nodePath) === '.';
+    if (segments.length === 0 && !targetsRoot) return { ok: false, error: 'node_path is empty.' };
+    const rootHeader = /^\[node name="([^"]+)"[^\]]*\]$/m.exec(text);
+    if (targetsRoot && !rootHeader) return { ok: false, error: 'The scene text has no root [node] entry.' };
+    const name = targetsRoot ? rootHeader[1] : segments[segments.length - 1];
+    const parent = targetsRoot ? null : (segments.length === 1 ? '.' : segments.slice(0, -1).join('/'));
 
     let resourceId = null;
     let nextText = text;
@@ -4183,7 +4346,9 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
       addedResource = true;
     }
 
-    const nodeHeader = new RegExp(`^\\[node name="${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*parent="${parent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*\\]$`, 'm');
+    const nodeHeader = targetsRoot
+      ? /^\[node name="[^"]+"(?![^\]]*\bparent=)[^\]]*\]$/m
+      : new RegExp(`^\\[node name="${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*parent="${parent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*\\]$`, 'm');
     const match = nodeHeader.exec(nextText);
     if (!match) return { ok: false, error: `No [node name="${name}" parent="${parent}"] entry in the scene text.` };
     const bodyStart = match.index + match[0].length;
@@ -4198,10 +4363,16 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     return { ok: true, text: nextText, resource_id: resourceId, added_ext_resource: addedResource };
   }
 
-  // Whether a Follow action may take over the workspace. Off by default and user-owned: the
-  // agent never decides to move someone's view for them.
+  const WORKSPACE_FOLLOW_PREFERENCE_KEY = 'webmcp.workspace-follow';
+
+  // Whether a Follow action may take over the workspace. Off by default and user-owned: an
+  // agent may request it explicitly, and the visible rail control remains the source of truth.
+  // Persisting the choice for this tab prevents a reload from silently disabling collaboration.
   const FollowAgent = {
-    enabled: false,
+    enabled: (() => {
+      try { return sessionStorage?.getItem(WORKSPACE_FOLLOW_PREFERENCE_KEY) === 'on'; }
+      catch (_) { return false; }
+    })(),
     pausedUntil: 0,
     active() {
       return this.enabled && Date.now() >= this.pausedUntil;
@@ -4209,6 +4380,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     set(enabled) {
       this.enabled = Boolean(enabled);
       if (this.enabled) this.pausedUntil = 0;
+      try { sessionStorage?.setItem(WORKSPACE_FOLLOW_PREFERENCE_KEY, this.enabled ? 'on' : 'off'); }
+      catch (_) {}
       return this.enabled;
     },
     // Direct human interaction with the editor pauses following, so the agent does not fight
@@ -4221,6 +4394,33 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
       return { enabled: this.enabled, paused: this.enabled && Date.now() < this.pausedUntil };
     }
   };
+
+  function follow3DWorkspace(nodePath = '') {
+    if (!FollowAgent.active()) return { followed: false, reason: 'follow_disabled' };
+    const reply = EditorCommandChannel.call('workspace_3d', { node_path: nodePath || '' });
+    return {
+      followed: reply.ok === true,
+      workspace: reply.ok === true ? '3D' : null,
+      reason: reply.ok === true ? null : (reply.error || 'workspace_unavailable')
+    };
+  }
+
+  async function refreshVisiblePlaytest() {
+    const running = typeof window !== 'undefined' && window.__godotGameState === 'running';
+    if (!running) return 'not_running';
+    if (activeGodotViewport() !== 'game') return 'stale';
+    try {
+      await stopGameRuntime(10000);
+      await startGameRuntime({ visible: true, timeoutMs: 60000 });
+      DiagnosticState.session = 'playtesting';
+      DiagnosticHUD.render();
+      return 'refreshed';
+    } catch (previewError) {
+      activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Refresh] ${previewError.message || String(previewError)}` });
+      if (activeLogs.length > MAX_LOGS) activeLogs.shift();
+      return 'refresh_failed';
+    }
+  }
 
   // The two-phase hot GDScript transaction.
   //
@@ -4246,7 +4446,6 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     const staged = cloneProjectFiles(activeFilesDict);
     const candidates = {};
     const expectedHashes = {};
-    const restoreBytes = {};
     const changes = [];
 
     for (const op of operations) {
@@ -4270,9 +4469,6 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
       const before = typeof staged[path] === 'string' ? staged[path] : null;
       candidates[path] = op.content;
       staged[path] = op.content;
-      // Only files that already existed can be restored to previous bytes; a created file is
-      // restored by writing back an empty stub, since copyToFS cannot delete.
-      if (before !== null) restoreBytes[path] = before;
       expectedHashes[path] = await sha256HexOfText(op.content);
       changes.push({
         path: resPath,
@@ -4282,6 +4478,20 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         ...lineChangeSummary(before ?? '', op.content)
       });
     }
+
+    const rollbackCandidates = async () => {
+      const restore = await rollbackHotScripts(previousFiles, Object.keys(candidates), generations);
+      if (!restore.ok) {
+        DiagnosticState.hotScriptDirty = {
+          paths: Object.keys(candidates).map(path => `res://${path}`),
+          at: Date.now(),
+          restore_error: restore.error || null
+        };
+        DiagnosticState.session = 'dirty_unpersisted';
+        DiagnosticHUD.render();
+      }
+      return restore;
+    };
 
     // Published on the operation so every subsequent phase event carries it: the shelf shows
     // what is being changed, not only that something is.
@@ -4311,28 +4521,13 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, { reveal });
     if (!applied.ok) {
       await advancePhase(operation, 'restoring_script');
-      const restore = Object.keys(restoreBytes).length > 0
-        ? await HotScriptChannel.writeAndRefresh(
-            restoreBytes,
-            Object.fromEntries(await Promise.all(Object.entries(restoreBytes).map(async ([path, text]) => [path, await sha256HexOfText(text)]))),
-            generations,
-            { reveal: false })
-        : { ok: true, refreshed: [] };
+      const restore = await rollbackCandidates();
       const diagnostics = applied.path
         ? scriptDiagnosticsFromLogs(activeLogs, refreshStartedAt, applied.path, generations.command)
         : [];
       if (operation) operation.diagnostics = diagnostics;
-      if (!restore.ok) {
-        // The candidate is in the engine, the previous bytes are not, and the only tool that
-        // would "fix" it is a second Engine — which is exactly what must not happen. Latch the
-        // divergence so it is visible rather than silently carried forward.
-        DiagnosticState.hotScriptDirty = {
-          paths: Object.keys(candidates).map(path => `res://${path}`),
-          at: Date.now(),
-          restore_error: restore.error || null
-        };
-        DiagnosticState.session = 'dirty_unpersisted';
-        DiagnosticHUD.render();
+      if (restore.ok) {
+        markRolledBackDiagnosticsResolved(activeLogs, refreshStartedAt, generations.command);
       }
       const error = new Error(applied.code === 'SCRIPT_COMPILE_FAILED'
         ? summarizeScriptDiagnostics(diagnostics, applied.path || 'the script')
@@ -4350,27 +4545,39 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     if (attach) {
       const scenePath = cleanProjectPath(attach.scene_path || activeMainScene);
       const scriptResPath = `res://${cleanProjectPath(attach.script_path)}`;
+      const resolved = EditorCommandChannel.call('node_state', { node_path: attach.node_path });
+      if (!resolved.ok) {
+        const restore = await rollbackCandidates();
+        const error = new Error(resolved.error || `Could not resolve ${attach.node_path} before attaching ${scriptResPath}.`);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        error.rolled_back = restore.ok;
+        throw error;
+      }
+      const sceneText = staged[scenePath];
+      if (typeof sceneText !== 'string') {
+        const restore = await rollbackCandidates();
+        const error = new Error(`Cannot synchronize the scene reference: res://${scenePath} is not a text file in the project.`);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        error.rolled_back = restore.ok;
+        throw error;
+      }
+      const written = attachScriptInSceneText(sceneText, resolved.node_path, scriptResPath);
+      if (!written.ok) {
+        const restore = await rollbackCandidates();
+        const error = new Error(written.error);
+        error.code = 'SCRIPT_REFRESH_FAILED';
+        error.rolled_back = restore.ok;
+        throw error;
+      }
       const live = EditorCommandChannel.call('node_script_attach', {
         node_path: attach.node_path,
         script_path: scriptResPath
       });
       if (!live.ok) {
+        const restore = await rollbackCandidates();
         const error = new Error(live.error || `Could not attach ${scriptResPath} to ${attach.node_path}.`);
         error.code = 'SCRIPT_REFRESH_FAILED';
-        throw error;
-      }
-      const sceneText = staged[scenePath];
-      if (typeof sceneText !== 'string') {
-        const error = new Error(`Cannot synchronize the scene reference: res://${scenePath} is not a text file in the project.`);
-        error.code = 'SCRIPT_REFRESH_FAILED';
-        throw error;
-      }
-      // The editor resolved the node path; using its answer rather than the requested one is
-      // what keeps an ambiguous leaf name from writing the reference onto the wrong node.
-      const written = attachScriptInSceneText(sceneText, live.node_path, scriptResPath);
-      if (!written.ok) {
-        const error = new Error(written.error);
-        error.code = 'SCRIPT_REFRESH_FAILED';
+        error.rolled_back = restore.ok;
         throw error;
       }
       staged[scenePath] = written.text;
@@ -4399,30 +4606,30 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
       files_before: previousFiles,
       project_after: DiagnosticState.activeProject,
       main_scene_after: activeMainScene,
-      files_after: cloneProjectFiles(staged)
+      files_after: cloneProjectFiles(staged),
+      editor_channel: 'script_command',
+      hot_script_paths: Object.keys(candidates),
+      script_attachment: attachResult ? {
+        node_path: attachResult.node_path,
+        previous_script: attachResult.previous_script,
+        script_path: attachResult.script_path
+      } : null
     });
     const persisted = await persistActiveProjectState();
+    if (!persisted) {
+      DiagnosticState.session = 'dirty_unpersisted';
+    } else if (DiagnosticState.session === 'dirty_unpersisted') {
+      DiagnosticState.session = 'editor-ready';
+    }
     DiagnosticHUD.render();
     BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
 
     // Never launch or switch to the game because a script changed. If a preview is already
     // running it is now out of date, and saying so is more useful than silently refreshing
     // something the user is not looking at.
-    const previewRunning = typeof window !== 'undefined' && window.__godotGameState === 'running';
-    let previewState = previewRunning ? 'stale' : 'not_running';
-    if (previewRunning && activeGodotViewport() === 'game') {
-      // The preview IS the surface the user is on, so refresh the game Engine only — the
-      // editor Engine is not touched.
-      try {
-        await stopGameRuntime(10000);
-        await startGameRuntime({ visible: true, timeoutMs: 60000 });
-        previewState = 'refreshed';
-      } catch (previewError) {
-        previewState = 'refresh_failed';
-        activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Refresh] ${previewError.message || String(previewError)}` });
-        if (activeLogs.length > MAX_LOGS) activeLogs.shift();
-      }
-    }
+    // The preview IS the surface the user is on, so refresh the game Engine only — the editor
+    // Engine is not touched. When the editor is visible, simply report that the preview is stale.
+    const previewState = await refreshVisiblePlaytest();
 
     // Follow is user-owned. With it off, the FileSystem dock reveal that script_refresh
     // already performed is the whole of the visual feedback in Godot: no tab switch, no
@@ -5200,6 +5407,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
               project_errors: classified.errors.length,
               warnings: classified.warnings.length,
               platform_diagnostics: classified.platform_diagnostics.length,
+              resolved_diagnostics: classified.resolved_diagnostics.length,
               recent_project_errors: classified.errors.slice(-3),
               generation: EditorCommandChannel.generation,
               editor_lifecycle: EditorLifecycle.describe(),
@@ -6241,6 +6449,56 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         }
         if (!transaction.files_before) throw new Error(`Undo transaction ${transaction.undo_id} has no restorable project snapshot.`);
 
+        if (transaction.editor_channel === 'script_command') {
+          const generations = {
+            lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
+            command: EditorCommandChannel.generation
+          };
+          const rollback = await rollbackHotScripts(
+            transaction.files_before,
+            transaction.hot_script_paths || [],
+            generations
+          );
+          if (!rollback.ok) {
+            DiagnosticState.hotScriptDirty = {
+              paths: (transaction.hot_script_paths || []).map(path => `res://${path}`),
+              at: Date.now(),
+              restore_error: rollback.error || null
+            };
+            DiagnosticState.session = 'dirty_unpersisted';
+            throw new Error(`Hot undo could not restore the previous scripts: ${rollback.error || 'unknown error'}`);
+          }
+          if (transaction.script_attachment) {
+            const restoredAttachment = EditorCommandChannel.call('node_script_restore', {
+              node_path: transaction.script_attachment.node_path,
+              script_path: transaction.script_attachment.previous_script || ''
+            });
+            if (!restoredAttachment.ok) {
+              DiagnosticState.session = 'dirty_unpersisted';
+              throw new Error(`Hot undo restored the script files but not the node attachment: ${restoredAttachment.error}`);
+            }
+          }
+          undoStack.pop();
+          activeFilesDict = cloneProjectFiles(transaction.files_before);
+          activeMainScene = transaction.main_scene_before;
+          DiagnosticState.sceneRevision += 1;
+          const persisted = await persistActiveProjectState();
+          DiagnosticState.session = persisted ? 'editor-ready' : 'dirty_unpersisted';
+          DiagnosticHUD.render();
+          BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+          const previewState = await refreshVisiblePlaytest();
+          return {
+            success: true,
+            undone_id: transaction.undo_id,
+            scene_revision: DiagnosticState.sceneRevision,
+            persisted,
+            editor_channel: 'script_command',
+            editor_restarted: false,
+            preview_state: previewState,
+            restored_paths: transaction.hot_script_paths.map(path => `res://${path}`)
+          };
+        }
+
         const current = {
           projectName: DiagnosticState.activeProject,
           mainScene: activeMainScene,
@@ -7123,6 +7381,31 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
     },
     {
       definition: {
+        name: 'godot_workspace_follow',
+        description: 'Enables or disables visible workspace following for this browser tab. When enabled, live script changes open at their changed lines and 3D node changes switch to the 3D workspace and select the edited node. The state is persisted in sessionStorage and mirrored by the Follow agent control.',
+        input_schema: {
+          type: 'object',
+          properties: { enabled: { type: 'boolean', description: 'Omit to read the current preference without changing it' } },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => {
+        const enabled = typeof args.enabled === 'boolean'
+          ? FollowAgent.set(args.enabled)
+          : FollowAgent.enabled;
+        DiagnosticHUD.render();
+        return {
+          success: true,
+          workspace_follow: enabled,
+          active: FollowAgent.active(),
+          paused: FollowAgent.describe().paused,
+          persistence: 'sessionStorage'
+        };
+      }
+    },
+    {
+      definition: {
         name: 'godot_node_spawn',
         description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
         input_schema: {
@@ -7211,6 +7494,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           }
         });
 
+        const navigation = follow3DWorkspace(res.commandReply?.node_path || nodeName);
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.focus(nodeName, pos, meshType, 'SPAWNED');
           CameraGuidance.noteSceneChanged(nodeName);
@@ -7221,7 +7505,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           type: 'MeshInstance3D',
           parent_path: parentPath,
           position: pos,
-          mesh_type: meshType
+          mesh_type: meshType,
+          follow: navigation
         });
       }
     },
@@ -7268,6 +7553,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyTransformInSource(source, resolvedNodePath(reply, requestedPath), reply?.transform)
         });
 
+        const navigation = follow3DWorkspace(res.commandReply?.node_path || requestedPath);
         if (typeof window !== 'undefined') {
           const focusPath = res.commandReply?.node_path || requestedPath;
           AgentFocusOverlay.focus(focusPath, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
@@ -7281,7 +7567,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           rotation: args.rotation || null,
           scale: args.scale || null,
           relative: args.relative === true,
-          serialized_transform: res.commandReply?.transform || null
+          serialized_transform: res.commandReply?.transform || null,
+          follow: navigation
         });
       }
     },
@@ -7324,6 +7611,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyMaterialInSource(source, resolvedNodePath(reply, requestedPath), args)
         });
 
+        const navigation = follow3DWorkspace(res.commandReply?.node_path || requestedPath);
         // A material tweak is not a geometry change: no auto-follow, and the reticle is
         // anchored to the node's real position rather than the origin.
         if (typeof window !== 'undefined') {
@@ -7339,7 +7627,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
             roughness: args.roughness,
             emission: args.emission,
             emission_energy: args.emission_energy
-          }
+          },
+          follow: navigation
         });
       }
     },
@@ -7368,6 +7657,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyNodePresence(source, resolvedNodePath(reply, requestedPath), false)
         });
 
+        const navigation = follow3DWorkspace();
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.hide('node_deleted');
           CameraGuidance.noteSceneChanged(null);
@@ -7375,7 +7665,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
 
         return liveMutationResult(res, {
           deleted_node: res.commandReply?.node_path || requestedPath,
-          resolved_node_path: res.commandReply?.node_path || null
+          resolved_node_path: res.commandReply?.node_path || null,
+          follow: navigation
         });
       }
     }
@@ -7787,6 +8078,7 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
         godot_diagnose_session: 'Diagnosing engine and project health',
         godot_camera_focus: `Framing ${input.node_path || 'node'} in the 3D viewport`,
         godot_camera_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} automatic camera follow`,
+        godot_workspace_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} workspace follow`,
         godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
         godot_node_transform: `Transforming ${input.node_path || 'node'}`,
         godot_node_material: `Recolouring ${input.node_path || 'node'}`,
@@ -8890,9 +9182,8 @@ func _op_node_script_attach(payload: Dictionary) -> Dictionary:
       // Plain-language intent first. The tool name and its arguments are evidence, and
       // evidence belongs in the expanded details, not in the headline a non-technical
       // collaborator reads while the agent is working.
-      const phaseText = latest?.phase ? phaseLabel(latest.phase) : '';
-      const label = latest ? (phaseText && latest.status === 'running' ? phaseText : latest.label) : 'Waiting for a WebMCP action';
-      const abbreviated = mode === 'narrow' && latest ? (phaseText || latest.label) : label;
+      const label = activityHeadline(latest);
+      const abbreviated = label;
       const detail = mode === 'narrow' ? '' : (latest?.detail ? ` \u00b7 ${latest.detail}` : '');
       const note = this.focusNote ? ` \u00b7 ${this.focusNote}` : '';
       const chip = mode === 'narrow' ? '' : activityChipMarkup(latest);
