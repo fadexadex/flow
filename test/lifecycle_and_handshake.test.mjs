@@ -454,3 +454,22 @@ test('boot-in-flight does not weaken the non-terminal states', () => {
     assert.equal(editorReplacementPlan(state, false).exitRequired, true);
   }
 });
+
+test("the page's own runtime-lifecycle notes are not counted as errors in the authored project", () => {
+  const result = classifyEngineDiagnostics([
+    { time: 1, generation: 1, level: 'error', msg: '[Runtime lifecycle] failed and cleaned up' },
+    { time: 2, generation: 1, level: 'warn', msg: '[Preview Refresh] the preview could not be restarted' }
+  ], 1);
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.warnings.length, 0);
+  assert.equal(result.platform_diagnostics.length, 2);
+});
+
+test('a genuine project error is still an error even beside a bridge note', () => {
+  const result = classifyEngineDiagnostics([
+    { time: 1, generation: 1, level: 'error', msg: '[Runtime lifecycle] failed and cleaned up' },
+    { time: 2, generation: 1, level: 'error', msg: 'SCRIPT ERROR: Parse Error: Expected end of statement.' }
+  ], 1);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0], /Parse Error/);
+});

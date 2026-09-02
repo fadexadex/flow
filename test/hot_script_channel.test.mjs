@@ -315,6 +315,8 @@ test('undo routes script-command transactions through the live channel without r
 test('Follow navigation routes 3D edits back to the 3D workspace without launching a game', () => {
   assert.match(bridgeSource, /function follow3DWorkspace/);
   assert.match(bridgeSource, /EditorCommandChannel\.call\('workspace_3d'/);
+  // It may refresh a preview that is already visible, because that IS the surface the change
+  // has to appear on. It must never start one, and never switch the page to the game tab.
   assert.doesNotMatch(
     bridgeSource.slice(bridgeSource.indexOf('function follow3DWorkspace'), bridgeSource.indexOf('async function refreshVisiblePlaytest')),
     /startGameRuntime|showTab\('game'\)/
@@ -336,4 +338,159 @@ test('refreshing an already-visible playtest keeps the session in playtesting st
   const start = bridgeSource.indexOf('async function refreshVisiblePlaytest');
   const body = bridgeSource.slice(start, bridgeSource.indexOf('async function runHotScriptTransaction', start));
   assert.match(body, /DiagnosticState\.session = 'playtesting'/);
+});
+
+// ---------------------------------------------------------------------------
+// What the human actually sees: buffer sync, arrival before the write, changed-line reveal
+// ---------------------------------------------------------------------------
+
+// The channel's visible half is driven entirely by the payload it hands the plugin, so the
+// payload is what is asserted here. The plugin's own half (a real CodeEdit, a real Tween) is
+// browser-only and is verified against a running page.
+function hotChannelHarness({ viewport = 'editor', jobFields = {} } = {}) {
+  const calls = [];
+  const EditorCommandChannel = {
+    available: () => true,
+    async waitForReady() { return true; },
+    call(op, payload) {
+      calls.push({ op, payload });
+      if (op === 'script_refresh') return { ok: true, job_id: `job_${calls.length}`, deferred: true };
+      if (op === 'script_job_status') {
+        return {
+          ok: true,
+          job_state: 'done',
+          job_ok: true,
+          sha256: 'hash-of-' + payload.job_id,
+          can_instantiate: true,
+          ...jobFields
+        };
+      }
+      return { ok: true };
+    }
+  };
+  const scope = new Function(
+    'EditorCommandChannel', 'DiagnosticState', 'window', 'awaitWithActiveBudget',
+    'exactSourceHashAcknowledged', 'sha256HexOfText', 'cleanProjectPath', 'activeGodotViewport',
+    'refreshVisiblePlaytest', 'FollowAgent',
+    `
+    ${slice('  const HotScriptChannel = {', '  async function rollbackHotScripts')}
+    ${slice('  async function follow3DWorkspace', '  async function refreshVisiblePlaytest')}
+    return { HotScriptChannel, follow3DWorkspace };
+  `)(
+    EditorCommandChannel,
+    { activeProject: 'demo' },
+    { __godotEditorWriteFiles: () => ({ ok: true }) },
+    async (probe) => { for (let i = 0; i < 50 && !probe(); i++) { /* settle */ } return { budget: { activeMs: 0 } }; },
+    // Every job above answers with the hash of its own id, so acknowledgement is forced to
+    // pass here and the assertions stay about the visible payload rather than about hashing.
+    () => true,
+    async (text) => text,
+    (path) => String(path).replace(/^res:\/\//, ''),
+    () => viewport,
+    async () => 'refreshed',
+    { active: () => true }
+  );
+  return { ...scope, calls };
+}
+
+test('only the file the human is following carries the focus and the changed line range', async () => {
+  const harness = hotChannelHarness();
+  await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a', 'enemy.gd': 'b' },
+    { 'player.gd': 'x', 'enemy.gd': 'y' },
+    { lifecycle: 1, command: 1 },
+    { focus: { path: 'player.gd', start_line: 20, end_line: 25, animate: true } }
+  );
+  const refreshes = harness.calls.filter(entry => entry.op === 'script_refresh');
+  const player = refreshes.find(entry => entry.payload.path === 'res://player.gd').payload;
+  const enemy = refreshes.find(entry => entry.payload.path === 'res://enemy.gd').payload;
+  assert.equal(player.focus, true);
+  assert.equal(player.start_line, 20);
+  assert.equal(player.end_line, 25);
+  assert.equal(player.animate, true);
+  assert.equal(enemy.focus, false);
+  assert.equal(enemy.animate, false);
+});
+
+test('a reduced-motion reader still gets the reveal, without the animation', async () => {
+  const harness = hotChannelHarness();
+  await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 },
+    { focus: { path: 'player.gd', start_line: 3, end_line: 3, animate: false } }
+  );
+  const payload = harness.calls.find(entry => entry.op === 'script_refresh').payload;
+  assert.equal(payload.focus, true);
+  assert.equal(payload.animate, false);
+});
+
+test('what the editor reports about the visible buffer is carried back, not assumed', async () => {
+  const harness = hotChannelHarness({
+    jobFields: {
+      buffer: { synced: true },
+      reveal: { revealed: true, first_line: 20, last_line: 25, animated: true },
+      screen: { workspace: 'Script', workspace_confirmed: true }
+    }
+  });
+  const applied = await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 },
+    { focus: { path: 'player.gd', start_line: 20, end_line: 25, animate: true } }
+  );
+  assert.equal(applied.ok, true);
+  assert.deepEqual(applied.refreshed[0].buffer, { synced: true });
+  assert.equal(applied.refreshed[0].revealed.revealed, true);
+  assert.equal(applied.refreshed[0].workspace.workspace_confirmed, true);
+});
+
+test('an unsynced buffer is reported rather than papered over', async () => {
+  const harness = hotChannelHarness({ jobFields: { buffer: { synced: false, stale: true, reason: 'background_buffer' } } });
+  const applied = await harness.HotScriptChannel.writeAndRefresh(
+    { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 }, {}
+  );
+  assert.equal(applied.ok, true);
+  assert.equal(applied.refreshed[0].buffer.stale, true);
+  assert.equal(applied.refreshed[0].revealed, null);
+});
+
+test('following a 3D change while the playtest is visible refreshes the game, not a hidden workspace', async () => {
+  const harness = hotChannelHarness({ viewport: 'game' });
+  const followed = await harness.follow3DWorkspace('SkyrailDeck');
+  assert.equal(followed.surface, 'game');
+  assert.equal(followed.preview_state, 'refreshed');
+  assert.equal(followed.followed, true);
+  assert.equal(harness.calls.some(entry => entry.op === 'workspace_3d'), false);
+});
+
+test('following a 3D change with the editor visible switches the workspace and reports what was observed', async () => {
+  const harness = hotChannelHarness({ viewport: 'editor' });
+  const followed = await harness.follow3DWorkspace('SkyrailDeck');
+  assert.equal(harness.calls.some(entry => entry.op === 'workspace_3d'), true);
+  assert.equal(followed.workspace, '3D');
+  assert.equal(followed.followed, true);
+});
+
+test('the human arrives at the script before the bytes are written, not after', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  const arrival = body.indexOf("EditorCommandChannel.call('script_open'");
+  const write = body.indexOf('HotScriptChannel.writeAndRefresh');
+  assert.ok(arrival > 0 && write > 0, 'both the arrival and the write must be in the transaction');
+  assert.ok(arrival < write, 'the Follow navigation must happen before the candidate bytes are written');
+});
+
+test('a preview refresh holds the last frame under the rail instead of going black', () => {
+  const start = bridgeSource.indexOf('async function refreshVisiblePlaytest');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('async function runHotScriptTransaction', start));
+  assert.match(body, /holdRuntimeFrame\(\{ belowRail: true \}\)/);
+  assert.match(body, /releaseRuntimeFrame\(\)/);
+  // The release has to be unconditional, or a failed relaunch strands a frozen still over a
+  // surface that is no longer running.
+  assert.match(body, /finally \{[\s\S]*releaseRuntimeFrame\(\)/);
+});
+
+test('waiting for a hidden page to paint is reported as waiting, not as a runtime failure', () => {
+  const start = bridgeSource.indexOf('async function stopGameRuntime');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('async function startGameRuntime', start));
+  assert.match(body, /awaitWithActiveBudget/);
+  assert.match(body, /waiting_for_foreground/);
+  assert.doesNotMatch(body, /waitFor\(/, 'a wall-clock wait declares a throttled quit failed');
 });

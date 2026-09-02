@@ -365,7 +365,10 @@
     return latest.label;
   }
 
-  function holdRuntimeFrame() {
+  // `belowRail` keeps the held frame under the activity rail, so a preview refresh can explain
+  // itself while it happens. A full editor replacement still covers everything: there is no
+  // live surface underneath it to be honest about.
+  function holdRuntimeFrame({ belowRail = false } = {}) {
     if (typeof document === 'undefined') return false;
     const canvas = resolveGodotCanvas('auto')?.canvas;
     if (!canvas || !canvas.width || !canvas.height || typeof canvas.toDataURL !== 'function') return false;
@@ -378,9 +381,9 @@
       cover.id = 'webmcp-runtime-frame-hold';
       cover.alt = '';
       cover.setAttribute('aria-hidden', 'true');
-      cover.style.cssText = 'position:fixed;inset:0;z-index:var(--gd-z-frame-hold, 950);width:100vw;height:100vh;object-fit:fill;background:var(--gd-surface, #141414);pointer-events:none;';
       document.body.appendChild(cover);
     }
+    cover.style.cssText = `position:fixed;inset:0;z-index:${belowRail ? 880 : 'var(--gd-z-frame-hold, 950)'};width:100vw;height:100vh;object-fit:fill;background:var(--gd-surface, #141414);pointer-events:none;`;
     cover.src = frame;
     cover.style.display = 'block';
     return true;
@@ -1572,6 +1575,10 @@
     // its own IndexedDB transaction, so this does not describe a project-source failure.
     /Failed to save IDB file system/i
   ];
+  // Lines this page writes about its own runtime handling. They are worth keeping in the log -
+  // they explain what the bridge did - but they are not output from the authored project, and
+  // counting them as project errors sends an agent off to fix code that is not broken.
+  const BRIDGE_NOTICE_PATTERN = /^\s*\[(?:Runtime lifecycle|Preview Refresh|WebMCP)\]/;
   const TEARDOWN_NOISE_PATTERN = /leaked at exit|leaked \d+ bytes|ObjectDB instances were leaked|RID allocations|Pages in use exist at exit|shaders? .* never freed|resources? still in use at exit|Buffer with GL ID .* leaked|Leaked instance dependency/i;
 
   function classifyEngineDiagnostics(logs, generation, sinceTime = 0) {
@@ -1596,6 +1603,7 @@
     for (const entry of merged) {
       if (TEARDOWN_NOISE_PATTERN.test(entry.text)) continue;
       if (/\bFATAL:/.test(entry.text)) { errors.push(entry.text); continue; }
+      if (BRIDGE_NOTICE_PATTERN.test(entry.text)) { platform.push(entry.text); continue; }
       if (entry.resolved) { resolved.push(entry.text); continue; }
       if (PLATFORM_DIAGNOSTIC_PATTERNS.some(pattern => pattern.test(entry.text))) { platform.push(entry.text); continue; }
       // Godot writes WARNING: lines to stderr, so they arrive tagged level 'error'. The text
@@ -1797,9 +1805,26 @@
     const onStopped = () => { stoppedEventObserved = true; };
     window.addEventListener('godot-game-stopped', onStopped, { once: true });
     window.closeGame();
-    const stopped = await waitFor(() => stoppedEventObserved || closeGameButton.disabled || ['stopped', 'failed'].includes(window.__godotGameState), timeoutMs);
+    // Active time, not wall clock - the same rule the editor shutdown budget already follows.
+    // The runtime acknowledges requestQuit on a frame, and a pane the browser has throttled to
+    // ~2fps produces almost none. Spending the budget on wall clock declared a perfectly
+    // healthy quit "failed and cleaned up" every time the preview was refreshed from a tab
+    // that was not being painted, and logged that as if the project had broken.
+    const settled = await awaitWithActiveBudget(
+      () => stoppedEventObserved || closeGameButton.disabled || ['stopped', 'failed'].includes(window.__godotGameState),
+      timeoutMs,
+      // Same rule as the editor shutdown: a runtime that is not being given frames is waiting
+      // on the human, not hung, and saying which one it is costs nothing.
+      (status) => {
+        DiagnosticState.shutdownWaiting = status === 'waiting_for_foreground';
+        AgentStatusRail.setFocusNote(status === 'waiting_for_foreground'
+          ? 'Keep this page visible to finish the preview update'
+          : 'Updating the running preview');
+      },
+      60);
     window.removeEventListener('godot-game-stopped', onStopped);
-    if (!stopped || !closeGameButton.disabled) {
+    DiagnosticState.shutdownWaiting = false;
+    if (!settled.ok || !closeGameButton.disabled) {
       if (typeof window.__forceResetFailedGameRuntime === 'function') {
         window.__forceResetFailedGameRuntime();
       }
@@ -2985,6 +3010,7 @@ func _enter_tree() -> void:
 	_window.__godotEditorCommand = _command_callback
 	_window.__godotEditorPluginVersion = CHANNEL_VERSION
 	_window.__godotEditorPluginReady = true
+	set_process(false)
 	_tune_navigation_feel()
 
 func _exit_tree() -> void:
@@ -3048,6 +3074,7 @@ func _on_command(args: Array) -> String:
 		"focus": reply = _op_focus(payload)
 		"focus_dispatch": reply = _op_focus_dispatch()
 		"workspace_3d": reply = _op_workspace_3d(payload)
+		"workspace_state": reply = _op_workspace_state()
 		"view_preset": reply = _op_view_preset(payload)
 		"viewport_tree": reply = _op_viewport_tree()
 		"node_add": reply = _op_node_add(payload)
@@ -3069,6 +3096,7 @@ func _on_command(args: Array) -> String:
 	return _reply(reply)
 
 func _reply(body: Dictionary) -> String:
+	_expire_stale_flash()
 	body["generation"] = _generation()
 	body["channel_version"] = CHANNEL_VERSION
 	var text := JSON.stringify(body)
@@ -3277,11 +3305,74 @@ func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
 			mechanism = "subviewport.push_input"
 	return {"ok": true, "mechanism": mechanism}
 
+## Which main-screen editor Godot is actually showing.
+##
+## EditorInterface can set the main screen but cannot report it, so this reads the visible
+## child of the main-screen container. The control's node name is its class ("Node3DEditor"),
+## not the tab label ("3D"), so the match is by hint and returns null rather than a guess when
+## the mapping is unknown - a follow result must say what was observed, not what was asked for.
+const MAIN_SCREEN_HINTS := {
+	"3D": ["node3d", "spatial"],
+	"2D": ["canvasitem", "2d"],
+	"Script": ["script"],
+	"Game": ["game"],
+	"AssetLib": ["asset"],
+}
+
+func _visible_main_screen() -> String:
+	var main_screen := EditorInterface.get_editor_main_screen()
+	if main_screen == null:
+		return ""
+	for child in main_screen.get_children():
+		if child is Control and (child as Control).visible:
+			return _main_screen_identity(child as Control)
+	return ""
+
+## Godot can wrap a main-screen editor in a WindowWrapper so the human can tear it off into its
+## own window, so the visible child is not always the editor itself. One level of unwrapping is
+## the difference between observing "ScriptEditor" and observing "WindowWrapper" and then
+## reporting a confirmation failure for a switch that in fact worked.
+func _main_screen_identity(control: Control) -> String:
+	var screen_name := control.name
+	if not screen_name.to_lower().contains("windowwrapper"):
+		return screen_name
+	for child in control.get_children():
+		if child is Control:
+			return child.name
+	return screen_name
+
+func _select_main_screen(screen_name: String) -> Dictionary:
+	EditorInterface.set_main_screen_editor(screen_name)
+	var shown := _visible_main_screen()
+	var confirmed = null
+	if shown != "" and MAIN_SCREEN_HINTS.has(screen_name):
+		confirmed = false
+		for hint in MAIN_SCREEN_HINTS[screen_name]:
+			if shown.to_lower().contains(hint):
+				confirmed = true
+				break
+	return {
+		"workspace": screen_name,
+		"workspace_control": shown,
+		"workspace_confirmed": confirmed,
+	}
+
+func _op_workspace_state() -> Dictionary:
+	var shown := _visible_main_screen()
+	return {
+		"ok": true,
+		"workspace_control": shown,
+		"process_ticks": _process_ticks,
+		"flash_active": _flash_edit != null,
+		"scroll_active": _scroll_edit != null,
+	}
+
 func _op_focus(payload: Dictionary) -> Dictionary:
-	EditorInterface.set_main_screen_editor("3D")
+	var screen := _select_main_screen("3D")
 	var selected := _op_select(payload)
 	if not selected.get("ok", false):
 		return selected
+	selected.merge(screen, true)
 	var dispatched := _op_focus_dispatch()
 	selected["focused"] = dispatched.get("ok", false)
 	selected["mechanism"] = dispatched.get("mechanism", "")
@@ -3290,14 +3381,16 @@ func _op_focus(payload: Dictionary) -> Dictionary:
 	return selected
 
 func _op_workspace_3d(payload: Dictionary) -> Dictionary:
-	EditorInterface.set_main_screen_editor("3D")
+	var screen := _select_main_screen("3D")
 	var node_path := String(payload.get("node_path", ""))
 	if node_path == "":
-		return {"ok": true, "workspace": "3D", "selected": null}
+		var reply := {"ok": true, "selected": null}
+		reply.merge(screen, true)
+		return reply
 	var selected := _op_select({"node_path": node_path})
 	if not selected.get("ok", false):
 		return selected
-	selected["workspace"] = "3D"
+	selected.merge(screen, true)
 	return selected
 
 ## Dispatch only, no selection. Node3DEditor reacts to EditorSelection changes on a deferred
@@ -3658,6 +3751,26 @@ func _aabb_of(node: Node) -> Array:
 var _script_jobs: Dictionary = {}
 var _script_job_counter: int = 0
 
+## Live state for the changed-line flash and the reveal scroll.
+##
+## Both are driven from _process rather than from a Tween. A Tween created by an EditorPlugin
+## did not advance in the editor's own loop - the tint was applied and then simply stayed - so
+## the fade is stepped by the frame callback that demonstrably runs. Only one flash exists at a
+## time: a second agent edit replaces the first rather than layering two fades on one buffer.
+const FLASH_SECONDS := 1.25
+const FLASH_PEAK := 0.34
+const SCROLL_SMOOTHING := 9.0
+
+var _flash_edit: TextEdit = null
+var _flash_lines: PackedInt32Array = PackedInt32Array()
+var _flash_alpha: float = 0.0
+var _flash_started_at: int = 0
+var _scroll_edit: TextEdit = null
+var _scroll_target: float = 0.0
+## Counted so the bridge can verify from the outside that the editor is actually giving this
+## plugin frames, instead of an animation silently never running again.
+var _process_ticks: int = 0
+
 func _open_script_for_path(path: String) -> Script:
 	var script_editor := EditorInterface.get_script_editor()
 	if script_editor == null:
@@ -3693,6 +3806,181 @@ func _op_script_preflight(payload: Dictionary) -> Dictionary:
 		"disk_sha256": FileAccess.get_sha256(path) if exists else "",
 	}
 
+## The CodeEdit behind the script tab that is currently in front.
+func _current_code_edit() -> TextEdit:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return null
+	var current := script_editor.get_current_editor()
+	if current == null:
+		return null
+	return current.get_base_editor() as TextEdit
+
+## Push acknowledged bytes into an already-open script buffer.
+##
+## The bridge writes candidate bytes straight into the engine's virtual filesystem, so Godot's
+## own "this file changed on disk" path never runs. A script the human already had open kept
+## rendering its pre-edit text while the agent reported success - and, worse, a later manual
+## save of that stale buffer would have silently overwritten the agent's work. Syncing the
+## buffer is therefore correctness; the flash below is the part that is decoration.
+func _sync_open_script_buffer(script: Script, source: String, focus: bool, line: int) -> Dictionary:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return {"synced": false, "reason": "no_script_editor"}
+	var is_open := false
+	for opened in script_editor.get_open_scripts():
+		if opened == script:
+			is_open = true
+			break
+	# Reading the caret has to happen before edit_script moves it, or "restore where the human
+	# was" restores where the agent just put them.
+	var previous := _current_code_edit()
+	var caret_line: int = previous.get_caret_line() if previous != null else 0
+	var caret_column: int = previous.get_caret_column() if previous != null else 0
+	var scroll: float = previous.scroll_vertical if previous != null else 0.0
+	if not focus:
+		# Never pull a background tab in front of someone who is reading a different file, and
+		# never open a tab nobody asked for. A buffer that is open but behind stays as it was
+		# and is reported stale, so the bridge can say so instead of the editor quietly lying.
+		if not is_open:
+			return {"synced": false, "reason": "not_open"}
+		if script_editor.get_current_script() != script:
+			return {"synced": false, "reason": "background_buffer", "stale": true}
+	# Following is exactly the request to be taken to the file, so a script that is not open yet
+	# - a file the agent just created - is opened here rather than left invisible.
+	EditorInterface.edit_script(script, line, 1, focus)
+	var edit := _current_code_edit()
+	if edit == null:
+		return {"synced": false, "reason": "no_base_editor", "stale": true}
+	if edit.text == source:
+		return {"synced": true, "already_matching": true, "opened": not is_open}
+	edit.begin_complex_operation()
+	edit.text = source
+	edit.end_complex_operation()
+	# The buffer now equals what Godot has on disk. Without this the tab would carry an unsaved
+	# marker for bytes nobody typed, and the next preflight would refuse the next agent edit as
+	# a human-buffer conflict.
+	edit.tag_saved_version()
+	if not focus:
+		edit.set_caret_line(mini(caret_line, maxi(edit.get_line_count() - 1, 0)))
+		edit.set_caret_column(caret_column)
+		edit.scroll_vertical = scroll
+	return {"synced": true, "opened": not is_open}
+
+func _visible_line_span(edit: TextEdit) -> int:
+	if edit.has_method("get_visible_line_count"):
+		return maxi(int(edit.call("get_visible_line_count")), 4)
+	return 20
+
+## Bring the changed lines into view and mark them.
+##
+## Two deliberate non-choices. The range is never *selected*: a selection survives until the
+## next click, and one stray keystroke would then replace the code the agent just wrote. And
+## nothing is ever typed out character by character - the bytes are already in the engine, so
+## animating them arriving would be a re-enactment, not the edit. What is animated is the
+## reader's attention: a damped scroll to the change, and a tint on exactly the changed lines
+## that fades out on its own.
+func _reveal_script_change(start_line: int, end_line: int, animate: bool) -> Dictionary:
+	var edit := _current_code_edit()
+	if edit == null:
+		return {"revealed": false, "reason": "no_base_editor"}
+	var line_count := edit.get_line_count()
+	if line_count <= 0:
+		return {"revealed": false, "reason": "empty_buffer"}
+	var first := clampi(start_line, 1, line_count)
+	var last := clampi(maxi(end_line, start_line), first, line_count)
+	edit.set_caret_line(first - 1)
+	edit.set_caret_column(0)
+	var target := clampi(first - 1 - int(_visible_line_span(edit) / 3.0), 0, maxi(line_count - 1, 0))
+	if animate:
+		_glide_scroll(edit, float(target))
+		_flash_change(edit, first, last)
+	else:
+		edit.scroll_vertical = float(target)
+	return {
+		"revealed": true,
+		"first_line": first,
+		"last_line": last,
+		"animated": animate,
+	}
+
+## A short damped scroll instead of a jump cut. Godot's own smooth scrolling only applies to
+## mouse wheel input, so an agent-driven reveal has to move the value itself.
+func _glide_scroll(edit: TextEdit, target: float) -> void:
+	if absf(edit.scroll_vertical - target) <= 1.0:
+		edit.scroll_vertical = target
+		_scroll_edit = null
+		return
+	_scroll_edit = edit
+	_scroll_target = target
+	set_process(true)
+
+func _flash_change(edit: TextEdit, first: int, last: int) -> void:
+	_clear_flash()
+	_flash_edit = edit
+	_flash_lines = PackedInt32Array()
+	for line in range(first - 1, last):
+		if line >= 0 and line < edit.get_line_count():
+			_flash_lines.append(line)
+	if _flash_lines.is_empty():
+		_flash_edit = null
+		return
+	_flash_alpha = FLASH_PEAK
+	_flash_started_at = Time.get_ticks_msec()
+	_paint_flash(_flash_alpha)
+	set_process(true)
+
+func _paint_flash(alpha: float) -> void:
+	if _flash_edit == null or not is_instance_valid(_flash_edit):
+		return
+	var tint := Color(0.29, 0.72, 1.0, alpha)
+	for line in _flash_lines:
+		if line < _flash_edit.get_line_count():
+			_flash_edit.set_line_background_color(line, tint)
+
+func _clear_flash() -> void:
+	if _flash_edit != null and is_instance_valid(_flash_edit):
+		for line in _flash_lines:
+			if line < _flash_edit.get_line_count():
+				_flash_edit.set_line_background_color(line, Color(0, 0, 0, 0))
+	_flash_edit = null
+	_flash_lines = PackedInt32Array()
+	_flash_alpha = 0.0
+
+## Belt and braces. If this plugin ever stops being given frames, a tint that was meant to last
+## a second must not become permanent decoration on someone's code, so any command arriving
+## after the fade should have finished clears it.
+func _expire_stale_flash() -> void:
+	if _flash_edit == null:
+		return
+	if Time.get_ticks_msec() - _flash_started_at > int(FLASH_SECONDS * 3000.0):
+		_clear_flash()
+
+func _process(delta: float) -> void:
+	_process_ticks += 1
+	var busy := false
+	if _flash_edit != null and is_instance_valid(_flash_edit):
+		_flash_alpha = maxf(_flash_alpha - delta * (FLASH_PEAK / FLASH_SECONDS), 0.0)
+		if _flash_alpha <= 0.0:
+			_clear_flash()
+		else:
+			_paint_flash(_flash_alpha)
+			busy = true
+	elif _flash_edit != null:
+		_clear_flash()
+	if _scroll_edit != null and is_instance_valid(_scroll_edit):
+		var current := _scroll_edit.scroll_vertical
+		if absf(_scroll_target - current) < 0.4:
+			_scroll_edit.scroll_vertical = _scroll_target
+			_scroll_edit = null
+		else:
+			_scroll_edit.scroll_vertical = current + (_scroll_target - current) * clampf(delta * SCROLL_SMOOTHING, 0.0, 1.0)
+			busy = true
+	elif _scroll_edit != null:
+		_scroll_edit = null
+	if not busy:
+		set_process(false)
+
 func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	var path := String(payload.get("path", ""))
 	if not path.begins_with("res://"):
@@ -3700,7 +3988,17 @@ func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	_script_job_counter += 1
 	var job_id := "script_job_%d" % _script_job_counter
 	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
-	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
+	# 'reveal' navigates the FileSystem dock; 'focus' is the stronger request that may bring the
+	# script tab forward, and only the bridge - which knows whether the human turned following
+	# on - is allowed to ask for it.
+	var reveal := {
+		"reveal": bool(payload.get("reveal", true)),
+		"focus": bool(payload.get("focus", false)),
+		"start_line": int(payload.get("start_line", 0)),
+		"end_line": int(payload.get("end_line", 0)),
+		"animate": bool(payload.get("animate", true)),
+	}
+	call_deferred("_run_script_refresh_job", job_id, path, reveal)
 	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
 
 func _op_script_delete(payload: Dictionary) -> Dictionary:
@@ -3737,7 +4035,7 @@ func _run_script_delete_job(job_id: String, path: String) -> void:
 		job["error"] = "Godot still sees %s after removal." % path
 	_script_jobs[job_id] = job
 
-func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
+func _run_script_refresh_job(job_id: String, path: String, reveal: Dictionary) -> void:
 	var job: Dictionary = _script_jobs.get(job_id, {})
 	job["state"] = "done"
 	job["finished_at"] = Time.get_ticks_msec()
@@ -3784,7 +4082,18 @@ func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void
 		_script_jobs[job_id] = job
 		return
 	job["ok"] = true
-	if reveal:
+	# The bytes are acknowledged. Everything below is about what the human can see: the open
+	# buffer must stop showing pre-edit text, and if the agent is being followed the change is
+	# scrolled to and marked.
+	var focus := bool(reveal.get("focus", false))
+	var start_line := int(reveal.get("start_line", 0))
+	var end_line := int(reveal.get("end_line", start_line))
+	if focus:
+		job["screen"] = _select_main_screen("Script")
+	job["buffer"] = _sync_open_script_buffer(script, disk_source, focus, maxi(start_line, 1))
+	if focus and bool(job["buffer"].get("synced", false)):
+		job["reveal"] = _reveal_script_change(maxi(start_line, 1), maxi(end_line, start_line), bool(reveal.get("animate", true)))
+	if bool(reveal.get("reveal", true)):
 		var dock := EditorInterface.get_file_system_dock()
 		if dock != null:
 			dock.navigate_to_path(path)
@@ -3817,6 +4126,9 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["can_instantiate"] = job.get("can_instantiate", null)
 	reply["finished_at"] = job.get("finished_at", 0)
 	reply["exists"] = job.get("exists", null)
+	reply["buffer"] = job.get("buffer", null)
+	reply["reveal"] = job.get("reveal", null)
+	reply["screen"] = job.get("screen", null)
 	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
 	# long authoring sessions grow without bound.
 	_script_jobs.erase(job_id)
@@ -3832,9 +4144,12 @@ func _op_script_open(payload: Dictionary) -> Dictionary:
 	if loaded == null or not (loaded is Script):
 		return {"ok": false, "error": "Could not load %s as a Script." % path}
 	var line := int(payload.get("line", 1))
-	EditorInterface.set_main_screen_editor("Script")
-	EditorInterface.edit_script(loaded as Script, line, 0, true)
-	return {"ok": true, "path": path, "line": line, "workspace": "Script"}
+	var end_line := int(payload.get("end_line", line))
+	var reply := {"ok": true, "path": path, "line": line, "end_line": end_line}
+	reply.merge(_select_main_screen("Script"), true)
+	EditorInterface.edit_script(loaded as Script, line, 1, true)
+	reply["reveal"] = _reveal_script_change(maxi(line, 1), maxi(end_line, line), bool(payload.get("animate", true)))
+	return reply
 
 ## Attach a script to an existing node through UndoRedo, so the human can undo it exactly as
 ## if they had dragged the file onto the node — and so the editor's own scene state, not the
@@ -4201,7 +4516,10 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
 
     // Copy candidate bytes in, then make Godot prove it saw them. `expected` maps a cleaned
     // project path to its SHA-256, and nothing is believed until Godot's own hash agrees.
-    async writeAndRefresh(files, expected, generations, { reveal = true, budgetMs = 12000 } = {}) {
+    // `focus` is the one path the human should be looking at, with the line range that
+    // changed. It is only ever set when the user turned following on: the plugin uses it to
+    // bring the script tab forward, scroll to the change, and mark the changed lines.
+    async writeAndRefresh(files, expected, generations, { reveal = true, budgetMs = 12000, focus = null } = {}) {
       if (typeof window === 'undefined' || typeof window.__godotEditorWriteFiles !== 'function') {
         return { ok: false, code: 'SCRIPT_REFRESH_FAILED', error: 'The live editor filesystem writer is unavailable in this page.' };
       }
@@ -4221,7 +4539,15 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       const refreshed = [];
       for (const path of Object.keys(files)) {
         const resPath = `res://${path}`;
-        const queued = EditorCommandChannel.call('script_refresh', { path: resPath, reveal });
+        const focused = focus && focus.path === path;
+        const queued = EditorCommandChannel.call('script_refresh', {
+          path: resPath,
+          reveal,
+          focus: Boolean(focused),
+          start_line: focused ? (focus.start_line || 1) : 0,
+          end_line: focused ? (focus.end_line || focus.start_line || 1) : 0,
+          animate: focused ? focus.animate !== false : false
+        });
         if (!queued.ok) {
           return {
             ok: false,
@@ -4261,7 +4587,16 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
             job
           };
         }
-        refreshed.push({ path: resPath, sha256: job.sha256 || null, can_instantiate: job.can_instantiate === true });
+        refreshed.push({
+          path: resPath,
+          sha256: job.sha256 || null,
+          can_instantiate: job.can_instantiate === true,
+          // What the editor reports it did with the visible buffer, so the caller can say
+          // whether the human actually saw the change rather than assuming it.
+          buffer: job.buffer || null,
+          revealed: job.reveal || null,
+          workspace: job.screen || null
+        });
       }
       return { ok: true, refreshed };
     },
@@ -4395,12 +4730,33 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     }
   };
 
-  function follow3DWorkspace(nodePath = '') {
+  async function follow3DWorkspace(nodePath = '') {
     if (!FollowAgent.active()) return { followed: false, reason: 'follow_disabled' };
+    // When the playtest is the visible surface, the 3D workspace is behind it. Switching that
+    // workspace would be a change nobody can see, and the running game would keep rendering
+    // the pre-edit scene - which is the "I changed the 3D thing and nothing happened" case.
+    // Refreshing the preview is what following means on this surface.
+    if (activeGodotViewport() === 'game') {
+      const preview = await refreshVisiblePlaytest();
+      return {
+        followed: preview === 'refreshed',
+        surface: 'game',
+        preview_state: preview,
+        reason: preview === 'refreshed' ? null : `preview_${preview}`
+      };
+    }
+    // A live mutation that had to fall back to a restart republishes the command channel a
+    // moment after the edit lands. A follow that gave up inside that window is exactly the
+    // "and then it just didn't go back to 3D" the user sees, so wait for the channel instead
+    // of reporting a failure the editor never actually refused.
+    if (!EditorCommandChannel.available()) await EditorCommandChannel.waitForReady(5000);
     const reply = EditorCommandChannel.call('workspace_3d', { node_path: nodePath || '' });
     return {
       followed: reply.ok === true,
       workspace: reply.ok === true ? '3D' : null,
+      // Observed from the editor's visible main-screen control, not inferred from the request.
+      workspace_confirmed: reply.workspace_confirmed ?? null,
+      selected: reply.selected ?? null,
       reason: reply.ok === true ? null : (reply.error || 'workspace_unavailable')
     };
   }
@@ -4409,16 +4765,25 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     const running = typeof window !== 'undefined' && window.__godotGameState === 'running';
     if (!running) return 'not_running';
     if (activeGodotViewport() !== 'game') return 'stale';
+    // Hold the last rendered frame across the relaunch. The runtime is a second Engine, so
+    // refreshing it means tearing one down and building another, and without this the surface
+    // the user is actually watching goes black for the whole restart - which reads as a crash,
+    // not an update. The frame sits under the rail so the rail can say what is happening.
+    const held = holdRuntimeFrame({ belowRail: true });
+    AgentStatusRail.setFocusNote('Updating the running preview');
     try {
       await stopGameRuntime(10000);
       await startGameRuntime({ visible: true, timeoutMs: 60000 });
       DiagnosticState.session = 'playtesting';
-      DiagnosticHUD.render();
       return 'refreshed';
     } catch (previewError) {
       activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Refresh] ${previewError.message || String(previewError)}` });
       if (activeLogs.length > MAX_LOGS) activeLogs.shift();
       return 'refresh_failed';
+    } finally {
+      if (held) releaseRuntimeFrame();
+      AgentStatusRail.setFocusNote('');
+      DiagnosticHUD.render();
     }
   }
 
@@ -4516,9 +4881,41 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         : null;
     }
     await advancePhase(operation, 'preparing_change');
+
+    // Navigate BEFORE writing, not after.
+    //
+    // Opening the script once the whole transaction had settled meant the human watched an
+    // unrelated workspace for the entire edit and was then teleported to a file that had
+    // already finished changing. Arriving first makes the sequence read the way it actually
+    // happens: you are looking at the file, and the agent's lines appear in it.
+    const primary = changes[0] || null;
+    const following = FollowAgent.active() && Boolean(primary);
+    const animate = !prefersReducedMotion();
+    let arrival = null;
+    if (following) {
+      const opened = EditorCommandChannel.call('script_open', {
+        path: primary.path,
+        line: primary.start_line || 1,
+        end_line: primary.end_line || primary.start_line || 1,
+        // Nothing to mark yet - the bytes are not in the engine. This is only the trip there.
+        animate: false
+      });
+      arrival = { ok: opened.ok === true, workspace_confirmed: opened.workspace_confirmed ?? null, error: opened.ok ? null : (opened.error || null) };
+    }
+
     const refreshStartedAt = Date.now();
     await advancePhase(operation, 'updating_script');
-    const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, { reveal });
+    const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, {
+      reveal,
+      focus: following
+        ? {
+            path: cleanProjectPath(primary.path),
+            start_line: primary.start_line || 1,
+            end_line: primary.end_line || primary.start_line || 1,
+            animate
+          }
+        : null
+    });
     if (!applied.ok) {
       await advancePhase(operation, 'restoring_script');
       const restore = await rollbackCandidates();
@@ -4634,15 +5031,38 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // Follow is user-owned. With it off, the FileSystem dock reveal that script_refresh
     // already performed is the whole of the visual feedback in Godot: no tab switch, no
     // stolen focus, no workspace change.
-    const primary = changes[0];
-    let followed = false;
-    if (FollowAgent.active() && primary) {
-      const opened = EditorCommandChannel.call('script_open', {
+    //
+    // With it on, the navigation and the changed-line reveal already happened inside the
+    // refresh job, at the only honest moment for them: after Godot acknowledged the bytes.
+    // What is left here is reporting what the editor observed, and one retry for the case
+    // where the arrival worked but the reveal did not.
+    const acknowledged = following
+      ? (applied.refreshed || []).find(entry => entry.path === `res://${cleanProjectPath(primary.path)}`) || null
+      : null;
+    let navigation = following
+      ? {
+          arrived: Boolean(arrival && arrival.ok),
+          workspace: 'Script',
+          workspace_confirmed: acknowledged?.workspace?.workspace_confirmed ?? arrival?.workspace_confirmed ?? null,
+          buffer_synced: acknowledged?.buffer?.synced === true,
+          buffer_stale: acknowledged?.buffer?.stale === true,
+          revealed: acknowledged?.revealed?.revealed === true,
+          highlighted_lines: acknowledged?.revealed?.revealed
+            ? [acknowledged.revealed.first_line, acknowledged.revealed.last_line]
+            : null
+        }
+      : { arrived: false, reason: 'follow_disabled' };
+    if (following && !navigation.revealed) {
+      const retried = EditorCommandChannel.call('script_open', {
         path: primary.path,
-        line: primary.start_line || 1
+        line: primary.start_line || 1,
+        end_line: primary.end_line || primary.start_line || 1,
+        animate
       });
-      followed = opened.ok === true;
+      navigation.revealed = retried.ok === true && retried.reveal?.revealed === true;
+      navigation.reveal_retried = true;
     }
+    const followed = following ? navigation.arrived : false;
 
     await advancePhase(operation, 'complete');
     return {
@@ -4661,7 +5081,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       persisted,
       persisted_revision: DiagnosticState.persistedRevision,
       preview_state: previewState,
-      follow: { ...FollowAgent.describe(), followed },
+      follow: { ...FollowAgent.describe(), followed, navigation },
       ...(attachResult ? { script_attachment: attachResult } : {})
     };
   }
@@ -7494,7 +7914,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           }
         });
 
-        const navigation = follow3DWorkspace(res.commandReply?.node_path || nodeName);
+        const navigation = await follow3DWorkspace(res.commandReply?.node_path || nodeName);
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.focus(nodeName, pos, meshType, 'SPAWNED');
           CameraGuidance.noteSceneChanged(nodeName);
@@ -7553,7 +7973,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyTransformInSource(source, resolvedNodePath(reply, requestedPath), reply?.transform)
         });
 
-        const navigation = follow3DWorkspace(res.commandReply?.node_path || requestedPath);
+        const navigation = await follow3DWorkspace(res.commandReply?.node_path || requestedPath);
         if (typeof window !== 'undefined') {
           const focusPath = res.commandReply?.node_path || requestedPath;
           AgentFocusOverlay.focus(focusPath, pos || [0, 0, 0], 'Node3D', 'TRANSFORMED');
@@ -7611,7 +8031,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyMaterialInSource(source, resolvedNodePath(reply, requestedPath), args)
         });
 
-        const navigation = follow3DWorkspace(res.commandReply?.node_path || requestedPath);
+        const navigation = await follow3DWorkspace(res.commandReply?.node_path || requestedPath);
         // A material tweak is not a geometry change: no auto-follow, and the reticle is
         // anchored to the node's real position rather than the origin.
         if (typeof window !== 'undefined') {
@@ -7657,7 +8077,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
           verify: (source, reply) => verifyNodePresence(source, resolvedNodePath(reply, requestedPath), false)
         });
 
-        const navigation = follow3DWorkspace();
+        const navigation = await follow3DWorkspace();
         if (typeof window !== 'undefined') {
           AgentFocusOverlay.hide('node_deleted');
           CameraGuidance.noteSceneChanged(null);

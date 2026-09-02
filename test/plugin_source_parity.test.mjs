@@ -92,3 +92,54 @@ test('patching is idempotent across repeated editor restarts', () => {
   assert.equal(once, twice);
   assert.equal((twice.match(/addons\/webmcp\/plugin\.cfg/g) || []).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// The visible half of a hot script edit
+// ---------------------------------------------------------------------------
+
+const pluginSource = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+
+function pluginFunction(name) {
+  const start = pluginSource.indexOf(`func ${name}(`);
+  assert.ok(start >= 0, `plugin.gd has no ${name}`);
+  const next = pluginSource.indexOf('\nfunc ', start + 1);
+  return pluginSource.slice(start, next > start ? next : pluginSource.length);
+}
+
+test('an acknowledged write is pushed into the open script buffer, not just onto disk', () => {
+  const body = pluginFunction('_sync_open_script_buffer');
+  assert.match(body, /edit\.text = source/);
+  // Without this the tab carries an unsaved marker for bytes nobody typed, and the next
+  // preflight refuses the next agent edit as a human-buffer conflict.
+  assert.match(body, /edit\.tag_saved_version\(\)/);
+  // A buffer that is open but behind is left alone and reported, never yanked to the front.
+  assert.match(body, /"background_buffer"/);
+  assert.match(body, /"stale": true/);
+});
+
+test('the changed lines are marked and scrolled to, never selected and never retyped', () => {
+  const body = pluginFunction('_reveal_script_change');
+  assert.match(body, /set_caret_line/);
+  assert.doesNotMatch(body, /\.select\(/, 'a live selection would let one keystroke replace the new code');
+  assert.doesNotMatch(body, /insert_text|type_char|await get_tree\(\)/, 'the bytes are already in the engine; retyping them would be a re-enactment');
+  assert.match(body, /_flash_change/);
+  assert.match(body, /_glide_scroll/);
+  // Reduced motion is the caller's fact, so the reveal still happens without the animation.
+  assert.match(body, /if animate:/);
+});
+
+test('the flash clears itself and never outlives its buffer', () => {
+  const body = pluginFunction('_clear_flash');
+  assert.match(body, /is_instance_valid\(_flash_edit\)/);
+  assert.match(body, /set_line_background_color\(line, Color\(0, 0, 0, 0\)\)/);
+  assert.match(pluginFunction('_flash_change'), /_clear_flash\(\)/);
+});
+
+test('a workspace switch reports the main screen Godot is actually showing', () => {
+  const body = pluginFunction('_select_main_screen');
+  assert.match(body, /EditorInterface\.set_main_screen_editor\(screen_name\)/);
+  assert.match(body, /_visible_main_screen\(\)/);
+  assert.match(body, /"workspace_confirmed"/);
+  // Unknown mapping must stay null: reporting false would claim an observation nobody made.
+  assert.match(body, /var confirmed = null/);
+});

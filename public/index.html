@@ -196,6 +196,26 @@ a:active {
 	border-color: var(--gd-accent);
 }
 
+/* A tab switch is instantaneous - both engines are already live and only their containers
+   toggle - so the fade exists purely to stop the swap reading as a jump cut. It runs on the
+   arriving surface only, and never delays it: the first frame is already visible. */
+@keyframes gd-surface-in {
+	from { opacity: .55; }
+	to { opacity: 1; }
+}
+
+#tab-editor.gd-surface-enter,
+#tab-game.gd-surface-enter {
+	animation: gd-surface-in 130ms cubic-bezier(.22, .61, .36, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	#tab-editor.gd-surface-enter,
+	#tab-game.gd-surface-enter {
+		animation: none;
+	}
+}
+
 /* Don't show distracting focus outlines for the main tabs' contents. */
 #tab-editor canvas:focus,
 #tab-game canvas:focus,
@@ -829,15 +849,29 @@ function showTab(name) {
 	}
 	tabs.forEach(function (elem) {
 		if (elem.id === `tab-${name}`) {
+			const wasHidden = elem.style.display === 'none';
 			elem.style.display = 'block';
+			if (wasHidden) {
+				// Restarting the animation needs the class off for one layout read.
+				elem.classList.remove('gd-surface-enter');
+				void elem.offsetWidth;
+				elem.classList.add('gd-surface-enter');
+			}
 			if (name === 'editor' || name === 'game') {
 				const canvas = document.getElementById(`${name}-canvas`);
 				canvas.focus();
+				// The engine sizes its framebuffer from the canvas box, which reads as zero
+				// while the container is display:none. Without this nudge a surface that was
+				// hidden across a resize comes back at the stale size until the next real
+				// window resize - the "I went back and it was wrong" case.
+				window.dispatchEvent(new Event('resize'));
 			}
 		} else {
 			elem.style.display = 'none';
+			elem.classList.remove('gd-surface-enter');
 		}
 	});
+	window.dispatchEvent(new CustomEvent('godot-surface-changed', { detail: { surface: name } }));
 }
 
 function setButtonEnabled(id, enabled) {

@@ -28,6 +28,7 @@ func _enter_tree() -> void:
 	_window.__godotEditorCommand = _command_callback
 	_window.__godotEditorPluginVersion = CHANNEL_VERSION
 	_window.__godotEditorPluginReady = true
+	set_process(false)
 	_tune_navigation_feel()
 
 func _exit_tree() -> void:
@@ -91,6 +92,7 @@ func _on_command(args: Array) -> String:
 		"focus": reply = _op_focus(payload)
 		"focus_dispatch": reply = _op_focus_dispatch()
 		"workspace_3d": reply = _op_workspace_3d(payload)
+		"workspace_state": reply = _op_workspace_state()
 		"view_preset": reply = _op_view_preset(payload)
 		"viewport_tree": reply = _op_viewport_tree()
 		"node_add": reply = _op_node_add(payload)
@@ -112,6 +114,7 @@ func _on_command(args: Array) -> String:
 	return _reply(reply)
 
 func _reply(body: Dictionary) -> String:
+	_expire_stale_flash()
 	body["generation"] = _generation()
 	body["channel_version"] = CHANNEL_VERSION
 	var text := JSON.stringify(body)
@@ -320,11 +323,74 @@ func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
 			mechanism = "subviewport.push_input"
 	return {"ok": true, "mechanism": mechanism}
 
+## Which main-screen editor Godot is actually showing.
+##
+## EditorInterface can set the main screen but cannot report it, so this reads the visible
+## child of the main-screen container. The control's node name is its class ("Node3DEditor"),
+## not the tab label ("3D"), so the match is by hint and returns null rather than a guess when
+## the mapping is unknown - a follow result must say what was observed, not what was asked for.
+const MAIN_SCREEN_HINTS := {
+	"3D": ["node3d", "spatial"],
+	"2D": ["canvasitem", "2d"],
+	"Script": ["script"],
+	"Game": ["game"],
+	"AssetLib": ["asset"],
+}
+
+func _visible_main_screen() -> String:
+	var main_screen := EditorInterface.get_editor_main_screen()
+	if main_screen == null:
+		return ""
+	for child in main_screen.get_children():
+		if child is Control and (child as Control).visible:
+			return _main_screen_identity(child as Control)
+	return ""
+
+## Godot can wrap a main-screen editor in a WindowWrapper so the human can tear it off into its
+## own window, so the visible child is not always the editor itself. One level of unwrapping is
+## the difference between observing "ScriptEditor" and observing "WindowWrapper" and then
+## reporting a confirmation failure for a switch that in fact worked.
+func _main_screen_identity(control: Control) -> String:
+	var screen_name := control.name
+	if not screen_name.to_lower().contains("windowwrapper"):
+		return screen_name
+	for child in control.get_children():
+		if child is Control:
+			return child.name
+	return screen_name
+
+func _select_main_screen(screen_name: String) -> Dictionary:
+	EditorInterface.set_main_screen_editor(screen_name)
+	var shown := _visible_main_screen()
+	var confirmed = null
+	if shown != "" and MAIN_SCREEN_HINTS.has(screen_name):
+		confirmed = false
+		for hint in MAIN_SCREEN_HINTS[screen_name]:
+			if shown.to_lower().contains(hint):
+				confirmed = true
+				break
+	return {
+		"workspace": screen_name,
+		"workspace_control": shown,
+		"workspace_confirmed": confirmed,
+	}
+
+func _op_workspace_state() -> Dictionary:
+	var shown := _visible_main_screen()
+	return {
+		"ok": true,
+		"workspace_control": shown,
+		"process_ticks": _process_ticks,
+		"flash_active": _flash_edit != null,
+		"scroll_active": _scroll_edit != null,
+	}
+
 func _op_focus(payload: Dictionary) -> Dictionary:
-	EditorInterface.set_main_screen_editor("3D")
+	var screen := _select_main_screen("3D")
 	var selected := _op_select(payload)
 	if not selected.get("ok", false):
 		return selected
+	selected.merge(screen, true)
 	var dispatched := _op_focus_dispatch()
 	selected["focused"] = dispatched.get("ok", false)
 	selected["mechanism"] = dispatched.get("mechanism", "")
@@ -333,14 +399,16 @@ func _op_focus(payload: Dictionary) -> Dictionary:
 	return selected
 
 func _op_workspace_3d(payload: Dictionary) -> Dictionary:
-	EditorInterface.set_main_screen_editor("3D")
+	var screen := _select_main_screen("3D")
 	var node_path := String(payload.get("node_path", ""))
 	if node_path == "":
-		return {"ok": true, "workspace": "3D", "selected": null}
+		var reply := {"ok": true, "selected": null}
+		reply.merge(screen, true)
+		return reply
 	var selected := _op_select({"node_path": node_path})
 	if not selected.get("ok", false):
 		return selected
-	selected["workspace"] = "3D"
+	selected.merge(screen, true)
 	return selected
 
 ## Dispatch only, no selection. Node3DEditor reacts to EditorSelection changes on a deferred
@@ -701,6 +769,26 @@ func _aabb_of(node: Node) -> Array:
 var _script_jobs: Dictionary = {}
 var _script_job_counter: int = 0
 
+## Live state for the changed-line flash and the reveal scroll.
+##
+## Both are driven from _process rather than from a Tween. A Tween created by an EditorPlugin
+## did not advance in the editor's own loop - the tint was applied and then simply stayed - so
+## the fade is stepped by the frame callback that demonstrably runs. Only one flash exists at a
+## time: a second agent edit replaces the first rather than layering two fades on one buffer.
+const FLASH_SECONDS := 1.25
+const FLASH_PEAK := 0.34
+const SCROLL_SMOOTHING := 9.0
+
+var _flash_edit: TextEdit = null
+var _flash_lines: PackedInt32Array = PackedInt32Array()
+var _flash_alpha: float = 0.0
+var _flash_started_at: int = 0
+var _scroll_edit: TextEdit = null
+var _scroll_target: float = 0.0
+## Counted so the bridge can verify from the outside that the editor is actually giving this
+## plugin frames, instead of an animation silently never running again.
+var _process_ticks: int = 0
+
 func _open_script_for_path(path: String) -> Script:
 	var script_editor := EditorInterface.get_script_editor()
 	if script_editor == null:
@@ -736,6 +824,181 @@ func _op_script_preflight(payload: Dictionary) -> Dictionary:
 		"disk_sha256": FileAccess.get_sha256(path) if exists else "",
 	}
 
+## The CodeEdit behind the script tab that is currently in front.
+func _current_code_edit() -> TextEdit:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return null
+	var current := script_editor.get_current_editor()
+	if current == null:
+		return null
+	return current.get_base_editor() as TextEdit
+
+## Push acknowledged bytes into an already-open script buffer.
+##
+## The bridge writes candidate bytes straight into the engine's virtual filesystem, so Godot's
+## own "this file changed on disk" path never runs. A script the human already had open kept
+## rendering its pre-edit text while the agent reported success - and, worse, a later manual
+## save of that stale buffer would have silently overwritten the agent's work. Syncing the
+## buffer is therefore correctness; the flash below is the part that is decoration.
+func _sync_open_script_buffer(script: Script, source: String, focus: bool, line: int) -> Dictionary:
+	var script_editor := EditorInterface.get_script_editor()
+	if script_editor == null:
+		return {"synced": false, "reason": "no_script_editor"}
+	var is_open := false
+	for opened in script_editor.get_open_scripts():
+		if opened == script:
+			is_open = true
+			break
+	# Reading the caret has to happen before edit_script moves it, or "restore where the human
+	# was" restores where the agent just put them.
+	var previous := _current_code_edit()
+	var caret_line: int = previous.get_caret_line() if previous != null else 0
+	var caret_column: int = previous.get_caret_column() if previous != null else 0
+	var scroll: float = previous.scroll_vertical if previous != null else 0.0
+	if not focus:
+		# Never pull a background tab in front of someone who is reading a different file, and
+		# never open a tab nobody asked for. A buffer that is open but behind stays as it was
+		# and is reported stale, so the bridge can say so instead of the editor quietly lying.
+		if not is_open:
+			return {"synced": false, "reason": "not_open"}
+		if script_editor.get_current_script() != script:
+			return {"synced": false, "reason": "background_buffer", "stale": true}
+	# Following is exactly the request to be taken to the file, so a script that is not open yet
+	# - a file the agent just created - is opened here rather than left invisible.
+	EditorInterface.edit_script(script, line, 1, focus)
+	var edit := _current_code_edit()
+	if edit == null:
+		return {"synced": false, "reason": "no_base_editor", "stale": true}
+	if edit.text == source:
+		return {"synced": true, "already_matching": true, "opened": not is_open}
+	edit.begin_complex_operation()
+	edit.text = source
+	edit.end_complex_operation()
+	# The buffer now equals what Godot has on disk. Without this the tab would carry an unsaved
+	# marker for bytes nobody typed, and the next preflight would refuse the next agent edit as
+	# a human-buffer conflict.
+	edit.tag_saved_version()
+	if not focus:
+		edit.set_caret_line(mini(caret_line, maxi(edit.get_line_count() - 1, 0)))
+		edit.set_caret_column(caret_column)
+		edit.scroll_vertical = scroll
+	return {"synced": true, "opened": not is_open}
+
+func _visible_line_span(edit: TextEdit) -> int:
+	if edit.has_method("get_visible_line_count"):
+		return maxi(int(edit.call("get_visible_line_count")), 4)
+	return 20
+
+## Bring the changed lines into view and mark them.
+##
+## Two deliberate non-choices. The range is never *selected*: a selection survives until the
+## next click, and one stray keystroke would then replace the code the agent just wrote. And
+## nothing is ever typed out character by character - the bytes are already in the engine, so
+## animating them arriving would be a re-enactment, not the edit. What is animated is the
+## reader's attention: a damped scroll to the change, and a tint on exactly the changed lines
+## that fades out on its own.
+func _reveal_script_change(start_line: int, end_line: int, animate: bool) -> Dictionary:
+	var edit := _current_code_edit()
+	if edit == null:
+		return {"revealed": false, "reason": "no_base_editor"}
+	var line_count := edit.get_line_count()
+	if line_count <= 0:
+		return {"revealed": false, "reason": "empty_buffer"}
+	var first := clampi(start_line, 1, line_count)
+	var last := clampi(maxi(end_line, start_line), first, line_count)
+	edit.set_caret_line(first - 1)
+	edit.set_caret_column(0)
+	var target := clampi(first - 1 - int(_visible_line_span(edit) / 3.0), 0, maxi(line_count - 1, 0))
+	if animate:
+		_glide_scroll(edit, float(target))
+		_flash_change(edit, first, last)
+	else:
+		edit.scroll_vertical = float(target)
+	return {
+		"revealed": true,
+		"first_line": first,
+		"last_line": last,
+		"animated": animate,
+	}
+
+## A short damped scroll instead of a jump cut. Godot's own smooth scrolling only applies to
+## mouse wheel input, so an agent-driven reveal has to move the value itself.
+func _glide_scroll(edit: TextEdit, target: float) -> void:
+	if absf(edit.scroll_vertical - target) <= 1.0:
+		edit.scroll_vertical = target
+		_scroll_edit = null
+		return
+	_scroll_edit = edit
+	_scroll_target = target
+	set_process(true)
+
+func _flash_change(edit: TextEdit, first: int, last: int) -> void:
+	_clear_flash()
+	_flash_edit = edit
+	_flash_lines = PackedInt32Array()
+	for line in range(first - 1, last):
+		if line >= 0 and line < edit.get_line_count():
+			_flash_lines.append(line)
+	if _flash_lines.is_empty():
+		_flash_edit = null
+		return
+	_flash_alpha = FLASH_PEAK
+	_flash_started_at = Time.get_ticks_msec()
+	_paint_flash(_flash_alpha)
+	set_process(true)
+
+func _paint_flash(alpha: float) -> void:
+	if _flash_edit == null or not is_instance_valid(_flash_edit):
+		return
+	var tint := Color(0.29, 0.72, 1.0, alpha)
+	for line in _flash_lines:
+		if line < _flash_edit.get_line_count():
+			_flash_edit.set_line_background_color(line, tint)
+
+func _clear_flash() -> void:
+	if _flash_edit != null and is_instance_valid(_flash_edit):
+		for line in _flash_lines:
+			if line < _flash_edit.get_line_count():
+				_flash_edit.set_line_background_color(line, Color(0, 0, 0, 0))
+	_flash_edit = null
+	_flash_lines = PackedInt32Array()
+	_flash_alpha = 0.0
+
+## Belt and braces. If this plugin ever stops being given frames, a tint that was meant to last
+## a second must not become permanent decoration on someone's code, so any command arriving
+## after the fade should have finished clears it.
+func _expire_stale_flash() -> void:
+	if _flash_edit == null:
+		return
+	if Time.get_ticks_msec() - _flash_started_at > int(FLASH_SECONDS * 3000.0):
+		_clear_flash()
+
+func _process(delta: float) -> void:
+	_process_ticks += 1
+	var busy := false
+	if _flash_edit != null and is_instance_valid(_flash_edit):
+		_flash_alpha = maxf(_flash_alpha - delta * (FLASH_PEAK / FLASH_SECONDS), 0.0)
+		if _flash_alpha <= 0.0:
+			_clear_flash()
+		else:
+			_paint_flash(_flash_alpha)
+			busy = true
+	elif _flash_edit != null:
+		_clear_flash()
+	if _scroll_edit != null and is_instance_valid(_scroll_edit):
+		var current := _scroll_edit.scroll_vertical
+		if absf(_scroll_target - current) < 0.4:
+			_scroll_edit.scroll_vertical = _scroll_target
+			_scroll_edit = null
+		else:
+			_scroll_edit.scroll_vertical = current + (_scroll_target - current) * clampf(delta * SCROLL_SMOOTHING, 0.0, 1.0)
+			busy = true
+	elif _scroll_edit != null:
+		_scroll_edit = null
+	if not busy:
+		set_process(false)
+
 func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	var path := String(payload.get("path", ""))
 	if not path.begins_with("res://"):
@@ -743,7 +1006,17 @@ func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	_script_job_counter += 1
 	var job_id := "script_job_%d" % _script_job_counter
 	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
-	call_deferred("_run_script_refresh_job", job_id, path, bool(payload.get("reveal", true)))
+	# 'reveal' navigates the FileSystem dock; 'focus' is the stronger request that may bring the
+	# script tab forward, and only the bridge - which knows whether the human turned following
+	# on - is allowed to ask for it.
+	var reveal := {
+		"reveal": bool(payload.get("reveal", true)),
+		"focus": bool(payload.get("focus", false)),
+		"start_line": int(payload.get("start_line", 0)),
+		"end_line": int(payload.get("end_line", 0)),
+		"animate": bool(payload.get("animate", true)),
+	}
+	call_deferred("_run_script_refresh_job", job_id, path, reveal)
 	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
 
 func _op_script_delete(payload: Dictionary) -> Dictionary:
@@ -780,7 +1053,7 @@ func _run_script_delete_job(job_id: String, path: String) -> void:
 		job["error"] = "Godot still sees %s after removal." % path
 	_script_jobs[job_id] = job
 
-func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void:
+func _run_script_refresh_job(job_id: String, path: String, reveal: Dictionary) -> void:
 	var job: Dictionary = _script_jobs.get(job_id, {})
 	job["state"] = "done"
 	job["finished_at"] = Time.get_ticks_msec()
@@ -827,7 +1100,18 @@ func _run_script_refresh_job(job_id: String, path: String, reveal: bool) -> void
 		_script_jobs[job_id] = job
 		return
 	job["ok"] = true
-	if reveal:
+	# The bytes are acknowledged. Everything below is about what the human can see: the open
+	# buffer must stop showing pre-edit text, and if the agent is being followed the change is
+	# scrolled to and marked.
+	var focus := bool(reveal.get("focus", false))
+	var start_line := int(reveal.get("start_line", 0))
+	var end_line := int(reveal.get("end_line", start_line))
+	if focus:
+		job["screen"] = _select_main_screen("Script")
+	job["buffer"] = _sync_open_script_buffer(script, disk_source, focus, maxi(start_line, 1))
+	if focus and bool(job["buffer"].get("synced", false)):
+		job["reveal"] = _reveal_script_change(maxi(start_line, 1), maxi(end_line, start_line), bool(reveal.get("animate", true)))
+	if bool(reveal.get("reveal", true)):
 		var dock := EditorInterface.get_file_system_dock()
 		if dock != null:
 			dock.navigate_to_path(path)
@@ -860,6 +1144,9 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["can_instantiate"] = job.get("can_instantiate", null)
 	reply["finished_at"] = job.get("finished_at", 0)
 	reply["exists"] = job.get("exists", null)
+	reply["buffer"] = job.get("buffer", null)
+	reply["reveal"] = job.get("reveal", null)
+	reply["screen"] = job.get("screen", null)
 	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
 	# long authoring sessions grow without bound.
 	_script_jobs.erase(job_id)
@@ -875,9 +1162,12 @@ func _op_script_open(payload: Dictionary) -> Dictionary:
 	if loaded == null or not (loaded is Script):
 		return {"ok": false, "error": "Could not load %s as a Script." % path}
 	var line := int(payload.get("line", 1))
-	EditorInterface.set_main_screen_editor("Script")
-	EditorInterface.edit_script(loaded as Script, line, 0, true)
-	return {"ok": true, "path": path, "line": line, "workspace": "Script"}
+	var end_line := int(payload.get("end_line", line))
+	var reply := {"ok": true, "path": path, "line": line, "end_line": end_line}
+	reply.merge(_select_main_screen("Script"), true)
+	EditorInterface.edit_script(loaded as Script, line, 1, true)
+	reply["reveal"] = _reveal_script_change(maxi(line, 1), maxi(end_line, line), bool(payload.get("animate", true)))
+	return reply
 
 ## Attach a script to an existing node through UndoRedo, so the human can undo it exactly as
 ## if they had dragged the file onto the node — and so the editor's own scene state, not the
