@@ -248,6 +248,7 @@ test('8. Diagnostic tool identification set', () => {
   const DIAGNOSTIC_TOOLS = new Set([
     'godot_get_operation_status',
     'godot_get_session_status',
+    'godot_diagnose_session',
     'godot_get_logs',
     'godot_get_game_telemetry',
     'godot_get_input_sequence_status',
@@ -256,6 +257,7 @@ test('8. Diagnostic tool identification set', () => {
 
   assert.ok(DIAGNOSTIC_TOOLS.has('godot_get_operation_status'));
   assert.ok(DIAGNOSTIC_TOOLS.has('godot_get_session_status'));
+  assert.ok(DIAGNOSTIC_TOOLS.has('godot_diagnose_session'));
   assert.ok(!DIAGNOSTIC_TOOLS.has('godot_create_project'));
   assert.ok(!DIAGNOSTIC_TOOLS.has('godot_apply_file_transaction'));
 });

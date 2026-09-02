@@ -406,6 +406,18 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: true, untrustedContentHint: false }
   },
   {
+    name: 'godot_diagnose_session',
+    description: 'Diagnoses current-generation Godot logs and recovery state into structured platform, project-source, persistence, lifecycle, and fatal-engine issues. Reports ownership, impact, evidence, and only remedies the agent can safely perform; read-only and never mutates the project.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        since_ms: { type: 'number', minimum: 0, description: 'Optional lookback window in milliseconds. Omit to inspect the full current editor generation.' }
+      },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
     name: 'godot_camera_focus',
     description: "Transient viewport-only framing: selects a node, dispatches Godot's own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node's projected screen position. Reports what it measured, not what it attempted: status is 'framed' only when the viewport pose actually changed, 'dispatched_unconfirmed' when the shortcut was delivered but the camera did not move (Godot only advances camera interpolation while rendering, so a backgrounded tab reports this), 'overlay_only' without the editor plugin, or 'yielded' during the 750 ms cooldown after user input. target_reached additionally requires the node to project inside the frame. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload.",
     input_schema: {

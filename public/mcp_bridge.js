@@ -43,6 +43,7 @@
   const DIAGNOSTIC_TOOLS = new Set([
     'godot_get_operation_status',
     'godot_get_session_status',
+    'godot_diagnose_session',
     'godot_get_logs',
     'godot_get_game_telemetry',
     'godot_get_input_sequence_status',
@@ -522,7 +523,8 @@
         if (needsChunkMigration) await migrateLegacyProjectUpload(upload);
       }
       if (snapshot) {
-        const hydratedFiles = cloneProjectFiles(snapshot.files || {});
+        const hydrationNormalization = normalizeProjectTextResources(cloneProjectFiles(snapshot.files || {}));
+        const hydratedFiles = hydrationNormalization.files;
         const hasFiles = Object.keys(hydratedFiles).length > 0;
         const hydratedProject = cleanProjectName(snapshot.project_name);
         if (!Number.isInteger(snapshot.scene_revision) || snapshot.scene_revision < 1) {
@@ -554,6 +556,17 @@
         DiagnosticState.session = persistedProjectAvailable ? 'persisted' : 'empty';
         DiagnosticState.engine = 'loading';
         projectPersistenceError = null;
+        if (hydrationNormalization.repairs > 0) {
+          activeLogs.push({
+            level: 'info',
+            time: Date.now(),
+            msg: `[Persistence migration] Repaired ${hydrationNormalization.repairs} escaped newline separator(s) in ${hydrationNormalization.repairedPaths.join(', ')}.`
+          });
+          // This is a byte-level repair of the already-persisted revision, not a user edit.
+          // Keep the revision stable while replacing the malformed authoritative snapshot so
+          // the same warnings cannot return on the next reload.
+          await persistActiveProjectState({ files: hydratedFiles, revision: snapshot.scene_revision });
+        }
       } else {
         DiagnosticState.session = 'empty';
         DiagnosticState.engine = 'loading';
@@ -1003,6 +1016,55 @@
     if (key) idempotentMutations.set(key, { fingerprint, result, metadata });
   }
 
+  function normalizeTextResourceEscapedNewlines(content) {
+    let text = '';
+    let repairs = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < content.length; i++) {
+      const char = content[i];
+      if (inString) {
+        text += char;
+        if (escaped) {
+          escaped = false;
+        } else if (char === '\\') {
+          escaped = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === '"') {
+        inString = true;
+        text += char;
+        continue;
+      }
+      if (char === '\\' && content[i + 1] === 'n') {
+        text += '\n';
+        repairs += 1;
+        i += 1;
+        continue;
+      }
+      text += char;
+    }
+    return { text, repairs };
+  }
+
+  function normalizeProjectTextResources(files) {
+    const normalized = { ...files };
+    const repairedPaths = [];
+    let repairs = 0;
+    for (const [filePath, content] of Object.entries(files || {})) {
+      if (typeof content !== 'string' || !(filePath.endsWith('.tscn') || filePath.endsWith('.tres'))) continue;
+      const result = normalizeTextResourceEscapedNewlines(content);
+      if (result.repairs === 0) continue;
+      normalized[filePath] = result.text;
+      repairs += result.repairs;
+      repairedPaths.push(filePath);
+    }
+    return { files: normalized, repairs, repairedPaths };
+  }
+
   function validateProjectFiles(files) {
     const entries = Object.entries(files);
     if (entries.length === 0) throw new Error('A project must contain at least one file.');
@@ -1340,7 +1402,7 @@
     // prints the message and its source location on SEPARATE lines, which is why entries are
     // paired with their `at:` continuation before matching — the message alone
     // (`Condition "err != OK" is true. Returning: ERR_CANT_CREATE`) carries no clue at all.
-    /tcp_server\.cpp|Unable to start(?: the)? debugger|remote debugger|Cannot bind/i,
+    /tcp_server\.cpp|Debug adapter server|Unable to start(?: the)? debugger|remote debugger|Cannot bind/i,
     /Blocking on the main thread is very dangerous/i,
     /AudioWorkletNode|BaseAudioContext/i,
     /WebGL.*(?:extension|not supported)/i,
@@ -1377,6 +1439,165 @@
       if (entry.level === 'error') errors.push(entry.text);
     }
     return { errors, warnings, platform_diagnostics: platform };
+  }
+
+  // Converts the raw Godot stream into causes an agent can act on. This stays pure so the
+  // classification can be regression-tested with exact engine output rather than relying on a
+  // particular template to happen to emit each failure. It deliberately reports capability:
+  // platform limitations are explained, but never presented as automatically repairable.
+  function diagnoseEngineSession(logs, generation, options = {}) {
+    const classified = classifyEngineDiagnostics(logs, generation, options.sinceTime || 0);
+    const issues = [];
+    const nextTools = new Set(['godot_get_session_status', 'godot_get_logs']);
+    const addIssue = issue => issues.push({
+      evidence: [],
+      automatic_fix: { available: false },
+      ...issue
+    });
+
+    const dapEvidence = classified.platform_diagnostics.filter(text =>
+      /tcp_server\.cpp|Debug adapter server|debugger.*(?:bind|start)|ERR_CANT_CREATE/i.test(text));
+    if (dapEvidence.length) {
+      addIssue({
+        code: 'GODOT_WEB_DAP_UNAVAILABLE',
+        severity: 'info',
+        owner: 'godot_web_platform',
+        category: 'platform_capability',
+        impact: 'External GDScript Debug Adapter Protocol clients cannot attach. The editor, project, game, WebMCP commands, and captured logs remain usable.',
+        probable_cause: 'Godot starts its desktop-oriented debug adapter TCP listener during editor startup, but a WebAssembly browser build has no raw TCP socket capability.',
+        evidence: dapEvidence,
+        automatic_fix: {
+          available: false,
+          reason: 'Changing the port cannot add raw TCP support. Removing the visible message requires rebuilding the Godot editor WebAssembly binary with the debug adapter disabled on Web builds.'
+        },
+        recommended_action: 'Do not modify the game project. Use WebMCP session diagnostics, logs, and telemetry for browser-hosted debugging.'
+      });
+    }
+
+    const otherPlatform = classified.platform_diagnostics.filter(text => !dapEvidence.includes(text));
+    if (otherPlatform.length) {
+      addIssue({
+        code: 'GODOT_WEB_PLATFORM_DIAGNOSTIC',
+        severity: 'info',
+        owner: 'godot_web_platform',
+        category: 'platform_capability',
+        impact: 'A native-editor capability is unavailable or constrained in the browser.',
+        probable_cause: 'The embedded Godot editor is running inside a browser WebAssembly sandbox.',
+        evidence: otherPlatform,
+        recommended_action: 'No project change is recommended unless a related feature is visibly broken.'
+      });
+    }
+
+    for (const warning of classified.warnings) {
+      if (/SpatialMaterial remapped parameter not found:\s*\\n/i.test(warning)) {
+        addIssue({
+          code: 'MALFORMED_TEXT_RESOURCE_ESCAPE',
+          severity: 'error',
+          owner: 'project_source',
+          category: 'resource_serialization',
+          impact: 'Godot reads an escaped newline as part of a material property name, so the intended property is ignored.',
+          probable_cause: 'A generated .tscn or .tres file contains a literal \\n token outside a quoted string instead of a real line break.',
+          evidence: [warning],
+          automatic_fix: {
+            available: true,
+            tool: 'godot_restore_project_session',
+            behavior: 'The bridge normalizes malformed text-resource line breaks while hydrating the authoritative project snapshot.'
+          },
+          recommended_action: 'Restore or reload the persisted project, then confirm the warning is absent and inspect the affected material.'
+        });
+        nextTools.add('godot_restore_project_session');
+        nextTools.add('godot_inspect_project_files');
+      } else {
+        addIssue({
+          code: 'PROJECT_WARNING',
+          severity: 'warning',
+          owner: 'project_or_engine',
+          category: 'warning',
+          impact: 'Godot reported a non-fatal condition that may affect the authored scene.',
+          probable_cause: 'The warning needs its referenced node, resource, or source location inspected.',
+          evidence: [warning],
+          recommended_action: 'Inspect the referenced project file or node before deciding whether a mutation is needed.'
+        });
+        nextTools.add('godot_inspect_project_files');
+      }
+    }
+
+    for (const error of classified.errors) {
+      if (/\bFATAL:/.test(error)) {
+        addIssue({
+          code: 'ENGINE_FATAL',
+          severity: 'fatal',
+          owner: 'engine_runtime',
+          category: 'engine_abort',
+          impact: 'The current Godot runtime cannot be trusted after an unconditional engine trap.',
+          probable_cause: 'A native engine invariant failed. Subsequent editor results from this generation may be invalid.',
+          evidence: [error],
+          automatic_fix: { available: false, reason: 'The page must recover or reload before further mutations; the underlying trigger still requires diagnosis.' },
+          recommended_action: 'Stop mutations, preserve the project snapshot, reload the editor, and investigate the first fatal line.'
+        });
+      } else if (/SCRIPT ERROR|Parse Error|Failed to load (?:script|resource|scene)/i.test(error)) {
+        addIssue({
+          code: 'PROJECT_SCRIPT_OR_RESOURCE_ERROR',
+          severity: 'error',
+          owner: 'project_source',
+          category: 'project_load',
+          impact: 'A script, scene, or resource could not be parsed or loaded correctly.',
+          probable_cause: 'The authored project source contains invalid syntax, an invalid reference, or unsupported serialized data.',
+          evidence: [error],
+          recommended_action: 'Inspect the named file, apply the smallest source correction, and re-run diagnostics.'
+        });
+        nextTools.add('godot_inspect_project_files');
+      } else {
+        addIssue({
+          code: 'UNCLASSIFIED_ENGINE_ERROR',
+          severity: 'error',
+          owner: 'unknown',
+          category: 'unclassified',
+          impact: 'Godot emitted an actionable error that does not match a known signature.',
+          probable_cause: 'More context is required; the tool intentionally does not infer a fix from an unknown message.',
+          evidence: [error],
+          recommended_action: 'Inspect adjacent logs and the current project files before changing state.'
+        });
+        nextTools.add('godot_inspect_project_files');
+      }
+    }
+
+    if (options.persistenceError) {
+      addIssue({
+        code: 'PROJECT_PERSISTENCE_FAILED',
+        severity: 'error',
+        owner: 'bridge_storage',
+        category: 'persistence',
+        impact: 'The live editor state may be newer than the project snapshot stored in IndexedDB.',
+        probable_cause: String(options.persistenceError),
+        recommended_action: 'Avoid reloading, inspect session status, and retry persistence before making more edits.'
+      });
+    }
+    if (options.restartRequired) {
+      addIssue({
+        code: 'EDITOR_RESTART_REQUIRED',
+        severity: 'error',
+        owner: 'bridge_lifecycle',
+        category: 'recovery',
+        impact: 'This page can no longer safely construct or reuse a Godot Engine instance.',
+        probable_cause: 'The previous editor instance did not confirm exit, so ownership safety blocks another same-page engine.',
+        recommended_action: 'Reload the browser page to recover the persisted project in a fresh engine instance.'
+      });
+    }
+
+    const severityRank = { info: 0, warning: 1, error: 2, fatal: 3 };
+    const highestSeverity = issues.reduce((highest, issue) =>
+      severityRank[issue.severity] > severityRank[highest] ? issue.severity : highest, 'info');
+    const actionableCount = issues.filter(issue => severityRank[issue.severity] > 0).length;
+    return {
+      status: options.restartRequired ? 'restart_required' : actionableCount ? 'action_required' : 'no_project_action_required',
+      generation,
+      highest_severity: highestSeverity,
+      actionable_issue_count: actionableCount,
+      platform_diagnostic_count: issues.filter(issue => issue.category === 'platform_capability').length,
+      issues,
+      recommended_next_tools: [...nextTools]
+    };
   }
 
   // Teardown from a previous editor process logs RID/ObjectDB/WebGL leaks that are expected
@@ -4678,6 +4899,8 @@ func _aabb_of(node: Node) -> Array:
           mainScene = 'res://orbital_sanctuary.tscn';
           projectType = 'orbital_garden';
         }
+        const stagedNormalization = normalizeProjectTextResources(stagedFiles);
+        stagedFiles = stagedNormalization.files;
         validateProjectFiles(stagedFiles);
         DiagnosticState.activeProject = projName;
         activeFilesDict = stagedFiles;
@@ -4715,6 +4938,7 @@ func _aabb_of(node: Node) -> Array:
           main_scene: mainScene,
           files_written: Object.keys(activeFilesDict),
           message: `Project '${projName}' created successfully with ${projectType} template architecture.`,
+          normalized_text_resource_escapes: stagedNormalization.repairs,
           ...(args._upload_id ? { upload_receipt_id: args._upload_id } : {})
         };
 
@@ -4824,7 +5048,7 @@ func _aabb_of(node: Node) -> Array:
         const previousMainScene = activeMainScene;
         const restorePlaytest = typeof window !== 'undefined' && window.__godotGameState === 'running';
         if (typeof window !== 'undefined') window.__godotWebMcpKeepRuntimeFrame = restorePlaytest;
-        const stagedFiles = cloneProjectFiles(activeFilesDict);
+        let stagedFiles = cloneProjectFiles(activeFilesDict);
         const changedPaths = [];
         for (const op of args.operations) {
           const filePath = cleanProjectPath(op.path);
@@ -4839,6 +5063,8 @@ func _aabb_of(node: Node) -> Array:
           }
           changedPaths.push(`res://${filePath}`);
         }
+        const transactionNormalization = normalizeProjectTextResources(stagedFiles);
+        stagedFiles = transactionNormalization.files;
         await advancePhase(operation, 'staging_files');
         const validation = validateProjectFiles(stagedFiles);
         const stagedMainScene = inferMainScene(stagedFiles);
@@ -4882,6 +5108,7 @@ func _aabb_of(node: Node) -> Array:
           main_scene: activeMainScene,
           file_count: validation.fileCount,
           total_bytes: validation.totalBytes,
+          normalized_text_resource_escapes: transactionNormalization.repairs,
           editor_acknowledged: true
         };
           storeIdempotentResult(args.idempotency_key, fingerprint, result);
@@ -5810,6 +6037,29 @@ func _aabb_of(node: Node) -> Array:
     },
     {
       definition: {
+        name: 'godot_diagnose_session',
+        description: 'Diagnoses current-generation Godot logs and recovery state into structured platform, project-source, persistence, lifecycle, and fatal-engine issues. Reports ownership, impact, evidence, and only remedies the agent can safely perform; read-only and never mutates the project.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            since_ms: { type: 'number', minimum: 0, description: 'Optional lookback window in milliseconds. Omit to inspect the full current editor generation.' }
+          },
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: true, untrustedContentHint: false }
+      },
+      handler: async (args = {}) => diagnoseEngineSession(
+        activeLogs,
+        EditorCommandChannel.generation,
+        {
+          sinceTime: Number.isFinite(args.since_ms) ? Date.now() - Math.max(0, args.since_ms) : 0,
+          restartRequired: editorRestartBlocked,
+          persistenceError: projectPersistenceError
+        }
+      )
+    },
+    {
+      definition: {
         name: 'godot_camera_focus',
         description: 'Transient viewport-only framing: selects a node, dispatches Godot\'s own spatial_editor/focus_selection so the editor camera eases to it, and anchors the on-page focus reticle to the node\'s projected screen position. Reports what it measured, not what it attempted: status is \'framed\' only when the viewport pose actually changed, \'dispatched_unconfirmed\' when the shortcut was delivered but the camera did not move (Godot only advances camera interpolation while rendering, so a backgrounded tab reports this), \'overlay_only\' without the editor plugin, or \'yielded\' during the 750 ms cooldown after user input. target_reached additionally requires the node to project inside the frame. Never mutates scene JSON, advances scene_revision, creates an undo entry, triggers autosave, or survives a project reload. Yields to the user for 750 ms after any pointer, wheel, or key input on the viewport.',
         input_schema: {
@@ -6514,6 +6764,7 @@ func _aabb_of(node: Node) -> Array:
         godot_get_operation_status: `Inspecting operation: ${input.operation_id || 'active/recent'}`,
         godot_get_game_telemetry: 'Reading project-owned game telemetry',
         godot_get_logs: 'Reading engine logs',
+        godot_diagnose_session: 'Diagnosing engine and project health',
         godot_camera_focus: `Framing ${input.node_path || 'node'} in the 3D viewport`,
         godot_camera_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} automatic camera follow`,
         godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,

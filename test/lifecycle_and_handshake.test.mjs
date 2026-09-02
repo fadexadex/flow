@@ -270,10 +270,11 @@ test('a page that cannot confirm an exit is reported as failed, not merely degra
 
 // ---------------------------------------------------------------- diagnostic classification
 
-const classifyEngineDiagnostics = new Function(`
+const diagnosticApi = new Function(`
   ${slice('  const PLATFORM_DIAGNOSTIC_PATTERNS', '  function currentGenerationErrors')}
-  return classifyEngineDiagnostics;
+  return { classifyEngineDiagnostics, diagnoseEngineSession };
 `)();
+const { classifyEngineDiagnostics, diagnoseEngineSession } = diagnosticApi;
 
 test('platform noise is separated from actionable project errors', () => {
   // A healthy fresh session reported `session_errors: 5`, all of which were the browser
@@ -349,6 +350,48 @@ test('a genuine stderr error is still an actionable project error', () => {
     [{ time: 1, level: 'error', generation: 1, msg: 'ERROR: SCRIPT ERROR: Parse Error: Unexpected identifier' }], 1);
   assert.equal(result.errors.length, 1);
   assert.equal(result.warnings.length, 0);
+});
+
+test('session diagnosis explains the Web DAP socket failure without blaming the project', () => {
+  const result = diagnoseEngineSession([
+    { time: 1, level: 'error', generation: 1, msg: 'ERROR: Condition "err != OK" is true. Returning: ERR_CANT_CREATE' },
+    { time: 2, level: 'error', generation: 1, msg: '   at: listen (core/io/tcp_server.cpp:56)' },
+    { time: 3, level: 'error', generation: 1, msg: '--- Failed to start Debug adapter server on port 6006: Can\'t create ---' }
+  ], 1);
+  assert.equal(result.status, 'no_project_action_required');
+  assert.equal(result.actionable_issue_count, 0);
+  assert.equal(result.issues.length, 1);
+  assert.equal(result.issues[0].code, 'GODOT_WEB_DAP_UNAVAILABLE');
+  assert.equal(result.issues[0].owner, 'godot_web_platform');
+  assert.equal(result.issues[0].severity, 'info');
+  assert.equal(result.issues[0].automatic_fix.available, false);
+  assert.match(result.issues[0].probable_cause, /raw TCP/i);
+});
+
+test('session diagnosis makes malformed resource escapes actionable and auto-repairable', () => {
+  const result = diagnoseEngineSession([
+    { time: 1, level: 'error', generation: 4, msg: 'WARNING: Godot 3.x SpatialMaterial remapped parameter not found: \\nemission_enabled' },
+    { time: 2, level: 'error', generation: 4, msg: '   at: _set (scene/resources/material.cpp:4096)' }
+  ], 4);
+  assert.equal(result.status, 'action_required');
+  assert.equal(result.issues[0].code, 'MALFORMED_TEXT_RESOURCE_ESCAPE');
+  assert.equal(result.issues[0].owner, 'project_source');
+  assert.equal(result.issues[0].automatic_fix.available, true);
+  assert.equal(result.issues[0].automatic_fix.tool, 'godot_restore_project_session');
+});
+
+test('session diagnosis prioritizes script errors, fatal traps, and recovery state', () => {
+  const result = diagnoseEngineSession([
+    { time: 1, level: 'error', generation: 2, msg: 'ERROR: SCRIPT ERROR: Parse Error: Unexpected identifier in res://runner.gd' },
+    { time: 2, level: 'error', generation: 2, msg: 'ERROR: FATAL: Index p_index = -1 is out of bounds (size() = 0).' }
+  ], 2, { restartRequired: true, persistenceError: 'IndexedDB write failed' });
+  assert.equal(result.status, 'restart_required');
+  assert.equal(result.highest_severity, 'fatal');
+  assert.ok(result.issues.some(issue => issue.code === 'ENGINE_FATAL'));
+  assert.ok(result.issues.some(issue => issue.code === 'PROJECT_SCRIPT_OR_RESOURCE_ERROR'));
+  assert.ok(result.issues.some(issue => issue.code === 'EDITOR_RESTART_REQUIRED'));
+  assert.ok(result.issues.some(issue => issue.code === 'PROJECT_PERSISTENCE_FAILED'));
+  assert.ok(result.recommended_next_tools.includes('godot_inspect_project_files'));
 });
 
 // ---------------------------------------------------------------- boot-in-flight overrides state
