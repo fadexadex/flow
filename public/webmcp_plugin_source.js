@@ -115,6 +115,7 @@ func _on_command(args: Array) -> String:
 		"selection_state": reply = _op_selection_state()
 		"asset_import": reply = _op_asset_import(payload)
 		"asset_state": reply = _op_asset_state(payload)
+		"resource_refresh": reply = _op_resource_refresh(payload)
 		"audio_capability": reply = _op_audio_capability()
 		"viewport_input": reply = _op_viewport_input(payload)
 		"open_scenes": reply = _op_open_scenes()
@@ -689,6 +690,9 @@ func _run_asset_import_job(job_id: String, path: String, steps: Dictionary) -> v
 	if dock != null and bool(steps.get("reveal", true)):
 		dock.navigate_to_path(path)
 		job["dock_revealed"] = true
+	if bool(steps.get("resource", false)):
+		_script_jobs[job_id] = _finish_resource_job(job, path)
+		return
 	job["exists"] = FileAccess.file_exists(path)
 	job["size_bytes"] = FileAccess.get_file_as_bytes(path).size() if bool(job["exists"]) else 0
 	job["ok"] = bool(job["exists"])
@@ -1836,6 +1840,60 @@ func _process(delta: float) -> void:
 	if not busy:
 		set_process(false)
 
+## Make a non-script project file Godot has just been handed real to it, and say what Godot
+## itself then thinks of it.
+##
+## A hash proves bytes landed, not that they mean anything: a mistyped SubResource hashes fine
+## and loads with a node missing. So a scene is also loaded with CACHE_MODE_REPLACE and its
+## instantiated root reported back, which is the .tscn equivalent of "it compiled".
+func _op_resource_refresh(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	_asset_jobs.append({"job_id": job_id, "path": path, "steps": {"reveal": bool(payload.get("reveal", true)), "resource": true}})
+	set_process(true)
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _finish_resource_job(job: Dictionary, path: String) -> Dictionary:
+	job["exists"] = FileAccess.file_exists(path)
+	if not bool(job["exists"]):
+		job["ok"] = false
+		job["failure"] = "missing_after_write"
+		job["error"] = "Godot does not see %s after the write." % path
+		return job
+	job["sha256"] = FileAccess.get_sha256(path)
+	job["size_bytes"] = FileAccess.get_file_as_bytes(path).size()
+	# CACHE_MODE_REPLACE, or an already-cached PackedScene is handed back unchanged and the
+	# reload reports the previous contents as if they were the new ones.
+	var resource = ResourceLoader.load(path, "", ResourceLoader.CACHE_MODE_REPLACE)
+	job["loadable"] = resource != null
+	if resource == null:
+		job["ok"] = false
+		job["failure"] = "load_failed"
+		job["error"] = "Godot wrote %s but could not load it." % path
+		return job
+	job["resource_class"] = resource.get_class()
+	if resource is PackedScene:
+		var packed := resource as PackedScene
+		job["can_instantiate"] = packed.can_instantiate()
+		if packed.can_instantiate():
+			var probe := packed.instantiate()
+			if probe != null:
+				job["root_name"] = String(probe.name)
+				job["root_class"] = probe.get_class()
+				job["node_count"] = _count_nodes(probe)
+				probe.free()
+		else:
+			job["ok"] = false
+			job["failure"] = "scene_not_instantiable"
+			job["error"] = "%s loaded but cannot be instantiated." % path
+			return job
+	job["ok"] = true
+	return job
+
 func _op_script_refresh(payload: Dictionary) -> Dictionary:
 	var path := String(payload.get("path", ""))
 	if not path.begins_with("res://"):
@@ -1990,6 +2048,13 @@ func _op_script_job_status(payload: Dictionary) -> Dictionary:
 	reply["dock_revealed"] = job.get("dock_revealed", null)
 	reply["reveal"] = job.get("reveal", null)
 	reply["screen"] = job.get("screen", null)
+	# Resource jobs: what Godot made of the file, not what was written to it.
+	reply["loadable"] = job.get("loadable", null)
+	reply["resource_class"] = job.get("resource_class", null)
+	reply["root_name"] = job.get("root_name", null)
+	reply["root_class"] = job.get("root_class", null)
+	reply["node_count"] = job.get("node_count", null)
+	reply["size_bytes"] = job.get("size_bytes", null)
 	# A polled terminal result is one-shot. Keeping every completed source snapshot forever made
 	# long authoring sessions grow without bound.
 	_script_jobs.erase(job_id)

@@ -67,8 +67,15 @@ FLow uses two change paths. Select the path that matches the work.
 
 | Path                | Use it for                                                                                  | Effect                                                     |
 | ------------------- | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| Transaction         | Project setup, assets, multi-file changes, and changes that need a file-level undo snapshot | Writes project files and replaces the editor when required |
+| Transaction         | Project setup, assets, multi-file changes, and changes that need a file-level undo snapshot | Writes project files, and replaces the editor only when the write cannot be applied live |
 | Live editor command | Supported 3D scene edits, selection, property reads, and camera guidance                    | Uses Godot editor commands and does not replace the editor |
+
+A transaction applies live when every file in it can be. Scripts are compiled and
+hash-acknowledged; scenes, resources and shaders are scanned and then loaded, so a mistyped
+`SubResource` is caught rather than published; data files need only the scan. These still
+replace the editor: `project.godot`, anything under `addons/`, a delete, binary content, and a
+scene the editor currently has open — reloading that one would discard the live tree and the
+undo history without asking.
 
 
 Eligible GDScript-only writes use a separate hot-script path. The bridge writes the script into the running editor, waits for Godot to reload it, and restores the previous script if compilation fails.
@@ -209,9 +216,10 @@ than reporting success.
   foreground-active budget rather than wall-clock time, and say how much of the wait was spent
   hidden.
 - **One tab owns the editor.** The active editor state is not shared across tabs or browsers.
-- **Some changes require replacing the editor.** Project-file writes other than eligible
-  GDScript restart the editor process. If an exit hangs, recovery needs a page reload; the
-  project is safe in storage.
+- **A scene the editor has open cannot be written live.** Reloading it from disk would discard
+  the live editor tree and the undo history with no prompt, so that write replaces the editor
+  instead. So do `project.godot`, `addons/`, deletes and binary content. If an editor exit
+  hangs, recovery needs a page reload; the project is safe in storage.
 - **The live mutator is 3D only.** It is not a general 2D editing system.
 - **A property set live in the editor is not written into the scene file.**
   `godot_node_set_property` changes the node in the running editor and reports `persisted:

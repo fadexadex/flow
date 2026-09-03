@@ -135,3 +135,25 @@ contains a stub.
 
 Fixed along the way: a rejection from the editor was being reported as *"not connected to an
 acknowledged Godot Editor command channel"* — which was not true, and hid the actual reason.
+
+## phase-4-hot-scenes
+
+Scene and resource writes that no longer replace the editor.
+
+| File | Shows |
+| ---- | ----- |
+| `hot-scene-writes-proof.png` | a `.tscn` written live and then instanced |
+
+A new `landing_pad.tscn` written into the running editor in **999 ms** with
+`editor_restarted: false` — the same write used to cost a ~4 s editor replacement. What makes
+it publishable is Godot's own answer, not the write: `loadable: true`,
+`resource_class: PackedScene`, `can_instantiate: true`, `root_name: LandingPad`,
+`node_count: 3`. It was then instanced straight away, both children present.
+
+The two refusals matter as much:
+
+- Writing `orbital_sanctuary.tscn`, the scene the editor **has open**, did not take the hot
+  path — it replaced the editor (6.0 s), because reloading it would discard the live tree and
+  the undo history.
+- A scene with a dangling `SubResource` was **refused**: *"Godot wrote res://broken.tscn but
+  could not load it."* The hash matched; the load is what caught it.

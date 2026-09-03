@@ -3077,28 +3077,72 @@
 
   const HOT_SCRIPT_EXTENSION = '.gd';
 
-  function isHotScriptEligiblePath(rawPath) {
+  // What can be written into the running editor, by kind.
+  //
+  //  - `script`   compiled and hash-acknowledged by Godot (the original hot path)
+  //  - `resource` scanned and then LOADED by Godot, so a mistyped SubResource is caught
+  //  - `data`     nothing in the editor holds it; the scan is the whole job
+  //
+  // Everything absent from this table replaces the editor. `project.godot` is read once at
+  // boot - autoloads, main scene, input map and rendering settings all bind there - so writing
+  // it live would leave the editor describing a project that no longer exists.
+  const HOT_WRITE_KINDS = {
+    '.gd': 'script',
+    '.tscn': 'resource', '.tres': 'resource', '.gdshader': 'resource',
+    '.json': 'data', '.txt': 'data', '.md': 'data', '.cfg': 'data', '.csv': 'data'
+  };
+
+  function hotWriteKind(rawPath) {
     const path = cleanProjectPath(rawPath);
-    if (!path.toLowerCase().endsWith(HOT_SCRIPT_EXTENSION)) return false;
-    // The command channel is published by this addon. Hot-reloading it from inside a call it
-    // is currently servicing is not a live edit, it is pulling the floor up.
-    if (path.startsWith('addons/')) return false;
-    return true;
+    // The command channel is published by this addon. Hot-writing it from inside a call it is
+    // currently servicing is not a live edit, it is pulling the floor up. This guard used to
+    // ride on the .gd-only test; now that .cfg is eligible it carries plugin.cfg on its own.
+    if (path.startsWith('addons/')) return null;
+    const dot = path.lastIndexOf('.');
+    if (dot < 0) return null;
+    return HOT_WRITE_KINDS[path.slice(dot).toLowerCase()] || null;
   }
 
-  // Every operation must be an eligible `.gd` write. One ineligible entry sends the WHOLE
-  // transaction down the restart path: a transaction that half-applied live and half-applied
-  // through a restart would not be atomic, and atomicity is the only reason to call it one.
-  function hotScriptTransactionPlan(operations) {
+  function isHotScriptEligiblePath(rawPath) {
+    return hotWriteKind(rawPath) === 'script';
+  }
+
+  // A scene Godot currently has open cannot be written live. Reloading it from disk discards
+  // the live editor tree and the whole undo history with no prompt, which is a worse outcome
+  // than the few seconds an editor replacement costs. Asked of the editor, not assumed.
+  function openSceneResPaths() {
+    const reply = EditorCommandChannel.call('open_scenes');
+    if (!reply.ok) return null;
+    const open = new Set((reply.open_scenes || []).map(String));
+    if (reply.edited_scene) open.add(String(reply.edited_scene));
+    return open;
+  }
+
+  // Every operation must be hot-writable. One ineligible entry sends the WHOLE transaction
+  // down the restart path: a transaction that half-applied live and half-applied through a
+  // restart would not be atomic, and atomicity is the only reason to call it one.
+  //
+  // `openScenes` is the set of res:// scenes the editor holds open, or null when it could not
+  // be asked - in which case no scene is eligible, because guessing wrong loses a human's
+  // unsaved work.
+  function hotScriptTransactionPlan(operations, openScenes = null) {
     if (!Array.isArray(operations) || operations.length === 0) {
       return { eligible: false, reason: 'no_operations' };
     }
+    const kinds = {};
     for (const op of operations) {
       if (!op || op.kind !== 'write') return { eligible: false, reason: `operation_kind:${op?.kind || 'unknown'}` };
       if (typeof op.content !== 'string') return { eligible: false, reason: 'binary_content' };
-      if (!isHotScriptEligiblePath(op.path)) return { eligible: false, reason: `ineligible_path:${cleanProjectPath(op.path)}` };
+      const path = cleanProjectPath(op.path);
+      const kind = hotWriteKind(path);
+      if (!kind) return { eligible: false, reason: `ineligible_path:${path}` };
+      if (path.toLowerCase().endsWith('.tscn')) {
+        if (!openScenes) return { eligible: false, reason: `open_scenes_unknown:${path}` };
+        if (openScenes.has(`res://${path}`)) return { eligible: false, reason: `scene_open_in_editor:${path}` };
+      }
+      kinds[path] = kind;
     }
-    return { eligible: true, reason: null, paths: operations.map(op => cleanProjectPath(op.path)) };
+    return { eligible: true, reason: null, paths: Object.keys(kinds), kinds };
   }
 
   // Hex SHA-256 of the UTF-8 bytes, framed exactly as Godot's FileAccess.get_sha256 reports
@@ -3240,7 +3284,47 @@
     // `focus` is the one path the human should be looking at, with the line range that
     // changed. It is only ever set when the user turned following on: the plugin uses it to
     // bring the script tab forward, scroll to the change, and mark the changed lines.
-    async writeAndRefresh(files, expected, generations, { reveal = true, budgetMs = 12000, focus = null } = {}) {
+    // A scene or a resource has no compile step and no open buffer. It is scanned, then LOADED
+    // by Godot, and only published when the hash Godot read back matches what was written and
+    // the load produced something instantiable. A hash alone would pass a .tscn with a
+    // mistyped SubResource, which loads with a node quietly missing.
+    async refreshResource(resPath, expectedHash, budgetMs, reveal) {
+      const queued = EditorCommandChannel.call('resource_refresh', { path: resPath, reveal });
+      if (!queued.ok) {
+        return { ok: false, code: queued.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_REFRESH_FAILED', error: queued.error, path: resPath };
+      }
+      const settled = await this.awaitJob(queued.job_id, budgetMs);
+      if (!settled.ok) {
+        return { ok: false, code: settled.stale ? 'EDITOR_GENERATION_CHANGED' : 'SCRIPT_REFRESH_FAILED', error: settled.error, path: resPath };
+      }
+      const job = settled.job;
+      if (job.job_ok !== true) {
+        return { ok: false, code: 'SCRIPT_REFRESH_FAILED', error: job.job_error || `Godot rejected ${resPath}.`, path: resPath, job };
+      }
+      if (!exactSourceHashAcknowledged(expectedHash, job.sha256)) {
+        return {
+          ok: false, code: 'SCRIPT_REFRESH_FAILED', path: resPath, job,
+          error: `Godot acknowledged ${resPath} with source hash ${job.sha256}, not the ${expectedHash} that was written.`
+        };
+      }
+      return {
+        ok: true,
+        entry: {
+          path: resPath,
+          sha256: job.sha256 || null,
+          loadable: job.loadable === true,
+          resource_class: job.resource_class || null,
+          can_instantiate: job.can_instantiate === true,
+          root_name: job.root_name || null,
+          node_count: job.node_count ?? null,
+          buffer: null,
+          dock_revealed: job.dock_revealed === true,
+          workspace: null
+        }
+      };
+    },
+
+    async writeAndRefresh(files, expected, generations, { reveal = true, budgetMs = 12000, focus = null, kinds = {} } = {}) {
       if (typeof window === 'undefined' || typeof window.__godotEditorWriteFiles !== 'function') {
         return { ok: false, code: 'SCRIPT_REFRESH_FAILED', error: 'The live editor filesystem writer is unavailable in this page.' };
       }
@@ -3260,6 +3344,13 @@
       const refreshed = [];
       for (const path of Object.keys(files)) {
         const resPath = `res://${path}`;
+        const kind = kinds[path] || 'script';
+        if (kind !== 'script') {
+          const settled = await this.refreshResource(resPath, expected[path], budgetMs, reveal);
+          if (!settled.ok) return settled;
+          refreshed.push(settled.entry);
+          continue;
+        }
         const focused = focus && focus.path === path;
         const queued = EditorCommandChannel.call('script_refresh', {
           path: resPath,
@@ -3583,7 +3674,7 @@
   // channel. If the restore itself cannot be acknowledged the session is marked
   // `dirty_unpersisted` and requires deliberate recovery — it NEVER starts a second Engine,
   // which is the whole reason this path exists.
-  async function runHotScriptTransaction({ operations, label, operation, attach = null, reveal = true }) {
+  async function runHotScriptTransaction({ operations, label, operation, attach = null, reveal = true, kinds = {} }) {
     const authoringSurface = activeGodotViewport();
     const generations = {
       lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
@@ -3600,7 +3691,11 @@
     for (const op of operations) {
       const path = cleanProjectPath(op.path);
       const resPath = `res://${path}`;
-      const preflight = EditorCommandChannel.call('script_preflight', { path: resPath });
+      // The preflight guards an OPEN SCRIPT BUFFER against being overwritten under the human.
+      // Only scripts have one, so a scene or a data file skips it.
+      const preflight = (kinds[path] || 'script') === 'script'
+        ? EditorCommandChannel.call('script_preflight', { path: resPath })
+        : { ok: true, skipped: 'not_a_script' };
       if (!preflight.ok) {
         if (preflight.conflict === 'user_buffer') {
           const error = new Error(preflight.error || `${resPath} has unsaved edits open in the script editor.`);
@@ -3694,6 +3789,7 @@
     const refreshStartedAt = Date.now();
     await advancePhase(operation, 'updating_script');
     const applied = await HotScriptChannel.writeAndRefresh(candidates, expectedHashes, generations, {
+      kinds,
       // The dock reveal happens in both modes: it is the file-map answer to "what did the
       // agent touch", and it costs the human nothing.
       reveal,
@@ -5881,17 +5977,22 @@
 
         return runManagedMutation('godot_apply_file_transaction', `Applying file transaction: ${args.label || 'Project update'}`, async (operation) => {
           await advancePhase(operation, 'validating_request');
-          // A transaction that only writes project .gd scripts does not need a new editor.
-          // Routed here rather than at the tool boundary so godot_apply_text_patch, which
-          // delegates to this handler, gets the live channel for free. Anything else — a
-          // project.godot change, a delete, a binary asset, a mixed transaction — falls
-          // through to the editor replacement below, which for those is the honest path.
-          const hotPlan = hotScriptTransactionPlan(args.operations);
+          // A transaction that only writes hot-writable project files does not need a new
+          // editor. Routed here rather than at the tool boundary so godot_apply_text_patch,
+          // which delegates to this handler, gets the live channel for free. Anything else — a
+          // project.godot change, a delete, a binary asset, a scene the editor has open, a
+          // mixed transaction — falls through to the editor replacement below, which for those
+          // is the honest path.
+          const hotPlan = hotScriptTransactionPlan(
+            args.operations,
+            EditorCommandChannel.available() ? openSceneResPaths() : null
+          );
           if (hotPlan.eligible && EditorCommandChannel.available()) {
             const outcome = await runHotScriptTransaction({
               operations: args.operations,
               label: args.label || 'Project file transaction',
-              operation
+              operation,
+              kinds: hotPlan.kinds
             });
             if (outcome.hot) {
               const hotResult = { ...outcome, label: args.label || 'Project file transaction' };

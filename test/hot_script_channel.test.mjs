@@ -265,7 +265,7 @@ test('the budget resumes on foreground frames and expires only on active time', 
 // ---------------------------------------------------------------------------
 
 test('the file-transaction handler routes eligible .gd writes through the hot channel', () => {
-  assert.match(bridgeSource, /const hotPlan = hotScriptTransactionPlan\(args\.operations\);/);
+  assert.match(bridgeSource, /const hotPlan = hotScriptTransactionPlan\(\s*args\.operations,/);
   assert.match(bridgeSource, /if \(hotPlan\.eligible && EditorCommandChannel\.available\(\)\)/);
 });
 
@@ -601,4 +601,57 @@ test('an editor with no FileSystem dock does not report a reveal', async () => {
   const applied = await harness.HotScriptChannel.writeAndRefresh(
     { 'player.gd': 'a' }, { 'player.gd': 'x' }, { lifecycle: 1, command: 1 }, {});
   assert.equal(applied.refreshed[0].dock_revealed, false);
+});
+
+// ---------------------------------------------------------------------------
+// Hot writes beyond .gd: what may be written into the running editor, and what may not
+// ---------------------------------------------------------------------------
+
+const openScenes = paths => new Set(paths);
+
+test('a scene the editor does not have open is hot; the one it is editing is not', () => {
+  const write = path => ({ kind: 'write', path, content: '[gd_scene format=3]\n' });
+  const open = openScenes(['res://main.tscn']);
+  assert.equal(hotScriptTransactionPlan([write('enemy.tscn')], open).eligible, true);
+  const editing = hotScriptTransactionPlan([write('main.tscn')], open);
+  assert.equal(editing.eligible, false);
+  assert.equal(editing.reason, 'scene_open_in_editor:main.tscn');
+});
+
+test('a scene write is refused when the open set could not be read', () => {
+  // Guessing wrong here silently discards a human's unsaved tree and undo history.
+  const plan = hotScriptTransactionPlan([{ kind: 'write', path: 'enemy.tscn', content: 'x' }], null);
+  assert.equal(plan.eligible, false);
+  assert.equal(plan.reason, 'open_scenes_unknown:enemy.tscn');
+});
+
+test('project.godot and the addon are never hot, whatever the extension table says', () => {
+  const open = openScenes([]);
+  assert.equal(hotScriptTransactionPlan([{ kind: 'write', path: 'project.godot', content: 'x' }], open).reason, 'ineligible_path:project.godot');
+  // plugin.cfg used to be excluded only by the .gd test; now .cfg is eligible, the addons/
+  // guard is what carries it.
+  assert.equal(hotScriptTransactionPlan([{ kind: 'write', path: 'addons/webmcp/plugin.cfg', content: 'x' }], open).reason, 'ineligible_path:addons/webmcp/plugin.cfg');
+  assert.equal(hotScriptTransactionPlan([{ kind: 'write', path: 'addons/webmcp/plugin.gd', content: 'x' }], open).reason, 'ineligible_path:addons/webmcp/plugin.gd');
+});
+
+test('each hot path is labelled with the acknowledgement it needs', () => {
+  const open = openScenes([]);
+  const plan = hotScriptTransactionPlan([
+    { kind: 'write', path: 'player.gd', content: 'x' },
+    { kind: 'write', path: 'enemy.tscn', content: 'x' },
+    { kind: 'write', path: 'levels.json', content: '{}' }
+  ], open);
+  assert.equal(plan.eligible, true);
+  assert.deepEqual(plan.kinds, { 'player.gd': 'script', 'enemy.tscn': 'resource', 'levels.json': 'data' });
+});
+
+test('a resource is published only when Godot loaded it, not merely hashed it', () => {
+  const at = bridgeSource.indexOf('    async refreshResource(');
+  assert.ok(at > 0);
+  const body = bridgeSource.slice(at, at + 2200);
+  assert.match(body, /exactSourceHashAcknowledged\(expectedHash, job\.sha256\)/);
+  assert.match(body, /loadable: job\.loadable === true/);
+  assert.match(body, /can_instantiate: job\.can_instantiate === true/);
+  // A hash alone passes a .tscn with a mistyped SubResource.
+  assert.match(bridgeSource.slice(at - 400, at), /mistyped SubResource/);
 });
