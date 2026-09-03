@@ -789,14 +789,16 @@ test('an import waits for Godot to confirm, rather than reading its own request 
   assert.doesNotMatch(body, /loadable: imported\.loadable/);
 });
 
-test('an imported asset states its real lifetime', () => {
+test('an imported asset enters the project model, not only Godot\'s filesystem', () => {
   const start = bridgeText.indexOf("name: 'godot_import_asset'");
   const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_user_focus'", start));
-  assert.match(body, /persistence: 'project_filesystem'/);
+  assert.match(body, /persistence: 'project_file'/);
   assert.match(body, /survives_editor_restart: true/);
-  // The gap that is easy to miss: it is a real file, but not in the exported model.
-  assert.match(body, /included_in_export_zip: false/);
-  assert.doesNotMatch(body, /activeFilesDict\[path\]/);
+  assert.match(body, /included_in_export_zip: true/);
+  // Leaving it out of activeFilesDict made every scene referencing it fail the reference
+  // check, which blocked transactions and project switching outright.
+  assert.match(body, /activeFilesDict\[path\] = bytes;/);
+  assert.match(body, /await persistActiveProjectState\(\)/);
 });
 
 test('the editor boot wait spends foreground-active time, not wall clock', () => {
@@ -808,4 +810,106 @@ test('the editor boot wait spends foreground-active time, not wall clock', () =>
   // A hidden tab is paused, not dead: the failure has to say which it was.
   assert.match(window, /EDITOR_BOOT_TIMEOUT/);
   assert.match(window, /foreground-active time/);
+});
+
+test('a still-running operation never reports success:false', () => {
+  const start = bridgeText.indexOf("      accepted: true,");
+  const body = bridgeText.slice(start, start + 900);
+  assert.match(body, /status: 'pending'/);
+  // The bug this replaced: an agent checking `success` read a healthy in-flight project
+  // creation as a failure, then raced the editor replacement it was still performing.
+  assert.doesNotMatch(body, /success: false/);
+  assert.match(body, /poll_with: 'godot_get_operation_status'/);
+  assert.match(body, /next_step:/, 'the caller must be told to poll before doing anything else');
+});
+
+test('an unknown project template is refused, not quietly substituted', () => {
+  const start = bridgeText.indexOf("name: 'godot_create_project'");
+  const body = bridgeText.slice(start, start + 4000);
+  assert.match(body, /!PROJECT_TEMPLATES\.includes\(args\.template\)/);
+  assert.match(body, /Unknown template/);
+  // Schema and runtime check read the same list, so they cannot drift.
+  assert.match(bridgeText, /const PROJECT_TEMPLATES = \['orbital_garden', 'neon_skyrail_3d', 'custom'\];/);
+  assert.match(body, /enum: PROJECT_TEMPLATES/);
+});
+
+test('a name clash is checked inside the edited scene, not across every scene file', () => {
+  const start = bridgeText.indexOf('function findNodeInActiveScene');
+  assert.ok(start > 0);
+  const body = bridgeText.slice(start, start + 700);
+  assert.match(body, /node\.path === resPath/, 'the search must be scoped to the active scene file');
+  // The bug: a reusable scene whose own root shares the node name refused placement.
+  const spawn = bridgeText.slice(bridgeText.indexOf("name: 'godot_node_spawn'"), bridgeText.indexOf("name: 'godot_node_transform'"));
+  assert.match(spawn, /findNodeInActiveScene\(activeFilesDict, nodeName\)/);
+  assert.doesNotMatch(spawn, /findSceneNode\(activeFilesDict, nodeName\)\)/);
+});
+
+test('camera framing drives a real canvas key event, not a synthesised plugin event', () => {
+  const start = bridgeText.indexOf('function dispatchEditorShortcutKey');
+  assert.ok(start > 0);
+  const body = bridgeText.slice(start, start + 1200);
+  assert.match(body, /getElementById\('editor-canvas'\)/);
+  assert.match(body, /canvas\.focus\(\)/, 'Godot reads keys from the focused element');
+  assert.match(body, /new KeyboardEvent/);
+  // Null, not a fake success, when there is no canvas: the caller falls back to the plugin.
+  assert.match(body, /return null;/);
+  assert.match(bridgeText, /dispatchEditorShortcutKey\('f'\) \|\| EditorCommandChannel\.call\('focus_dispatch'\)/);
+});
+
+test('the guidance channel does not yield to its own dispatched key', () => {
+  const install = bridgeText.slice(bridgeText.indexOf('    install() {'), bridgeText.indexOf('    yieldedToUser('));
+  assert.match(install, /event\.__webmcpAgentDispatched/);
+  const dispatch = bridgeText.slice(bridgeText.indexOf('function dispatchEditorShortcutKey'), bridgeText.indexOf('function dispatchEditorShortcutKey') + 1400);
+  assert.match(dispatch, /event\.__webmcpAgentDispatched = true;/);
+});
+
+test('framing primes the viewport before selecting, because the click changes the selection', () => {
+  const prime = bridgeText.slice(bridgeText.indexOf('function primeEditorViewportFocus'), bridgeText.indexOf('function dispatchEditorShortcutKey'));
+  assert.match(prime, /pointerdown/);
+  assert.match(prime, /event\.__webmcpAgentDispatched = true;/);
+  const at = bridgeText.indexOf('const primed = primeEditorViewportFocus();');
+  const frame = bridgeText.slice(at, at + 800);
+  // Prime, then let Godot process the click, then select. Selecting first would be undone by
+  // the priming click, and pressing before the click lands sends the key to whichever dock
+  // still holds focus.
+  assert.ok(frame.indexOf('primeEditorViewportFocus()') < frame.indexOf("EditorCommandChannel.call('select'"));
+  assert.match(frame, /if \(primed\) \{ await nextFrame\(\);/);
+});
+
+test('the Web build\'s missing FileSystem dock shortcuts are platform noise', () => {
+  const classified = classifyEngineDiagnostics([
+    { time: 10, generation: 1, level: 'error', msg: 'ERROR: Unknown Shortcut: filesystem_dock/open_in_terminal.' },
+    { time: 11, generation: 1, level: 'error', msg: 'ERROR: res://player.gd:4 - Parse Error: something real' }
+  ], 1, 0);
+  assert.equal(classified.errors.length, 1, 'only the project error counts');
+  assert.match(classified.errors[0], /Parse Error/);
+  assert.equal(classified.platform_diagnostics.length, 1);
+});
+
+test('framing retries once before reporting the camera unmoved', () => {
+  const at = bridgeText.indexOf('for (let attempt = 0; attempt < 2');
+  assert.ok(at > 0, 'the framing watch should make a second attempt');
+  const body = bridgeText.slice(at, at + 900);
+  assert.match(body, /primeEditorViewportFocus\(\)/);
+  assert.match(body, /dispatchEditorShortcutKey\('f'\)/);
+  // A restart or a human taking the viewport ends the attempts; they are not retried over.
+  assert.match(body, /!moved && !stale && !yielded/);
+});
+
+test('an unfocused document is named as the reason framing did nothing', () => {
+  const at = bridgeText.indexOf("status: 'dispatched_unconfirmed'");
+  const body = bridgeText.slice(Math.max(0, at - 700), at + 1400);
+  assert.match(body, /document\.hasFocus\?\.\(\) !== false/);
+  assert.match(body, /'document_not_focused'/);
+  // The distinction matters: one is a throttled tab, the other is a browser rule the user
+  // can fix in one click.
+  assert.match(body, /Click the editor once to give the page focus/);
+});
+
+test('an imported asset is not claimed as generated, or licensed, by this page', () => {
+  const at = bridgeText.indexOf('const imported = DiagnosticState.importedAssets.has(filePath);');
+  assert.ok(at > 0);
+  const body = bridgeText.slice(at, at + 500);
+  assert.match(body, /'imported_via_godot_import_asset'/);
+  assert.match(body, /license: 'unspecified'/);
 });

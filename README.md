@@ -45,7 +45,12 @@ FLow can:
 - Apply revision-checked file transactions and text patches.
 - Update eligible GDScript files without replacing the editor.
 - Add, transform, recolor, and delete supported 3D nodes through Godot editor commands.
+- Import images, fonts, and glTF models into the running editor, and place an imported model
+  in the scene as an instanced node.
+- Synthesize a procedural sound suite and load it in the running game.
 - Run and stop the project, send input, capture the viewport, and record playtests.
+- Read what the person has selected in the editor, so a request like "make this taller" can be
+  resolved against the real selection.
 - Export the active project as a ZIP file.
 - Save project state and recordings in browser IndexedDB.
 - Report session state, tool operations, logs, diagnostics, and game telemetry.
@@ -66,6 +71,22 @@ FLow uses two change paths. Select the path that matches the work.
 Eligible GDScript-only writes use a separate hot-script path. The bridge writes the script into the running editor, waits for Godot to reload it, and restores the previous script if compilation fails.
 
 Each mutating request can include an idempotency key. A retry with the same key returns the first result instead of applying the change again.
+
+## Assets
+
+Binary assets enter a project through `godot_import_asset`. The bytes are written into the
+running editor, Godot scans and imports them, and the tool reports what Godot confirmed rather
+than assuming the write succeeded. An imported asset is a real project file: it survives an
+editor replacement and it is included in the exported ZIP.
+
+Place an imported model in a scene with `godot_node_instance`. It accepts a `.glb`, a `.gltf`,
+or a `.tscn` already in the project, and the placed node moves, rotates, and scales like any
+other node. `godot_node_spawn` builds Godot's own primitive meshes and cannot place a model.
+
+Audio takes a different path. `godot_synthesize_audio_suite` writes the samples as `.wavdata`
+files next to an `sfx_library.gd` that builds an `AudioStreamWAV` from the bytes at run time.
+This needs no import step and behaves the same way in the exported game. See the audio entry
+under Godot Web editor limitations for why.
 
 ## State and persistence
 
@@ -111,22 +132,50 @@ The server provides:
 
 The server sets Cross-Origin Opener Policy and Cross-Origin Embedder Policy headers. The Godot Web build needs these headers for SharedArrayBuffer and threading support.
 
-## Current limitations
+## Godot Web editor limitations
 
-This project uses an experimental Godot Web editor, which means that there are a number of limitations present in the current project. 
+FLow is built on the experimental Godot Web editor. These are constraints of that build, not
+design choices. Each one is measured, and the tool that meets it reports the constraint rather
+than reporting success.
 
-- The active editor state belongs to one open browser tab. It is not shared across tabs or browsers.
-- A hidden or background browser tab can throttle the Godot main loop. Keep the editor visible while it starts, stops, runs a playtest, or replaces the editor.
-- Some changes require an editor replacement. If an editor exit hangs, recovery currently requires a page reload.
-- The live mutator supports 3D scene work only. It is not a general 2D editing system.
-- Images, fonts and meshes import into the running editor through `godot_import_asset`. They
-  become real project files and survive restarts, but they live in Godot's filesystem rather
-  than the exported project model, so they are not included in `godot_export_zip`.
-- Audio cannot be imported. Godot's WAV importer aborts this WebAssembly build of the editor,
-  with no recovery. `godot_synthesize_audio_suite` instead writes the samples as `.wavdata`
-  next to an `sfx_library.gd` that builds an `AudioStreamWAV` from the bytes at runtime, which
-  plays identically in the exported game. `.wav`, `.ogg` and `.mp3` are refused with an error
-  that names this route.
-- `godot_connect_signal_live`, `godot_resize_gizmo_live`, `godot_live_code_diff`, `godot_hot_reload_property`, and `godot_switch_mode` are deliberate stubs. They report that they are unsupported. They do not claim success.
-- Netlify, Vercel, and the Node server use manually synchronized configuration and tool catalog data.
+- **Audio cannot be imported.** Godot's WAV importer aborts this WebAssembly build of the
+  editor. The runtime traps in `ProgressDialog` on an empty task stack, the viewport goes
+  black, and the editor cannot be recovered in that page. It happens wherever the importer
+  runs: during a boot scan, from a deferred frame, or on a live rescan. `.wav`, `.ogg`, and
+  `.mp3` are refused with an error naming the route that works. Images, fonts, and glTF models
+  import normally, and a project holding them reopens healthy.
+- **Editor camera framing needs a focused page.** Godot's "frame selection" is a keyboard
+  shortcut, and a browser delivers no keyboard input to a document that does not have focus. In
+  an unfocused tab `godot_camera_focus` selects the node, places the overlay, and reports
+  `document_not_focused` instead of claiming a camera move.
+- **There is no scripted route to the editor camera.** Godot exposes the 3D viewport but no
+  method to move its camera, so framing is driven through the editor's own shortcut and the
+  resulting pose is measured afterwards.
+- **A hidden or throttled tab pauses the engine.** Godot's main loop runs on
+  `requestAnimationFrame`, so a backgrounded tab stops making progress. Long operations spend a
+  foreground-active budget rather than wall-clock time, and say how much of the wait was spent
+  hidden.
+- **One tab owns the editor.** The active editor state is not shared across tabs or browsers.
+- **Some changes require replacing the editor.** Project-file writes other than eligible
+  GDScript restart the editor process. If an exit hangs, recovery needs a page reload; the
+  project is safe in storage.
+- **The live mutator is 3D only.** It is not a general 2D editing system.
+- **`godot_connect_signal_live`, `godot_resize_gizmo_live`, `godot_live_code_diff`,
+  `godot_hot_reload_property`, and `godot_switch_mode` are deliberate stubs.** They report that
+  they are unsupported. They do not claim success.
+- **Netlify, Vercel, and the Node server use manually synchronized configuration** and tool
+  catalog data. `npm test` fails if the catalogs drift.
 
+## Where this is going
+
+Named here so the gaps above read as a roadmap rather than a list of dead ends.
+
+- A collision and physics vocabulary in the live mutator, so a floor, a wall, or a trigger
+  volume can be added without writing scene text by hand.
+- Asset import driven from a URL or a drag-and-drop, not only from base64 supplied by an agent.
+- A 2D live mutator alongside the 3D one.
+- Editor camera control that does not depend on a keyboard shortcut, if a future Godot Web
+  build exposes the viewport camera.
+- Audio through Godot's own importer, once that build no longer aborts on it.
+- Generated configuration for the three deployment targets from one source, replacing the
+  manual synchronization.

@@ -904,13 +904,18 @@
     ]);
     if (operation.status === 'failed') throw new Error(operation.error);
     if (operation.status === 'succeeded') return operation.result;
+    // No `success` field at all while the work is still running. Reporting `success: false`
+    // on a healthy in-flight operation reads as a failure to anything that checks that field,
+    // and the next call then races the editor replacement this one is still performing.
     return {
       accepted: true,
-      success: false,
       status: 'pending',
       operation_id: operation.id,
       label,
-      poll_with: 'godot_get_operation_status'
+      poll_with: 'godot_get_operation_status',
+      // Said in the payload because a caller that misses it writes into an Engine that is
+      // being torn down and gets a confusing refusal instead of a queue.
+      next_step: `This operation is still running and the editor is not ready. Poll godot_get_operation_status with operation_id "${operation.id}" until status is "succeeded" before calling any other tool.`
     };
   }
 
@@ -1783,7 +1788,11 @@
     // Godot's Web export may attempt to sync its desktop-style virtual filesystem after the
     // project directory has been replaced. The bridge persists the authoritative project in
     // its own IndexedDB transaction, so this does not describe a project-source failure.
-    /Failed to save IDB file system/i
+    /Failed to save IDB file system/i,
+    // The Web editor build ships the FileSystem dock without the desktop-only shortcuts it
+    // still looks up ("Show in File Manager", "Open in Terminal"). Every keypress the dock
+    // sees logs one of these. It describes the build, not the project.
+    /Unknown Shortcut: filesystem_dock\//i
   ];
   // Lines this page writes about its own runtime handling. They are worth keeping in the log -
   // they explain what the bridge did - but they are not output from the authored project, and
@@ -3376,6 +3385,28 @@
   // authoritative source in step with it WITHOUT a restart. The two are then consistent: the
   // editor holds the change in its scene tree, the bridge holds it in the text it stages into
   // the playtest engine and reboots from. Pure, so the .tscn surgery is testable.
+  // One place that knows how a .tscn declares an external resource: reuse an existing id for
+  // the same path, mint a fresh one otherwise, and keep load_steps in step. A short load_steps
+  // makes Godot stop reading resources partway through the file, which reads as a scene that
+  // silently lost a node.
+  function ensureExtResource(sceneText, type, resPath, hint = 'res') {
+    const text = String(sceneText);
+    const escaped = resPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const existing = new RegExp(`\\[ext_resource type="${type}"[^\\]]*path="${escaped}"[^\\]]*id="([^"]+)"\\]`).exec(text);
+    if (existing) return { ok: true, text, resource_id: existing[1], added: false };
+    const used = new Set([...text.matchAll(/\[ext_resource[^\]]*id="([^"]+)"\]/g)].map(match => match[1]));
+    const slug = String(hint).toLowerCase().replace(/[^a-z0-9_]/g, '') || 'res';
+    let candidate = `${used.size + 1}_${slug}`;
+    let suffix = 1;
+    while (used.has(candidate)) candidate = `${used.size + 1 + suffix++}_${slug}`;
+    const header = /^\[gd_scene[^\]]*\]\n/m.exec(text);
+    if (!header) return { ok: false, error: 'The scene text has no [gd_scene] header.' };
+    const insertAt = header.index + header[0].length;
+    let nextText = `${text.slice(0, insertAt)}[ext_resource type="${type}" path="${resPath}" id="${candidate}"]\n${text.slice(insertAt)}`;
+    nextText = nextText.replace(/(\[gd_scene[^\]]*?load_steps=)(\d+)/, (_, prefix, count) => `${prefix}${Number(count) + 1}`);
+    return { ok: true, text: nextText, resource_id: candidate, added: true };
+  }
+
   function attachScriptInSceneText(sceneText, nodePath, scriptResPath) {
     const text = String(sceneText);
     const segments = String(nodePath).split('/').filter(Boolean);
@@ -3386,28 +3417,11 @@
     const name = targetsRoot ? rootHeader[1] : segments[segments.length - 1];
     const parent = targetsRoot ? null : (segments.length === 1 ? '.' : segments.slice(0, -1).join('/'));
 
-    let resourceId = null;
-    let nextText = text;
-    let addedResource = false;
-    const existing = new RegExp(`\\[ext_resource type="Script"[^\\]]*path="${scriptResPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"[^\\]]*id="([^"]+)"\\]`).exec(text);
-    if (existing) {
-      resourceId = existing[1];
-    } else {
-      const used = new Set([...text.matchAll(/\[ext_resource[^\]]*id="([^"]+)"\]/g)].map(match => match[1]));
-      let candidate = `${used.size + 1}_${name.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'script'}`;
-      let suffix = 1;
-      while (used.has(candidate)) candidate = `${used.size + 1 + suffix++}_${name.toLowerCase().replace(/[^a-z0-9_]/g, '') || 'script'}`;
-      resourceId = candidate;
-      const line = `[ext_resource type="Script" path="${scriptResPath}" id="${resourceId}"]`;
-      const header = /^\[gd_scene[^\]]*\]\n/m.exec(nextText);
-      if (!header) return { ok: false, error: 'The scene text has no [gd_scene] header.' };
-      const insertAt = header.index + header[0].length;
-      nextText = `${nextText.slice(0, insertAt)}${line}\n${nextText.slice(insertAt)}`;
-      // load_steps counts sub_resources and ext_resources plus one. Leaving it short makes
-      // Godot stop reading resources partway through the file.
-      nextText = nextText.replace(/(\[gd_scene[^\]]*?load_steps=)(\d+)/, (_, prefix, count) => `${prefix}${Number(count) + 1}`);
-      addedResource = true;
-    }
+    const declared = ensureExtResource(text, 'Script', scriptResPath, name || 'script');
+    if (!declared.ok) return declared;
+    const resourceId = declared.resource_id;
+    const addedResource = declared.added;
+    let nextText = declared.text;
 
     const nodeHeader = targetsRoot
       ? /^\[node name="[^"]+"(?![^\]]*\bparent=)[^\]]*\]$/m
@@ -3424,6 +3438,69 @@
       : `${body.replace(/\n+$/, '')}\n${assignment}\n`;
     nextText = nextText.slice(0, bodyStart) + nextBody + nextText.slice(bodyEnd);
     return { ok: true, text: nextText, resource_id: resourceId, added_ext_resource: addedResource };
+  }
+
+  // Godot's editor shortcuts only fire for keys that arrive through its own DOM listener on
+  // the canvas. A plugin-side InputEventKey emitted as `gui_input` was accepted and did
+  // nothing: the shortcut match inside Node3DEditorViewport never ran, so framing reported
+  // `dispatched_unconfirmed` on every call. A real KeyboardEvent on the focused canvas fires
+  // it, and the camera moves. Returns null when the canvas is not there to be driven, so the
+  // caller can fall back to the plugin instead of assuming this worked.
+  // Godot's 3D viewport only answers a keyboard shortcut once it holds the engine's own GUI
+  // focus, and only a pointer event gives it that - DOM focus() and the plugin's grab_focus()
+  // are both insufficient, measured. One synthetic click primes it. The click lands on the
+  // viewport and can change the selection, so callers select AFTER priming, never before.
+  function primeEditorViewportFocus() {
+    if (typeof document === 'undefined') return false;
+    const canvas = document.getElementById('editor-canvas');
+    if (!canvas || typeof canvas.getBoundingClientRect !== 'function') return false;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return false;
+    const clientX = rect.left + rect.width * 0.5;
+    const clientY = rect.top + rect.height * 0.45;
+    try {
+      // DOM focus first. Without it the very first framing of a page session was dropped -
+      // the click reached a canvas that was not the focused element and Godot never took
+      // viewport focus, so the shortcut afterwards went nowhere.
+      canvas.focus();
+      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
+        const Ctor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+        const event = new Ctor(type, {
+          clientX, clientY, button: 0, buttons: type.includes('down') ? 1 : 0,
+          bubbles: true, cancelable: true, composed: true,
+          pointerId: 1, pointerType: 'mouse', isPrimary: true
+        });
+        event.__webmcpAgentDispatched = true;
+        canvas.dispatchEvent(event);
+      }
+    } catch (_) {
+      return false;
+    }
+    return true;
+  }
+
+  function dispatchEditorShortcutKey(key, { code = null, keyCode = null } = {}) {
+    if (typeof document === 'undefined') return null;
+    const canvas = document.getElementById('editor-canvas');
+    if (!canvas) return null;
+    const resolvedCode = code || `Key${String(key).toUpperCase()}`;
+    const resolvedKeyCode = keyCode ?? String(key).toUpperCase().charCodeAt(0);
+    try {
+      // Godot reads key events from whichever element holds DOM focus.
+      canvas.focus();
+      for (const type of ['keydown', 'keyup']) {
+        const event = new KeyboardEvent(type, {
+          key, code: resolvedCode, keyCode: resolvedKeyCode, which: resolvedKeyCode,
+          bubbles: true, cancelable: true, composed: true
+        });
+        // Marked so the yield-to-human cooldown can tell this apart from a real keypress.
+        event.__webmcpAgentDispatched = true;
+        canvas.dispatchEvent(event);
+      }
+    } catch (_) {
+      return null;
+    }
+    return { ok: true, mechanism: 'editor_canvas.keyboard_event', key };
   }
 
   const WORKSPACE_FOLLOW_PREFERENCE_KEY = 'webmcp.workspace-follow';
@@ -4097,6 +4174,19 @@
     return byName.length === 1 ? byName[0] : null;
   }
 
+  // A name clash only matters inside the scene being edited. Searching every .tscn refused to
+  // place ArenaFloor in the main scene because arena_floor.tscn's own root node is called
+  // ArenaFloor - which is the normal shape of a reusable scene, not a conflict.
+  function findNodeInActiveScene(filesDict, nodeName) {
+    if (!nodeName) return null;
+    const scenePath = activeMainScene ? cleanProjectPath(activeMainScene) : null;
+    if (!scenePath) return null;
+    const leaf = String(nodeName).replace(/^\.\//, '').replace(/^.*\//, '');
+    const resPath = `res://${scenePath}`;
+    return sceneGraphFromFiles(filesDict).nodes
+      .find(node => node.path === resPath && node.name === leaf) || null;
+  }
+
   function findSceneNodeCandidates(filesDict, nodeName) {
     const leaf = String(nodeName || '').replace(/^.*\//, '');
     return sceneGraphFromFiles(filesDict).nodes.filter(node => node.name === leaf).map(node => node.node_path);
@@ -4590,6 +4680,9 @@
     };
   }
 
+  // One list, so the schema enum and the runtime check cannot drift apart.
+  const PROJECT_TEMPLATES = ['orbital_garden', 'neon_skyrail_3d', 'custom'];
+
   const MANIFEST_TOOLS = [
     {
       definition: {
@@ -4825,7 +4918,7 @@
     {
       definition: {
         name: 'godot_import_asset',
-        description: "Imports a binary asset - image, font, mesh - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file and survives restarts, but it lives in Godot's filesystem rather than the bridge's project model, so it is not in godot_export_zip. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+        description: "Imports a binary asset - image, font, or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
         input_schema: {
           type: 'object',
           properties: {
@@ -4887,12 +4980,18 @@
         }
         const imported = job.job;
         const settled = await awaitAssetImport(`res://${path}`, args.reimport !== false ? 8000 : 0);
-        // The asset lives in the editor's filesystem, not in the bridge's text project model.
-        // Recording it there would put binary into undo snapshots and every export, and would
-        // put it back into the next boot - which is the thing that crashes.
+        // The asset belongs in the project model, not only in Godot's filesystem. Keeping it
+        // out was a hedge against a boot crash that turned out to be audio-specific: a project
+        // holding an imported .glb or .png boots healthy. Keeping it out also broke real work -
+        // the scene referencing it failed every reference check, which blocked transactions and
+        // project switching outright, and the asset was silently missing from every export.
+        activeFilesDict[path] = bytes;
+        DiagnosticState.sceneRevision += 1;
+        await persistActiveProjectState();
         DiagnosticState.importedAssets.set(path, {
           path, bytes: bytes.byteLength, loadable: settled.loadable === true, at: Date.now()
         });
+        BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
         DiagnosticHUD.render();
         return {
           success: true,
@@ -4903,13 +5002,13 @@
           import_metadata_written: settled.has_import === true,
           revealed_in_dock: imported.dock_revealed === true,
           editor_restarted: false,
-          // Said plainly, because the gap is easy to miss. The asset is a real file in the
-          // project and survives restarts - a project holding an imported image reopens
-          // healthy - but it lives in Godot's filesystem, not in the bridge's text project
-          // model, so it is absent from godot_export_zip and from undo snapshots.
-          persistence: 'project_filesystem',
+          scene_revision: DiagnosticState.sceneRevision,
+          // A real project file in both places that matter: Godot's filesystem, so it is
+          // loadable now without a restart, and the project model, so it survives restarts,
+          // rides into the export, and satisfies the reference check for any scene using it.
+          persistence: 'project_file',
           survives_editor_restart: true,
-          included_in_export_zip: false,
+          included_in_export_zip: true,
           project: DiagnosticState.activeProject
         };
       }
@@ -5331,10 +5430,16 @@
         const fileProvenance = {};
         for (const filePath of Object.keys(activeFilesDict)) {
           const supplied = suppliedProvenance[filePath] || suppliedProvenance[`res://${filePath}`];
-          fileProvenance[filePath] = supplied || {
-            source: generatedProject ? 'generated_by_godot_webmcp' : 'user_supplied_via_webmcp',
-            license: generatedProject ? 'MIT' : 'unspecified'
-          };
+          // An asset the caller imported was not generated here, whatever the rest of the
+          // project is, and this page cannot know its licence. Saying MIT over someone else's
+          // model is the kind of claim a provenance manifest exists to prevent.
+          const imported = DiagnosticState.importedAssets.has(filePath);
+          fileProvenance[filePath] = supplied || (imported
+            ? { source: 'imported_via_godot_import_asset', license: 'unspecified' }
+            : {
+              source: generatedProject ? 'generated_by_godot_webmcp' : 'user_supplied_via_webmcp',
+              license: generatedProject ? 'MIT' : 'unspecified'
+            });
         }
         for (const rawPath of Object.keys(suppliedProvenance)) {
           const filePath = cleanProjectPath(rawPath);
@@ -5552,12 +5657,12 @@
     {
       definition: {
         name: 'godot_create_project',
-        description: 'Creates custom 2D/3D visual scenes, GDScripts, shaders, or authors complete project templates (orbital_garden, neon_skyrail_3d, custom) with arbitrary file injection',
+        description: "Creates a Godot project from a built-in template or an explicit file set, and REPLACES the running editor to open it. Because that takes several seconds it may return {status: 'pending', operation_id} instead of a result - poll godot_get_operation_status until it reports succeeded before calling any other tool, or the next call will be refused while the editor is being torn down. Audio is never staged into a project: add it afterwards with godot_synthesize_audio_suite, and other assets with godot_import_asset.",
         input_schema: {
           type: 'object',
           properties: {
             project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
-            template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden' },
+            template: { type: 'string', enum: PROJECT_TEMPLATES, default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; custom requires files.' },
             files: { type: 'object', description: 'Custom dictionary of file paths to source strings/buffers to write into res://' },
             idempotency_key: { type: 'string' }
           },
@@ -5572,6 +5677,11 @@
 
         if (args.template === 'custom' && (!args.files || Object.keys(args.files).length === 0)) {
           throw new Error('The custom template requires a non-empty files dictionary. No fallback template was created.');
+        }
+        // An unrecognised template used to fall through to orbital_garden, so asking for '3d'
+        // quietly built a different project than the one requested and reported success.
+        if (args.template !== undefined && !PROJECT_TEMPLATES.includes(args.template)) {
+          throw new Error(`Unknown template '${args.template}'. Valid templates are: ${PROJECT_TEMPLATES.join(', ')}. Use 'custom' with a files dictionary to supply your own.`);
         }
 
         return runManagedMutation('godot_create_project', `Creating project: ${projName}`, async (operation) => {
@@ -6427,7 +6537,7 @@
       definition: {
         name: 'godot_send_input',
         description: 'Dispatches a keyboard event to the game canvas and reports any subsequent project-owned telemetry without claiming unverified gameplay acknowledgement',
-        input_schema: { type: 'object', properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } }, additionalProperties: false },
+        input_schema: { type: 'object', properties: { key: { type: 'string', description: "DOM KeyboardEvent name, used as both `key` and `code`: ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Space, Enter, KeyW, KeyA, KeyS, KeyD. Godot's default ui_* actions are the arrow keys and Space." }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } }, additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
@@ -6498,7 +6608,7 @@
               type: 'array', minItems: 1, maxItems: 32,
               items: {
                 type: 'object',
-                properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
+                properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string', description: "DOM KeyboardEvent name, used as both `key` and `code`: ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Space, Enter, KeyW, KeyA, KeyS, KeyD. Godot's default ui_* actions are the arrow keys and Space." }, pressed: { type: 'boolean' } },
                 required: ['at_ms', 'key', 'pressed'], additionalProperties: false
               }
             },
@@ -7065,7 +7175,7 @@
       },
       handler: async (args = {}) => {
         const nodeName = cleanProjectName(args.name);
-        if (findSceneNode(activeFilesDict, nodeName)) {
+        if (findNodeInActiveScene(activeFilesDict, nodeName)) {
           throw new Error(`A node named '${nodeName}' already exists in the active scene. Godot renames name clashes on load, so pick a unique name or delete the existing node first.`);
         }
         const parentPath = args.parent_path || '.';
@@ -7130,6 +7240,84 @@
           parent_path: parentPath,
           position: pos,
           mesh_type: meshType,
+          follow: navigation
+        });
+      }
+    },
+    {
+      definition: {
+        name: 'godot_node_instance',
+        description: "Places an imported model or saved scene into the live 3D scene as a child node: a .glb or .gltf imported with godot_import_asset, or a .tscn already in the project. Use this for anything that came from an asset file - godot_node_spawn only builds Godot's own primitive meshes and cannot place a model. The instantiated node moves, rotates and scales like any other node via godot_node_transform, and its own sub-nodes belong to the imported scene, so they are reported rather than editable from here. Applied through the editor command channel without restarting the engine when the plugin is present.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Unique name for the new node in this scene' },
+            scene_path: { type: 'string', description: 'res:// path of the model or scene to instantiate, for example res://models/crystal.glb' },
+            parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+            position: { type: 'array', items: { type: 'number' }, description: '3D position coordinates [X, Y, Z]' },
+            rotation: { type: 'array', items: { type: 'number' }, description: '3D rotation in degrees [Pitch, Yaw, Roll]' },
+            scale: { type: 'array', items: { type: 'number' }, description: '3D scale factors [sx, sy, sz]' }
+          },
+          required: ['name', 'scene_path'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const nodeName = cleanProjectName(args.name);
+        const scenePath = String(args.scene_path || '').startsWith('res://')
+          ? String(args.scene_path)
+          : `res://${cleanProjectPath(args.scene_path || '')}`;
+        if (scenePath === 'res://') throw new Error('scene_path is required.');
+        if (findNodeInActiveScene(activeFilesDict, nodeName)) {
+          throw new Error(`A node named '${nodeName}' already exists in the active scene. Godot renames name clashes on load, so pick a unique name or delete the existing node first.`);
+        }
+        if (!EditorCommandChannel.available()) {
+          const error = new Error('The editor command plugin is not available, so an imported scene cannot be instantiated.');
+          error.code = 'EDITOR_COMMAND_UNSUPPORTED';
+          throw error;
+        }
+        const parentPath = args.parent_path || '.';
+        const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : [0, 0, 0];
+        const rot = Array.isArray(args.rotation) && args.rotation.length >= 3 ? args.rotation : [0, 0, 0];
+        const scale = Array.isArray(args.scale) && args.scale.length >= 3 ? args.scale : [1, 1, 1];
+        const localBasis = basisFromEulerScale(rot, scale);
+
+        const res = await liveMutateSceneFile((source, commandReply) => {
+          const authoritative = Array.isArray(commandReply?.transform) && commandReply.transform.length >= 12
+            ? commandReply.transform
+            : [...localBasis, ...pos];
+          // The model is an external resource, not a sub-resource: the .tscn refers to the
+          // imported file, exactly as the editor writes it when a model is dragged in.
+          const declared = ensureExtResource(source, 'PackedScene', scenePath, nodeName);
+          if (!declared.ok) throw new Error(declared.error);
+          return `${declared.text}\n[node name="${nodeName}" parent="${parentPath}" instance=ExtResource("${declared.resource_id}")]\ntransform = ${formatTransform3D(authoritative.slice(0, 9), authoritative.slice(9, 12))}\n`;
+        }, {
+          command: {
+            op: 'node_instance',
+            payload: { name: nodeName, scene_path: scenePath, parent_path: parentPath, position: pos, rotation: rot, scale }
+          },
+          verify: (source, reply) => {
+            const path = reply?.node_path || (parentPath === '.' ? nodeName : `${parentPath}/${nodeName}`);
+            return verifyNodePresence(source, path, true);
+          }
+        });
+
+        const navigation = await follow3DWorkspace(res.commandReply?.node_path || nodeName);
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.settleWork(nodeName, pos, 'Placed', res.ok !== false);
+          CameraGuidance.noteSceneChanged(nodeName);
+        }
+
+        return liveMutationResult(res, {
+          node_name: nodeName,
+          type: 'InstancedScene',
+          scene_path: scenePath,
+          parent_path: parentPath,
+          position: pos,
+          // The imported scene owns these; editing them from here is not supported, and
+          // saying so beats a caller discovering it through a failed node_path lookup.
+          instanced_children: res.commandReply?.children || [],
           follow: navigation
         });
       }
@@ -7713,6 +7901,7 @@
         godot_camera_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} automatic camera follow`,
         godot_workspace_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} workspace follow`,
         godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
+        godot_node_instance: `Placing ${input.name || 'model'} from ${String(input.scene_path || '').split('/').pop() || 'a scene'}`,
         godot_node_transform: `Transforming ${input.node_path || 'node'}`,
         godot_node_material: `Recolouring ${input.node_path || 'node'}`,
         godot_node_delete: `Deleting ${input.node_path || 'node'}`
@@ -8448,6 +8637,8 @@
   // an undo entry, or survives a project reload.
   const USER_INPUT_COOLDOWN_MILLISECONDS = 750;
   const MAX_GUIDANCE_FRAMES = 8;
+  // How long to keep watching for Godot's own camera ease before calling it unmoved.
+  const GUIDANCE_SETTLE_MILLISECONDS = 1200;
   const CAMERA_AUTO_FOLLOW_PREFERENCE_KEY = 'godot-webmcp.auto-follow';
   const AUTO_FOLLOW_DEBOUNCE_MILLISECONDS = 180;
 
@@ -8501,6 +8692,10 @@
       const note = () => { this.lastInteractionAt = Date.now(); this.pending = null; };
       for (const type of ['pointerdown', 'wheel', 'keydown']) {
         document.addEventListener(type, (event) => {
+          // The guidance channel drives Godot's own framing shortcut by dispatching a key
+          // event at the canvas. Counting that as human activity made the tool yield to
+          // itself on every call and report `yielded` instead of framing anything.
+          if (event.__webmcpAgentDispatched) return;
           const target = event.target;
           if (target && (target.id === 'editor-canvas' || target.id === 'game-canvas')) note();
         }, { capture: true, passive: true });
@@ -8576,8 +8771,15 @@
       };
 
       const before = this.readPose();
-      // Select, let Node3DEditor's deferred selection handling run, then dispatch the
-      // framing shortcut. Sending both in one frame frames an empty selection.
+      // Prime the viewport's focus first, then select, then dispatch. The order matters twice
+      // over: the priming click can change the selection, so it has to come first, and
+      // Node3DEditor handles a selection change on a deferred call, so a shortcut sent in the
+      // same frame as the selection frames an empty set.
+      const primed = primeEditorViewportFocus();
+      // Godot processes the click on a later frame; sending the shortcut before then delivered
+      // it to whichever dock still held focus, which is where the `Unknown Shortcut:
+      // filesystem_dock/...` noise came from.
+      if (primed) { await nextFrame(); await nextFrame(); await nextFrame(); }
       const selected = EditorCommandChannel.call('select', { node_path: node.node_path });
       if (!selected.ok) {
         return {
@@ -8592,7 +8794,7 @@
       }
       await nextFrame();
       await nextFrame();
-      const dispatch = EditorCommandChannel.call('focus_dispatch');
+      const dispatch = dispatchEditorShortcutKey('f') || EditorCommandChannel.call('focus_dispatch');
       if (!dispatch.ok) {
         return {
           ...base,
@@ -8607,36 +8809,69 @@
 
       const reduced = typeof window !== 'undefined'
         && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
+      // Godot eases the editor camera over roughly half a second, so a fixed frame count is
+      // the wrong unit: at 8 frames it gave up after ~100 ms on a fast page and reported
+      // `camera_moved: false` for a move that was already under way. Watch for the move, and
+      // stop as soon as it is seen or the window closes.
       const frames = reduced ? 1 : MAX_GUIDANCE_FRAMES;
       let framesPresented = 0;
       let moved = false;
       let after = before;
-      for (let frame = 0; frame < frames; frame += 1) {
-        await nextFrame();
-        if (EditorCommandChannel.generation !== generation) {
-          return { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
+      let stale = null;
+      let yielded = null;
+      // The first framing of a page session regularly misses: the viewport has never held the
+      // engine's GUI focus, and the priming click only takes effect on a later frame. One
+      // retry turns that into a hit, and two misses is genuine evidence rather than a race.
+      for (let attempt = 0; attempt < 2 && !moved && !stale && !yielded; attempt += 1) {
+        if (attempt > 0) {
+          primeEditorViewportFocus();
+          await nextFrame();
+          await nextFrame();
+          await nextFrame();
+          EditorCommandChannel.call('select', { node_path: node.node_path });
+          await nextFrame();
+          await nextFrame();
+          dispatchEditorShortcutKey('f');
         }
-        if (this.withinCooldown()) return this.yieldedToUser();
-        AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
-        framesPresented += 1;
-        after = this.readPose() || after;
-        if (this.poseDelta(before, after) > 0.001) moved = true;
+        const watchUntil = nowMs() + (reduced ? 0 : GUIDANCE_SETTLE_MILLISECONDS);
+        for (let frame = 0; frame < frames || (!moved && nowMs() < watchUntil); frame += 1) {
+          await nextFrame();
+          if (EditorCommandChannel.generation !== generation) {
+            stale = { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
+            break;
+          }
+          if (this.withinCooldown()) { yielded = this.yieldedToUser(); break; }
+          AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
+          framesPresented += 1;
+          after = this.readPose() || after;
+          if (this.poseDelta(before, after) > 0.001) moved = true;
+        }
       }
+      if (stale) return stale;
+      if (yielded) return yielded;
 
       const framed = moved ? this.targetFramed(findSceneNode(activeFilesDict, nodeName)) : null;
       if (!moved) {
         // The shortcut went out and the editor did not move the camera. Say exactly that.
+        // An unfocused document cannot receive keyboard input at all, and Godot's framing is a
+        // keyboard shortcut. That is the whole explanation when it applies, and it is
+        // actionable in a way that "the pose did not change" is not.
+        const documentFocused = typeof document === 'undefined' || document.hasFocus?.() !== false;
         return {
           ...base,
           status: 'dispatched_unconfirmed',
-          reason: 'camera_pose_unchanged',
+          reason: documentFocused ? 'camera_pose_unchanged' : 'document_not_focused',
+          document_focused: documentFocused,
+          viewport_focus_primed: primed,
           mechanism: dispatch.mechanism || 'spatial_editor/focus_selection',
           dispatched: true,
           camera_moved: false,
           target_reached: false,
           frames_presented: framesPresented,
           selection_count: dispatch.selection_count ?? null,
-          note: 'The framing shortcut was delivered and the node is selected, but the viewport camera pose did not change. Godot only advances its camera interpolation while the editor is rendering, so a backgrounded or throttled tab will report this.'
+          note: documentFocused
+            ? 'The framing shortcut was delivered and the node is selected, but the viewport camera pose did not change. Godot only advances its camera interpolation while the editor is rendering, so a backgrounded or throttled tab will report this.'
+            : 'The browser document does not have focus, so no keyboard event reaches Godot and the framing shortcut cannot fire. The node is selected and the overlay is placed. Click the editor once to give the page focus, then ask again.'
         };
       }
       return {

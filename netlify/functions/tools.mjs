@@ -30,7 +30,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_import_asset',
-    description: "Imports a binary asset - image, font, mesh - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file and survives restarts, but it lives in Godot's filesystem rather than the bridge's project model, so it is not in godot_export_zip. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+    description: "Imports a binary asset - image, font, or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
     input_schema: {
       type: 'object',
       properties: {
@@ -193,12 +193,12 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_create_project',
-    description: 'Injects complete 2D/3D visual scenes (.tscn), GDScripts, shaders, and audio into Godot virtual FS and boots Godot Viewport',
+    description: "Creates a Godot project from a built-in template or an explicit file set, and REPLACES the running editor to open it. Because that takes several seconds it may return {status: 'pending', operation_id} instead of a result - poll godot_get_operation_status until it reports succeeded before calling any other tool, or the next call will be refused while the editor is being torn down. Audio is never staged into a project: add it afterwards with godot_synthesize_audio_suite, and other assets with godot_import_asset.",
     input_schema: {
       type: 'object',
       properties: {
         project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
-        template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden' },
+        template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; custom requires files.' },
         files: { type: 'object', description: 'Custom dictionary of normalized file paths to source strings or binary buffers' },
         idempotency_key: { type: 'string' }
       },
@@ -408,7 +408,7 @@ export const MCP_TOOL_CATALOG = [
     description: 'Dispatches a keyboard event and reports subsequent project telemetry without claiming unverified gameplay acknowledgement',
     input_schema: {
       type: 'object',
-      properties: { key: { type: 'string' }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } },
+      properties: { key: { type: 'string', description: "DOM KeyboardEvent name, used as both `key` and `code`: ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Space, Enter, KeyW, KeyA, KeyS, KeyD. Godot's default ui_* actions are the arrow keys and Space." }, pressed: { type: 'boolean' }, duration_ms: { type: 'integer', minimum: 20, maximum: 5000 }, await_telemetry: { type: 'boolean', default: true }, target: { type: 'string', enum: ['auto', 'editor', 'game'], default: 'auto', description: "Which Godot canvas to address. 'auto' follows the visible tab." } },
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
@@ -423,7 +423,7 @@ export const MCP_TOOL_CATALOG = [
           type: 'array', minItems: 1, maxItems: 32,
           items: {
             type: 'object',
-            properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string' }, pressed: { type: 'boolean' } },
+            properties: { at_ms: { type: 'integer', minimum: 0, maximum: 10000 }, key: { type: 'string', description: "DOM KeyboardEvent name, used as both `key` and `code`: ArrowUp, ArrowDown, ArrowLeft, ArrowRight, Space, Enter, KeyW, KeyA, KeyS, KeyD. Godot's default ui_* actions are the arrow keys and Space." }, pressed: { type: 'boolean' } },
             required: ['at_ms', 'key', 'pressed'], additionalProperties: false
           }
         },
@@ -568,6 +568,24 @@ export const MCP_TOOL_CATALOG = [
         }
       },
       required: ['name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_instance',
+    description: "Places an imported model or saved scene into the live 3D scene as a child node: a .glb or .gltf imported with godot_import_asset, or a .tscn already in the project. Use this for anything that came from an asset file - godot_node_spawn only builds Godot's own primitive meshes and cannot place a model. The instantiated node moves, rotates and scales like any other node via godot_node_transform, and its own sub-nodes belong to the imported scene, so they are reported rather than editable from here. Applied through the editor command channel without restarting the engine when the plugin is present.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Unique name for the new node in this scene' },
+        scene_path: { type: 'string', description: 'res:// path of the model or scene to instantiate, for example res://models/crystal.glb' },
+        parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+        position: { type: 'array', items: { type: 'number' }, description: '3D position coordinates [X, Y, Z]' },
+        rotation: { type: 'array', items: { type: 'number' }, description: '3D rotation in degrees [Pitch, Yaw, Roll]' },
+        scale: { type: 'array', items: { type: 'number' }, description: '3D scale factors [sx, sy, sz]' }
+      },
+      required: ['name', 'scene_path'],
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: true }

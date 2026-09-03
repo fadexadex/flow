@@ -116,7 +116,9 @@ func _on_command(args: Array) -> String:
 		"asset_import": reply = _op_asset_import(payload)
 		"asset_state": reply = _op_asset_state(payload)
 		"viewport_tree": reply = _op_viewport_tree()
+		"viewport_api": reply = _op_viewport_api(payload)
 		"node_add": reply = _op_node_add(payload)
+		"node_instance": reply = _op_node_instance(payload)
 		"node_transform": reply = _op_node_transform(payload)
 		"node_material": reply = _op_node_material(payload)
 		"node_delete": reply = _op_node_delete(payload)
@@ -453,6 +455,29 @@ func _op_focus_dispatch() -> Dictionary:
 
 ## Diagnostic: report the ancestor chain of the 3D editor viewport so the JS side can see
 ## which control actually owns the spatial editor shortcuts.
+func _op_viewport_api(payload: Dictionary) -> Dictionary:
+	var viewport := EditorInterface.get_editor_viewport_3d(0)
+	if viewport == null:
+		return {"ok": false, "error": "No 3D editor viewport."}
+	var target: Node = viewport
+	var want := String(payload.get("class", "Node3DEditorViewport"))
+	while target != null and target.get_class() != want:
+		target = target.get_parent()
+	if target == null:
+		return {"ok": false, "error": "No ancestor of class %s." % want}
+	var filter := String(payload.get("filter", "")).to_lower()
+	var methods := []
+	for m in target.get_method_list():
+		var name := String(m.get("name", ""))
+		if filter == "" or name.to_lower().contains(filter):
+			methods.append(name)
+	var props := []
+	for pr in target.get_property_list():
+		var name := String(pr.get("name", ""))
+		if filter == "" or name.to_lower().contains(filter):
+			props.append(name)
+	return {"ok": true, "class": target.get_class(), "methods": methods, "properties": props}
+
 func _op_viewport_tree() -> Dictionary:
 	var viewport := EditorInterface.get_editor_viewport_3d(0)
 	if viewport == null:
@@ -906,6 +931,58 @@ func _op_node_add(payload: Dictionary) -> Dictionary:
 		"node_name": node_name,
 		"aabb": _aabb_of(instance),
 		"transform": _transform_array(instance),
+	}
+
+func _op_node_instance(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var scene_path := String(payload.get("scene_path", ""))
+	if not scene_path.begins_with("res://"):
+		return {"ok": false, "error": "scene_path must be a res:// path."}
+	if not ResourceLoader.exists(scene_path):
+		return {"ok": false, "error": "Godot cannot load %s. Import it first, and check the path." % scene_path}
+	var resource := ResourceLoader.load(scene_path)
+	if resource == null or not (resource is PackedScene):
+		return {"ok": false, "error": "%s did not load as a scene. Imported meshes (.glb, .gltf) and .tscn files are instantiable; a texture or a material is not." % scene_path}
+	var parent := _resolve_node(String(payload.get("parent_path", ".")))
+	if parent == null:
+		parent = root
+	var node_name := String(payload.get("name", ""))
+	if node_name == "":
+		return {"ok": false, "error": "node_instance requires a name."}
+	if _find_by_name(root, node_name) != null:
+		return {"ok": false, "error": "A node named '%s' already exists in this scene." % node_name}
+	var instance := (resource as PackedScene).instantiate()
+	if instance == null:
+		return {"ok": false, "error": "%s could not be instantiated." % scene_path}
+	instance.name = node_name
+	if instance is Node3D:
+		(instance as Node3D).transform = _compose_transform(
+			_vector3(payload.get("position"), Vector3.ZERO),
+			_vector3(payload.get("rotation"), Vector3.ZERO),
+			_vector3(payload.get("scale"), Vector3.ONE))
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: instance %s" % node_name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "add_child", instance, true)
+	undo.add_do_method(instance, "set_owner", root)
+	undo.add_do_reference(instance)
+	undo.add_undo_method(parent, "remove_child", instance)
+	undo.commit_action()
+	# The children of an instantiated scene belong to that scene, not to this one, so they are
+	# reported rather than left for the caller to guess at from an empty node.
+	var children := []
+	for child in instance.get_children():
+		children.append({"name": String(child.name), "class": child.get_class()})
+	return {
+		"ok": true,
+		"node_path": String(root.get_path_to(instance)),
+		"node_name": node_name,
+		"scene_path": scene_path,
+		"child_count": instance.get_child_count(),
+		"children": children,
+		"aabb": _aabb_of(instance) if instance is Node3D else null,
+		"transform": _transform_array(instance) if instance is Node3D else null,
 	}
 
 func _op_node_transform(payload: Dictionary) -> Dictionary:

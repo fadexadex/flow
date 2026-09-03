@@ -25,6 +25,7 @@ const {
   scriptDiagnosticsFromLogs,
   summarizeScriptDiagnostics,
   attachScriptInSceneText,
+  ensureExtResource,
   exactSourceHashAcknowledged,
   hotScriptRollbackPlan,
   createActiveBudget,
@@ -36,10 +37,11 @@ const {
   ${slice('  function createActiveBudget', '  // Runs \`isDone\` until it returns true')}
   ${slice('  const HOT_SCRIPT_EXTENSION', '  async function sha256HexOfText')}
   ${slice('  function lineChangeSummary', '  const HotScriptChannel = {')}
+  ${slice('  function ensureExtResource', '  function attachScriptInSceneText')}
   ${slice('  function attachScriptInSceneText', '  // Whether a Follow action may take over')}
   return {
     cleanProjectPath, isHotScriptEligiblePath, hotScriptTransactionPlan, lineChangeSummary,
-    scriptDiagnosticsFromLogs, summarizeScriptDiagnostics, attachScriptInSceneText,
+    scriptDiagnosticsFromLogs, summarizeScriptDiagnostics, attachScriptInSceneText, ensureExtResource,
     exactSourceHashAcknowledged,
     hotScriptRollbackPlan,
     createActiveBudget, tickActiveBudget, activityHeadline
