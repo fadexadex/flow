@@ -33,6 +33,10 @@
     // True only while an unavoidable editor replacement is paused because the pane is hidden
     // or unthrottled frames have stopped. It is a "waiting on you", not a failure.
     shutdownWaiting: false,
+    // Assets imported into the running editor this session. They deliberately do not live in
+    // the project file dict: binary there would ride into undo snapshots, exports, and the
+    // next boot - and a binary asset present at boot is what aborts this WASM build.
+    importedAssets: new Map(),
     // The evidence from the most recent editor replacement: how long the engine actually had
     // frames, how long it was hidden, and what the exit did. Recorded whether or not it
     // succeeded, so a later "the editor hung" report can be checked rather than believed.
@@ -1238,6 +1242,12 @@
     return { files: normalized, repairs, repairedPaths };
   }
 
+  // Narrowed from "all binary" by experiment. Images, fonts and meshes import cleanly, both
+  // live and during a boot scan: a project holding an imported PNG reopens healthy. Audio does
+  // not - Godot's WAV import aborts this WebAssembly build wherever it runs, so audio is the
+  // one family that never reaches the importer. See AUDIO_ASSET_PATTERN's note.
+  const AUDIO_ASSET_PATTERN = /\.(wav|ogg|mp3)$/i;
+
   function validateProjectFiles(files) {
     const entries = Object.entries(files);
     if (entries.length === 0) throw new Error('A project must contain at least one file.');
@@ -1248,6 +1258,17 @@
       if (filePath !== rawPath) throw new Error(`Project paths must be normalized before commit: ${rawPath}`);
       if (!(typeof content === 'string' || content instanceof Uint8Array || content instanceof ArrayBuffer)) {
         throw new Error(`Unsupported content type for ${filePath}. Use text or binary bytes.`);
+      }
+      // Godot's WAV importer aborts this WebAssembly build - the runtime traps in
+      // ProgressDialog on an empty task stack and the editor goes black with no recovery.
+      // It happens at boot and equally on a live scan, so the file simply never reaches the
+      // importer. Refusing here turns an unrecoverable abort into an error that says what to
+      // do instead; godot_synthesize_audio_suite writes the same samples as .wavdata, which
+      // Godot has no importer for, and loads them as AudioStreamWAV at runtime.
+      if (AUDIO_ASSET_PATTERN.test(filePath)) {
+        const error = new Error(`${filePath} cannot be added to a project: Godot's audio import aborts this WebAssembly build of the editor. Ship the samples as .wavdata and build an AudioStreamWAV at runtime - godot_synthesize_audio_suite does exactly that.`);
+        error.code = 'AUDIO_IMPORT_UNSUPPORTED';
+        throw error;
       }
       const size = typeof content === 'string' ? new TextEncoder().encode(content).byteLength : content.byteLength;
       if (size > 5 * 1024 * 1024) throw new Error(`File exceeds the 5 MB limit: ${filePath}`);
@@ -1479,6 +1500,30 @@
   // barrier and recreated the overlap it existed to prevent.
   let editorRestartBlocked = false;
 
+  // Remove every asset this session imported into the live editor filesystem.
+  //
+  // These deliberately never entered the project file dict, so nothing else knows about them;
+  // this map is the only record, and the plugin is the only thing that can delete them.
+  // Godot imports on its own main-loop pass, so the reply to an import request is always
+  // taken before the work happens. Ask the editor what it actually ended up with, spending
+  // foreground-active time so a hidden tab is reported as paused rather than as a failure.
+  async function awaitAssetImport(resPath, budgetMs) {
+    let last = { ok: false, loadable: false, has_import: false, exists: false, size_bytes: null };
+    const read = () => {
+      const state = EditorCommandChannel.call('asset_state', { path: resPath });
+      if (state && state.ok) last = state;
+      return state;
+    };
+    read();
+    if (budgetMs <= 0) return last;
+    await awaitWithActiveBudget(() => {
+      const state = read();
+      return Boolean(state && state.ok && state.loadable === true);
+    }, budgetMs, null, 120);
+    return last;
+  }
+
+
   async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
@@ -1581,17 +1626,43 @@
     // editor a real AudioContext can race game teardown/restart and invalidate
     // the next AudioWorkletNode. Authoring itself does not need audio output.
     window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor', '--audio-driver', 'Dummy']);
-    const ready = await waitFor(() => {
+    // Booting is frame-work: the engine only makes progress while the page is actually
+    // painting. Spending a wall-clock budget declares a hidden or throttled tab dead when it
+    // is merely paused, so the boot wait spends the same foreground-active budget the exit
+    // wait does, and says so when it is waiting on frames rather than on the engine.
+    const bootReady = () => {
       if (failureMessage || readyEventObserved) return true;
       const editorTab = document.getElementById('btn-tab-editor');
       const editorCanvas = document.getElementById('editor-canvas');
       const bootTelemetry = activeLogs.some(entry => entry.time >= bootStartedAt && /Build configuration:|Godot Engine v/i.test(entry.msg));
       return Boolean(editorTab && !editorTab.disabled && editorCanvas && bootTelemetry);
-    }, timeoutMs);
+    };
+    const booted = await awaitWithActiveBudget(bootReady, timeoutMs, (status, budget) => {
+      if (status === 'waiting_for_foreground') {
+        AgentStatusRail.setFocusNote('Keep this editor visible to finish opening the project');
+      } else {
+        AgentStatusRail.setFocusNote(`Opening the project - ${Math.round(budget.activeMs / 1000)}s`);
+      }
+    });
+    AgentStatusRail.setFocusNote('');
+    const ready = booted.ok;
+    DiagnosticState.lastBootWait = {
+      ok: ready,
+      active_ms: Math.round(booted.budget.activeMs),
+      hidden_ms: Math.round(booted.budget.hiddenMs),
+      suspended_ms: Math.round(booted.budget.suspendedMs),
+      at: Date.now()
+    };
     window.removeEventListener('godot-engine-ready', onReady);
     window.removeEventListener('godot-engine-failed', onFailed);
     if (failureMessage) throw new Error(failureMessage);
-    if (!ready) throw new Error(`Godot editor did not confirm project readiness within ${Math.round(timeoutMs / 1000)} seconds.`);
+    if (!ready) {
+      const error = new Error(`Godot editor did not confirm project readiness after ${Math.round(booted.budget.activeMs / 1000)}s of foreground-active time (${Math.round(booted.budget.hiddenMs / 1000)}s hidden).`);
+      error.code = 'EDITOR_BOOT_TIMEOUT';
+      error.active_ms = Math.round(booted.budget.activeMs);
+      error.hidden_ms = Math.round(booted.budget.hiddenMs);
+      throw error;
+    }
     await new Promise(resolve => setTimeout(resolve, 450));
     const bootErrors = recentGodotErrors(bootStartedAt);
     if (bootErrors.length > 0) {
@@ -2177,6 +2248,79 @@
   // ==========================================
   // 3. 6-Piece Procedural Audio Synthesizer
   // ==========================================
+  // The GDScript half of the audio pipeline. Held as lines rather than one blob so a
+  // stray backtick or backslash in an edit cannot silently change what ships.
+  const SFX_LIBRARY_SOURCE = [
+    "extends Node",
+    "## Runtime sample loader for the WebMCP audio suite.",
+    "##",
+    "## The samples ship as .wavdata rather than .wav on purpose: Godot's WAV importer aborts the",
+    "## WebAssembly build of the editor, and an extension it has no importer for never reaches that",
+    "## code. The bytes are an ordinary 16-bit PCM RIFF file, parsed here and handed to",
+    "## AudioStreamWAV, which needs no import step at all.",
+    "",
+    "const SUITE_DIR := \"res://sfx\"",
+    "",
+    "static func load_stream(path: String) -> AudioStreamWAV:",
+    "\tvar bytes := FileAccess.get_file_as_bytes(path)",
+    "\tif bytes.size() < 44:",
+    "\t\tpush_error(\"Sample is too small to be a RIFF file: \" + path)",
+    "\t\treturn null",
+    "\tvar mix_rate := bytes.decode_u32(24)",
+    "\tvar channels := bytes.decode_u16(22)",
+    "\tvar bits := bytes.decode_u16(34)",
+    "\t# Walk the chunk list rather than assuming data starts at 44: some writers add chunks.",
+    "\tvar offset := 12",
+    "\tvar data_start := -1",
+    "\tvar data_size := 0",
+    "\twhile offset + 8 <= bytes.size():",
+    "\t\tvar chunk_id := bytes.slice(offset, offset + 4).get_string_from_ascii()",
+    "\t\tvar chunk_size := bytes.decode_u32(offset + 4)",
+    "\t\tif chunk_id == \"data\":",
+    "\t\t\tdata_start = offset + 8",
+    "\t\t\tdata_size = chunk_size",
+    "\t\t\tbreak",
+    "\t\toffset += 8 + chunk_size + (chunk_size % 2)",
+    "\tif data_start < 0:",
+    "\t\tpush_error(\"No data chunk in \" + path)",
+    "\t\treturn null",
+    "\tif bits != 16:",
+    "\t\tpush_error(\"Only 16-bit PCM samples are supported: \" + path)",
+    "\t\treturn null",
+    "\tvar stream := AudioStreamWAV.new()",
+    "\tstream.format = AudioStreamWAV.FORMAT_16_BITS",
+    "\tstream.mix_rate = int(mix_rate)",
+    "\tstream.stereo = channels == 2",
+    "\tstream.data = bytes.slice(data_start, mini(data_start + data_size, bytes.size()))",
+    "\treturn stream",
+    "",
+    "## Loads every sample in the suite, keyed by name: load_all()[\"laser_fire\"].",
+    "static func load_all(directory: String = SUITE_DIR) -> Dictionary:",
+    "\tvar streams := {}",
+    "\tvar dir := DirAccess.open(directory)",
+    "\tif dir == null:",
+    "\t\treturn streams",
+    "\tfor file_name in dir.get_files():",
+    "\t\tif not file_name.ends_with(\".wavdata\"):",
+    "\t\t\tcontinue",
+    "\t\tvar stream := load_stream(directory.path_join(file_name))",
+    "\t\tif stream != null:",
+    "\t\t\tstreams[file_name.get_basename()] = stream",
+    "\treturn streams",
+    "",
+    "## Plays one sample once and frees the player when it finishes.",
+    "static func play(parent: Node, name: String, directory: String = SUITE_DIR) -> AudioStreamPlayer:",
+    "\tvar stream := load_stream(directory.path_join(name + \".wavdata\"))",
+    "\tif stream == null:",
+    "\t\treturn null",
+    "\tvar player := AudioStreamPlayer.new()",
+    "\tplayer.stream = stream",
+    "\tparent.add_child(player)",
+    "\tplayer.finished.connect(player.queue_free)",
+    "\tplayer.play()",
+    "\treturn player"
+  ].join('\n') + '\n';
+
   const AudioEngine = {
     unlock() {
       try {
@@ -2186,6 +2330,13 @@
           if (ctx.state === 'suspended') ctx.resume();
         }
       } catch (e) {}
+    },
+
+    // The named suite, in one place, so the authoring path and the audio tool cannot drift.
+    SUITE: ['laser_fire', 'rail_impact', 'energy_pickup', 'jump_boost', 'gate_warp', 'shield_down'],
+
+    synthesizeSuite(types = null, durationSeconds = 0.4) {
+      return (types || this.SUITE).map(type => this.synthesizeSound(type, durationSeconds));
     },
 
     synthesizeSound(type, durationSeconds = 0.4, sampleRate = 22050) {
@@ -4523,7 +4674,13 @@
             persisted_revision: DiagnosticState.persistedRevision,
             unpersisted: DiagnosticState.sceneRevision !== DiagnosticState.persistedRevision,
             undo_stack_depth: undoStack.length,
-            active_operation_id: activeManagedMutationId
+            active_operation_id: activeManagedMutationId,
+            // Imported assets are real project files, but they are not part of the bridge's
+            // text project model, so they are absent from exports and undo snapshots. Listing
+            // them keeps that gap visible rather than something a caller has to remember.
+            imported_assets: [...DiagnosticState.importedAssets.values()].map(entry => ({
+              path: entry.path, bytes: entry.bytes, loadable: entry.loadable === true
+            }))
           },
           runtime: {
             state: typeof window !== 'undefined' ? window.__godotGameState || 'unknown' : 'unavailable',
@@ -4662,6 +4819,98 @@
           file_count: Object.keys(activeFilesDict).length,
           undo_stack_depth: 0,
           undo_history: 'cleared_on_switch'
+        };
+      }
+    },
+    {
+      definition: {
+        name: 'godot_import_asset',
+        description: "Imports a binary asset - image, font, mesh - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file and survives restarts, but it lives in Godot's filesystem rather than the bridge's project model, so it is not in godot_export_zip. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav' },
+            content_base64: { type: 'string', description: 'Base64 of the raw file bytes', maxLength: 7000000 },
+            reimport: { type: 'boolean', default: true, description: 'Ask Godot to import it into a loadable resource' }
+          },
+          required: ['path', 'content_base64'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const path = cleanProjectPath(args.path);
+        if (!path) throw new Error('path is required.');
+        // The one family Godot cannot import here without aborting the editor.
+        if (AUDIO_ASSET_PATTERN.test(path)) {
+          const error = new Error(`Godot's audio import aborts this WebAssembly build of the editor, so ${path} cannot be imported. Use godot_synthesize_audio_suite, which writes the samples as .wavdata and builds an AudioStreamWAV at runtime.`);
+          error.code = 'AUDIO_IMPORT_UNSUPPORTED';
+          throw error;
+        }
+        if (!EditorCommandChannel.available()) {
+          const error = new Error('The editor command plugin is not available, so an asset cannot be imported.');
+          error.code = 'EDITOR_COMMAND_UNSUPPORTED';
+          throw error;
+        }
+        const bytes = decodeUploadChunk(String(args.content_base64 || ''), 'base64');
+        if (!bytes.byteLength) throw new Error('content_base64 decoded to zero bytes.');
+        if (bytes.byteLength > 5 * 1024 * 1024) throw new Error(`Asset exceeds the 5 MB limit: ${path}`);
+
+        const generations = {
+          lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
+          command: EditorCommandChannel.generation
+        };
+        const write = window.__godotEditorWriteFiles({ [path]: bytes }, {
+          expectLifecycleGeneration: generations.lifecycle,
+          expectCommandGeneration: generations.command,
+          projectName: DiagnosticState.activeProject
+        });
+        if (!write.ok) {
+          const error = new Error(write.error || 'The editor filesystem refused the asset.');
+          error.code = write.reason === 'generation_changed' ? 'EDITOR_GENERATION_CHANGED' : 'EDITOR_FS_COPY_FAILED';
+          throw error;
+        }
+        const queued = EditorCommandChannel.call('asset_import', { path: `res://${path}`, reimport: args.reimport !== false });
+        if (!queued.ok) {
+          const error = new Error(queued.error || `Godot did not accept ${path}.`);
+          error.code = 'ASSET_IMPORT_FAILED';
+          throw error;
+        }
+        // Scanning and importing run on a deferred frame, so the request only queues a job.
+        // Reading the outcome from the request's own reply reported every asset as unimported
+        // while the write had in fact succeeded.
+        const job = await HotScriptChannel.awaitJob(queued.job_id, 12000);
+        if (!job.ok || job.job?.job_ok !== true) {
+          const error = new Error(job.job?.job_error || `Godot did not finish importing ${path}.`);
+          error.code = 'ASSET_IMPORT_FAILED';
+          throw error;
+        }
+        const imported = job.job;
+        const settled = await awaitAssetImport(`res://${path}`, args.reimport !== false ? 8000 : 0);
+        // The asset lives in the editor's filesystem, not in the bridge's text project model.
+        // Recording it there would put binary into undo snapshots and every export, and would
+        // put it back into the next boot - which is the thing that crashes.
+        DiagnosticState.importedAssets.set(path, {
+          path, bytes: bytes.byteLength, loadable: settled.loadable === true, at: Date.now()
+        });
+        DiagnosticHUD.render();
+        return {
+          success: true,
+          path: `res://${path}`,
+          bytes_written: bytes.byteLength,
+          bytes_on_disk: settled.size_bytes ?? imported.size_bytes ?? null,
+          loadable: settled.loadable === true,
+          import_metadata_written: settled.has_import === true,
+          revealed_in_dock: imported.dock_revealed === true,
+          editor_restarted: false,
+          // Said plainly, because the gap is easy to miss. The asset is a real file in the
+          // project and survives restarts - a project holding an imported image reopens
+          // healthy - but it lives in Godot's filesystem, not in the bridge's text project
+          // model, so it is absent from godot_export_zip and from undo snapshots.
+          persistence: 'project_filesystem',
+          survives_editor_restart: true,
+          included_in_export_zip: false,
+          project: DiagnosticState.activeProject
         };
       }
     },
@@ -4842,14 +5091,24 @@
             'player_runner.gd': NeonSkyrail.generatePlayerGd()
           };
 
-          // Synthesize audio suite assets
+          // The audio suite is synthesized but NOT staged into the project.
+          //
+          // This is the bug that made this template unusable. A .wav present in the project
+          // directory when the editor boots aborts the Godot WebAssembly build during its
+          // first import scan - reproduced with a minimal project containing nothing but
+          // project.godot, an empty Node3D scene, and one WAV. The identical scene files boot
+          // perfectly without it, so the template was never at fault.
+          //
+          // The sounds are returned for preview and can be put into the project with
+          // godot_import_asset, which writes into the RUNNING editor where importing is safe.
           const audioTypes = ['laser_fire', 'rail_impact', 'energy_pickup', 'jump_boost', 'gate_warp', 'shield_down'];
-          const generatedAudio = [];
-          for (const t of audioTypes) {
-            const aud = AudioEngine.synthesizeSound(t, 0.4);
-            activeFilesDict[aud.filename] = aud.raw_bytes;
-            generatedAudio.push({ name: aud.name, filename: aud.filename, duration: aud.duration_seconds, license: aud.license });
-          }
+          const generatedAudio = AudioEngine.synthesizeSuite(audioTypes, 0.4).map(aud => ({
+            name: aud.name,
+            filename: aud.filename,
+            duration: aud.duration_seconds,
+            license: aud.license,
+            preview_data_url: aud.data_url
+          }));
 
           try {
             await restartEditorWithProject(activeFilesDict, projName, 60000, operation);
@@ -4889,6 +5148,7 @@
               camera: 'Third-Person ChaseCamera (FOV 68)'
             },
             audio_assets_generated: generatedAudio,
+            audio_import_hint: 'Sounds are previews until imported. Add one with godot_import_asset once the editor is running; staging audio into the boot aborts the engine.',
             files_written: Object.keys(activeFilesDict)
           };
           storeIdempotentResult(idempotencyKey, fingerprint, result);
@@ -4900,15 +5160,82 @@
     {
       definition: {
         name: 'godot_synthesize_audio_suite',
-        description: 'Procedurally synthesizes the complete 6-piece 16-bit WAV sound effects suite with duration, loudness, and MIT license metadata',
-        input_schema: { type: 'object', properties: {}, additionalProperties: false },
+        description: "Procedurally synthesizes the 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to also write them into the project as .wavdata plus an sfx_library.gd that builds an AudioStreamWAV from the bytes at runtime. They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; an extension it has no importer for never reaches that code, and runtime loading behaves identically in the exported game. Reports per-file what Godot confirmed on disk.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            import_into_project: { type: 'boolean', default: false, description: 'Also write the suite into the running editor and import it' },
+            directory: { type: 'string', default: 'sfx', description: 'Project-relative folder for the imported files' }
+          },
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
-      handler: async () => {
-        const audioTypes = ['laser_fire', 'rail_impact', 'energy_pickup', 'jump_boost', 'gate_warp', 'shield_down'];
-        const suite = audioTypes.map(t => AudioEngine.synthesizeSound(t, 0.4));
+      handler: async (args = {}) => {
+        const suite = AudioEngine.synthesizeSuite(null, 0.4);
+        const wantsImport = args.import_into_project === true;
+        const directory = cleanProjectPath(args.directory || 'sfx').replace(/\/+$/, '');
+        const imported = [];
+        let libraryPath = null;
+        if (wantsImport) {
+          if (!EditorCommandChannel.available()) {
+            const error = new Error('The editor command plugin is not available, so the suite cannot be written into the project.');
+            error.code = 'EDITOR_COMMAND_UNSUPPORTED';
+            throw error;
+          }
+          // .wavdata, not .wav: Godot's audio importer aborts this WebAssembly build, and an
+          // extension it has no importer for is never handed to that code. The bytes are an
+          // ordinary RIFF file; sfx_library.gd turns them into an AudioStreamWAV at runtime,
+          // which needs no import step and works the same in the exported game.
+          const generations = {
+            lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
+            command: EditorCommandChannel.generation
+          };
+          const payload = {};
+          for (const asset of suite) {
+            const path = directory ? `${directory}/${asset.name}.wavdata` : `${asset.name}.wavdata`;
+            payload[path] = decodeUploadChunk(asset.data_url.split(',')[1], 'base64');
+            imported.push({ name: asset.name, path: `res://${path}`, bytes: payload[path].byteLength });
+          }
+          libraryPath = directory ? `${directory}/sfx_library.gd` : 'sfx_library.gd';
+          payload[libraryPath] = SFX_LIBRARY_SOURCE;
+          const write = window.__godotEditorWriteFiles(payload, {
+            expectLifecycleGeneration: generations.lifecycle,
+            expectCommandGeneration: generations.command,
+            projectName: DiagnosticState.activeProject
+          });
+          if (!write.ok) {
+            const error = new Error(write.error || 'The editor filesystem refused the audio suite.');
+            error.code = write.reason === 'generation_changed' ? 'EDITOR_GENERATION_CHANGED' : 'EDITOR_FS_COPY_FAILED';
+            throw error;
+          }
+          // The samples are text-free project files, so they belong in the project model:
+          // that is what carries them into an export, an undo snapshot and the next boot.
+          for (const [path, content] of Object.entries(payload)) activeFilesDict[path] = content;
+          DiagnosticState.sceneRevision += 1;
+          await persistActiveProjectState();
+          // Godot's FileSystem dock hides files it has no importer for, so .wavdata samples
+          // are invisible there by design. Our own project view is where the human sees them.
+          BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
+          // One scan picks up the whole directory; each file is then confirmed individually.
+          const queued = EditorCommandChannel.call('asset_import', { path: `res://${libraryPath}`, reveal: true });
+          if (queued.ok && queued.job_id) await HotScriptChannel.awaitJob(queued.job_id, 12000);
+          for (const entry of imported) {
+            const state = EditorCommandChannel.call('asset_state', { path: entry.path });
+            entry.on_disk = state?.exists === true;
+            entry.bytes_on_disk = state?.size_bytes ?? null;
+          }
+        }
         return {
           suite_count: suite.length,
+          imported_into_project: wantsImport,
+          imported: wantsImport ? imported : null,
+          imported_ok: wantsImport ? imported.filter(entry => entry.on_disk === true).length : 0,
+          runtime_loader: libraryPath ? `res://${libraryPath}` : null,
+          // Said explicitly because the extension is unusual and deliberate.
+          playback: wantsImport
+            ? `Load a sample with SfxLibrary.load_stream("res://${directory || '.'}/<name>.wavdata") or play one with SfxLibrary.play(self, "<name>"). They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; AudioStreamWAV is built from the bytes at runtime instead, which behaves identically in the exported game.`
+            : null,
           assets: suite.map(a => ({
             name: a.name,
             filename: a.filename,
@@ -7351,6 +7678,7 @@
         godot_open_saved_project: `Opening saved project: ${input.project_name || 'unknown'}`,
         godot_adopt_open_project: 'Adding the open project to the library',
         godot_get_user_focus: 'Reading what you have selected',
+        godot_import_asset: `Importing asset: ${input.path || 'file'}`,
         godot_author_3d_runner: `Authoring 3D runner architecture: ${input.project_name || 'Neon Skyrail'}`,
         godot_inspect_project_files: input.paths?.length ? `Inspecting ${input.paths.length} project files` : 'Inspecting authoritative project manifest',
         godot_apply_file_transaction: input.label ? `${input.label} (${input.operations?.length || 1} file${input.operations?.length === 1 ? '' : 's'})` : `Applying file transaction (${input.operations?.length || 0} operations)`,

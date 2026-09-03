@@ -154,6 +154,31 @@ Camera framing uses selection plus Godot's `spatial_editor/focus_selection` shor
 
 Both paths persist state via `persistActiveProjectState()` (IndexedDB) so `godot_restore_project_session` can rehydrate after a page reload without losing revision/undo history.
 
+### Assets, and the one thing Godot cannot import here
+
+Binary assets go in through `godot_import_asset`: the bytes are written into the running
+editor's filesystem, then a deferred job calls `EditorFileSystem.update_file()` + `scan()` from
+`_process`, and the bridge polls the `asset_state` op until Godot itself reports the file
+loadable. Nothing reads the import request's own reply for the outcome — that reply is taken
+before the work happens, and reading it reported every asset as unimported while the write had
+in fact succeeded. Imported assets are real project files that survive editor restarts, but
+they live in Godot's filesystem rather than `activeFilesDict`, so they are absent from
+`godot_export_zip`; the tool says so in `included_in_export_zip`.
+
+**Audio is the exception, and it is not a style choice.** Godot's WAV import aborts this
+WebAssembly build: the runtime traps in `ProgressDialog` on an empty task stack
+(`FATAL: Index p_index = -1 is out of bounds (size() = 0)`), the editor goes black, and there
+is no recovery. Measured, not assumed — the same bytes under a `.wavdata` extension scan
+cleanly, and a PNG imports and reboots fine, so it is the audio importer and not "binary assets"
+or any particular template. `godot_synthesize_audio_suite` therefore writes the samples as
+`sfx/<name>.wavdata` plus `sfx/sfx_library.gd`, which parses the RIFF header and builds an
+`AudioStreamWAV` at runtime — no import step, identical behaviour in the exported game. Both
+`validateProjectFiles` and `godot_import_asset` refuse `.wav`/`.ogg`/`.mp3` outright
+(`AUDIO_IMPORT_UNSUPPORTED`) and name the route that works.
+
+Do not call `reimport_files()`, and do not run a scan straight from a JavaScriptBridge callback
+or `call_deferred` — both were tried, and both abort the runtime.
+
 ### Idempotency and long-running ops
 
 Mutating tools accept an `idempotency_key`; results are cached in `idempotentMutations`/`inflightIdempotency` so a retried call replays the prior result instead of double-applying. Operations that can outlive a single tool-call deadline (uploads, transactions) are tracked in `managedOperations` and polled via `godot_get_operation_status`.

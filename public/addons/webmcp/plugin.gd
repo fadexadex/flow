@@ -98,6 +98,8 @@ func _on_command(args: Array) -> String:
 		"project_state": reply = _op_project_state()
 		"project_files": reply = _op_project_files()
 		"selection_state": reply = _op_selection_state()
+		"asset_import": reply = _op_asset_import(payload)
+		"asset_state": reply = _op_asset_state(payload)
 		"viewport_tree": reply = _op_viewport_tree()
 		"node_add": reply = _op_node_add(payload)
 		"node_transform": reply = _op_node_transform(payload)
@@ -578,6 +580,89 @@ func _collect_project_files(path: String, acc: Dictionary) -> void:
 ## could read the scene but never the human's selection, so every instruction had to name a
 ## node explicitly. This is the other half of the collaboration - the editor reporting what the
 ## person is looking at and has selected, so the agent can resolve a pronoun.
+## Make an asset the bridge just wrote into the live filesystem real to Godot.
+##
+## Assets cannot be staged into a project before the editor boots: a .wav present at boot
+## aborts this WASM build during the initial import scan. Writing into the RUNNING editor and
+## importing here is the path that works, so this reports the two facts that matter - whether
+## Godot can see the file, and whether it could actually import it into a loadable resource.
+func _op_asset_import(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	if not FileAccess.file_exists(path):
+		return {"ok": false, "error": "Godot cannot see %s in its filesystem." % path}
+	_script_job_counter += 1
+	var job_id := "script_job_%d" % _script_job_counter
+	_script_jobs[job_id] = {"state": "pending", "path": path, "queued_at": Time.get_ticks_msec()}
+	# Scanning and importing walk the whole filesystem and touch the editor docks. This callback
+	# runs inline on a JS call stack (see the note above _on_command), and doing that work here
+	# aborted the WebAssembly runtime with CRASH_BAD_INDEX - the same way save_scene() did.
+	# It has to happen from a settled main-loop iteration instead.
+	var steps := {
+		"reimport": bool(payload.get("reimport", true)),
+		"reveal": bool(payload.get("reveal", true)),
+	}
+	# call_deferred still runs inside the current frame's idle callbacks, which is where the
+	# editor's own EditorProgress task can still be open: nesting a scan there made
+	# ProgressDialog::end_task fail its "tasks.has(p_task)" check and then abort the runtime on
+	# an empty task stack. Run it from _process instead, on a settled frame with nothing else
+	# in flight.
+	_asset_jobs.append({"job_id": job_id, "path": path, "steps": steps})
+	set_process(true)
+	return {"ok": true, "deferred": true, "job_id": job_id, "path": path}
+
+func _run_asset_import_job(job_id: String, path: String, steps: Dictionary) -> void:
+	var job: Dictionary = _script_jobs.get(job_id, {})
+	job["state"] = "done"
+	job["finished_at"] = Time.get_ticks_msec()
+	job["failure"] = null
+	job["error"] = null
+	var filesystem := EditorInterface.get_resource_filesystem()
+	if filesystem == null:
+		job["ok"] = false
+		job["failure"] = "filesystem_unavailable"
+		job["error"] = "The editor filesystem is unavailable."
+		_script_jobs[job_id] = job
+		return
+	# A file written straight into the virtual filesystem is invisible to EditorFileSystem until
+	# it rescans: update_file() only refreshes an entry a previous scan already found, and a
+	# brand new directory was never walked at all. Without the scan there is no import metadata
+	# for reimport_files() to work from, and the asset stays unloadable while every call says ok.
+	filesystem.update_file(path)
+	if not filesystem.is_scanning():
+		filesystem.scan()
+		job["scanned"] = true
+	# reimport_files() is deliberately not called. The scan above already imports a newly seen
+	# file, and asking for a second, explicit reimport of the same path aborted this build.
+	var dock := EditorInterface.get_file_system_dock()
+	if dock != null and bool(steps.get("reveal", true)):
+		dock.navigate_to_path(path)
+		job["dock_revealed"] = true
+	job["exists"] = FileAccess.file_exists(path)
+	job["size_bytes"] = FileAccess.get_file_as_bytes(path).size() if bool(job["exists"]) else 0
+	job["ok"] = bool(job["exists"])
+	if not bool(job["ok"]):
+		job["failure"] = "asset_missing"
+		job["error"] = "Godot no longer sees %s after the import pass." % path
+	_script_jobs[job_id] = job
+
+func _op_asset_state(payload: Dictionary) -> Dictionary:
+	var path := String(payload.get("path", ""))
+	if not path.begins_with("res://"):
+		return {"ok": false, "error": "path must be a res:// path."}
+	var filesystem := EditorInterface.get_resource_filesystem()
+	var exists := FileAccess.file_exists(path)
+	return {
+		"ok": true,
+		"path": path,
+		"exists": exists,
+		"has_import": FileAccess.file_exists(path + ".import"),
+		"loadable": ResourceLoader.exists(path),
+		"scanning": filesystem != null and filesystem.is_scanning(),
+		"size_bytes": FileAccess.get_file_as_bytes(path).size() if exists else 0,
+	}
+
 func _op_selection_state() -> Dictionary:
 	var root := EditorInterface.get_edited_scene_root()
 	var nodes := []
@@ -1020,6 +1105,7 @@ var _scroll_target: float = 0.0
 ## Counted so the bridge can verify from the outside that the editor is actually giving this
 ## plugin frames, instead of an animation silently never running again.
 var _process_ticks: int = 0
+var _asset_jobs: Array = []
 
 func _open_script_for_path(path: String) -> Script:
 	var script_editor := EditorInterface.get_script_editor()
@@ -1209,6 +1295,14 @@ func _expire_stale_flash() -> void:
 func _process(delta: float) -> void:
 	_process_ticks += 1
 	var busy := false
+	if not _asset_jobs.is_empty():
+		var filesystem := EditorInterface.get_resource_filesystem()
+		if filesystem != null and filesystem.is_scanning():
+			busy = true
+		else:
+			var next: Dictionary = _asset_jobs.pop_front()
+			_run_asset_import_job(String(next["job_id"]), String(next["path"]), next["steps"])
+			busy = not _asset_jobs.is_empty()
 	if _flash_edit != null and is_instance_valid(_flash_edit):
 		_flash_alpha = maxf(_flash_alpha - delta * (FLASH_PEAK / FLASH_SECONDS), 0.0)
 		if _flash_alpha <= 0.0:

@@ -643,7 +643,7 @@ test('switching projects persists the one being left, and never replays its undo
 test('the rail names the project on screen, not only the scene', () => {
   const start = bridgeText.indexOf('// The project name, always visible.');
   assert.ok(start > 0, 'the scene inspector header must name the project');
-  const body = bridgeText.slice(start, start + 1400);
+  const body = bridgeText.slice(start, start + 2200);
   assert.match(body, /DiagnosticState\.activeProject \|\| 'none'/);
   assert.match(body, />Project</);
 });
@@ -745,4 +745,67 @@ test('the orphan check uses the lenient identity, not the throwing validator', (
   assert.match(body, /normalizeProjectIdentity\(truth\.editor_project\)/);
   assert.doesNotMatch(body, /cleanProjectName\(truth\.editor_project\)/,
     'a display name with a space must not throw while rendering the project list');
+});
+
+// ---------------------------------------------------------------------------
+// Audio: fatal wherever Godot's importer runs, in this WebAssembly build
+// ---------------------------------------------------------------------------
+
+test('audio is refused from a project with an error that says what to do instead', () => {
+  const start = bridgeText.indexOf('function validateProjectFiles');
+  const body = bridgeText.slice(start, start + 2600);
+  assert.match(body, /AUDIO_IMPORT_UNSUPPORTED/);
+  assert.match(body, /wavdata/, 'the error must name the path that works');
+  // Only audio. Images, fonts and meshes import cleanly and a project holding one reboots
+  // healthy, so widening this back to all binaries would take working assets away.
+  assert.match(bridgeText, /const AUDIO_ASSET_PATTERN = \/\\\.\(wav\|ogg\|mp3\)\$\/i;/);
+  assert.doesNotMatch(bridgeText, /BOOT_UNSAFE_ASSET_PATTERN/);
+});
+
+test('the authoring template no longer stages audio into the boot it is about to perform', () => {
+  const start = bridgeText.indexOf("name: 'godot_author_3d_runner'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_synthesize_audio_suite'", start));
+  assert.doesNotMatch(body, /activeFilesDict\[aud\.filename\]/,
+    'a .wav in the project at boot aborts the engine');
+  assert.match(body, /synthesizeSuite/);
+  assert.match(body, /audio_import_hint/);
+});
+
+test('an asset import is refused for audio, and named as the reason', () => {
+  const start = bridgeText.indexOf("name: 'godot_import_asset'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_user_focus'", start));
+  assert.match(body, /AUDIO_ASSET_PATTERN\.test\(path\)/);
+  assert.match(body, /AUDIO_IMPORT_UNSUPPORTED/);
+  assert.match(body, /godot_synthesize_audio_suite/, 'the refusal must name the route that works');
+});
+
+test('an import waits for Godot to confirm, rather than reading its own request back', () => {
+  const start = bridgeText.indexOf("name: 'godot_import_asset'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_user_focus'", start));
+  // Scanning and importing happen on a later frame, so the request's own reply cannot know.
+  assert.match(body, /await HotScriptChannel\.awaitJob\(queued\.job_id/);
+  assert.match(body, /await awaitAssetImport\(/);
+  assert.match(body, /loadable: settled\.loadable === true/);
+  assert.doesNotMatch(body, /loadable: imported\.loadable/);
+});
+
+test('an imported asset states its real lifetime', () => {
+  const start = bridgeText.indexOf("name: 'godot_import_asset'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_user_focus'", start));
+  assert.match(body, /persistence: 'project_filesystem'/);
+  assert.match(body, /survives_editor_restart: true/);
+  // The gap that is easy to miss: it is a real file, but not in the exported model.
+  assert.match(body, /included_in_export_zip: false/);
+  assert.doesNotMatch(body, /activeFilesDict\[path\]/);
+});
+
+test('the editor boot wait spends foreground-active time, not wall clock', () => {
+  const start = bridgeSource.indexOf('const bootReady = () => {');
+  assert.ok(start > 0, 'the boot readiness predicate should be named so the wait around it is auditable');
+  const window = bridgeSource.slice(start, start + 2200);
+  assert.match(window, /awaitWithActiveBudget\(bootReady, timeoutMs/);
+  assert.doesNotMatch(window, /waitFor\(bootReady/);
+  // A hidden tab is paused, not dead: the failure has to say which it was.
+  assert.match(window, /EDITOR_BOOT_TIMEOUT/);
+  assert.match(window, /foreground-active time/);
 });

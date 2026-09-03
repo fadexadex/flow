@@ -29,6 +29,21 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
+    name: 'godot_import_asset',
+    description: "Imports a binary asset - image, font, mesh - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file and survives restarts, but it lives in Godot's filesystem rather than the bridge's project model, so it is not in godot_export_zip. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav' },
+        content_base64: { type: 'string', description: 'Base64 of the raw file bytes', maxLength: 7000000 },
+        reimport: { type: 'boolean', default: true, description: 'Ask Godot to import it into a loadable resource' }
+      },
+      required: ['path', 'content_base64'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_get_user_focus',
     description: "Reports what the human is currently pointed at in the editor: which nodes they have selected, which workspace they are in, which script is open and at what line, and which scene is being edited. Use it to resolve a pronoun - \"make this taller\", \"rename that\" - instead of asking which node was meant. Reports selection_count 0 rather than guessing when nothing is selected, and is read-only: it never changes the selection or the workspace.",
     input_schema: { type: 'object', properties: {}, additionalProperties: false },
@@ -73,8 +88,15 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_synthesize_audio_suite',
-    description: 'Procedurally synthesizes the complete 6-piece 16-bit WAV sound effects suite with duration, loudness, and MIT license metadata',
-    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    description: "Procedurally synthesizes the 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to also write them into the project as .wavdata plus an sfx_library.gd that builds an AudioStreamWAV from the bytes at runtime. They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; an extension it has no importer for never reaches that code, and runtime loading behaves identically in the exported game. Reports per-file what Godot confirmed on disk.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        import_into_project: { type: 'boolean', default: false, description: 'Also write the suite into the running editor and import it' },
+        directory: { type: 'string', default: 'sfx', description: 'Project-relative folder for the imported files' }
+      },
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {

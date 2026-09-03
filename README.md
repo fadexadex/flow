@@ -119,7 +119,14 @@ This project uses an experimental Godot Web editor, which means that there are a
 - A hidden or background browser tab can throttle the Godot main loop. Keep the editor visible while it starts, stops, runs a playtest, or replaces the editor.
 - Some changes require an editor replacement. If an editor exit hangs, recovery currently requires a page reload.
 - The live mutator supports 3D scene work only. It is not a general 2D editing system.
-- There is no general asset pipeline.
+- Images, fonts and meshes import into the running editor through `godot_import_asset`. They
+  become real project files and survive restarts, but they live in Godot's filesystem rather
+  than the exported project model, so they are not included in `godot_export_zip`.
+- Audio cannot be imported. Godot's WAV importer aborts this WebAssembly build of the editor,
+  with no recovery. `godot_synthesize_audio_suite` instead writes the samples as `.wavdata`
+  next to an `sfx_library.gd` that builds an `AudioStreamWAV` from the bytes at runtime, which
+  plays identically in the exported game. `.wav`, `.ogg` and `.mp3` are refused with an error
+  that names this route.
 - `godot_connect_signal_live`, `godot_resize_gizmo_live`, `godot_live_code_diff`, `godot_hot_reload_property`, and `godot_switch_mode` are deliberate stubs. They report that they are unsupported. They do not claim success.
 - Netlify, Vercel, and the Node server use manually synchronized configuration and tool catalog data.
 
