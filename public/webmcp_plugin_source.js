@@ -122,6 +122,9 @@ func _on_command(args: Array) -> String:
 		"viewport_api": reply = _op_viewport_api(payload)
 		"node_add": reply = _op_node_add(payload)
 		"node_body": reply = _op_node_body(payload)
+		"workspace_set": reply = _op_workspace_set(payload)
+		"signal_connect": reply = _op_signal_connect(payload)
+		"node_set_property": reply = _op_node_set_property(payload)
 		"node_instance": reply = _op_node_instance(payload)
 		"node_transform": reply = _op_node_transform(payload)
 		"node_material": reply = _op_node_material(payload)
@@ -1132,6 +1135,147 @@ func _op_node_instance(payload: Dictionary) -> Dictionary:
 ## The whole subtree is built OUTSIDE the tree and added in one undo action. Recording each
 ## add_child as its own do-method looks equivalent and is not: undo removes only the body, so
 ## redo would re-parent a child that still has a parent and corrupt the scene tree.
+## Switch the visible main-screen editor. _select_main_screen reads back what is actually
+## showing rather than echoing the request, so a switch that did not take is visible.
+func _op_workspace_set(payload: Dictionary) -> Dictionary:
+	var wanted := String(payload.get("workspace", ""))
+	if not MAIN_SCREEN_HINTS.has(wanted):
+		return {"ok": false, "error": "Unknown workspace '%s'. Valid: %s" % [wanted, ", ".join(MAIN_SCREEN_HINTS.keys())]}
+	var reply := _select_main_screen(wanted)
+	reply["ok"] = true
+	return reply
+
+## Connect a signal on the live scene tree, through the editor undo stack.
+##
+## The connection is made on the running scene AND written into the .tscn by the JS side, so
+## the human sees it in the Node dock and the file records it. A method that does not exist on
+## the target is refused here: Godot would accept the connection and then warn at load, which
+## is a failure nobody reads.
+func _op_signal_connect(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var from := _resolve_node(String(payload.get("from_node", "")))
+	if from == null:
+		return _resolve_error(String(payload.get("from_node", "")))
+	var to := _resolve_node(String(payload.get("to_node", ".")))
+	if to == null:
+		return _resolve_error(String(payload.get("to_node", ".")))
+	var signal_name := String(payload.get("signal", ""))
+	var method_name := String(payload.get("method", ""))
+	if signal_name == "" or method_name == "":
+		return {"ok": false, "error": "signal_connect requires both signal and method."}
+	if not from.has_signal(signal_name):
+		var available := []
+		for entry in from.get_signal_list():
+			available.append(String(entry.get("name", "")))
+		return {"ok": false, "error": "%s has no signal '%s'." % [from.get_class(), signal_name], "available_signals": available}
+	if not to.has_method(method_name):
+		var script_path := ""
+		var script = to.get_script()
+		if script != null and script is Resource:
+			script_path = (script as Resource).resource_path
+		return {
+			"ok": false,
+			"error": "%s has no method '%s'. Add it to the attached script first." % [String(to.name), method_name],
+			"target_script": script_path,
+		}
+	if from.is_connected(signal_name, Callable(to, method_name)):
+		return {"ok": true, "already_connected": true, "from": String(root.get_path_to(from)), "to": String(root.get_path_to(to)), "signal": signal_name, "method": method_name}
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: connect %s.%s" % [String(from.name), signal_name], UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(from, "connect", signal_name, Callable(to, method_name))
+	undo.add_undo_method(from, "disconnect", signal_name, Callable(to, method_name))
+	undo.commit_action()
+	return {
+		"ok": true,
+		"already_connected": false,
+		"from": String(root.get_path_to(from)),
+		"to": String(root.get_path_to(to)),
+		"signal": signal_name,
+		"method": method_name,
+		"connected": from.is_connected(signal_name, Callable(to, method_name)),
+	}
+
+## Set one property on a scene node, through the undo stack, and read it back.
+##
+## Primitives only in this version. A property that wants a Resource - a Mesh, a Material - is
+## refused by name rather than set to something that looks right and is not.
+func _op_node_set_property(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node == null:
+		return _resolve_error(String(payload.get("node_path", "")))
+	var property := String(payload.get("property", ""))
+	if property == "":
+		return {"ok": false, "error": "node_set_property requires a property name."}
+	var found := false
+	var expected_type := TYPE_NIL
+	for entry in node.get_property_list():
+		if String(entry.get("name", "")) == property:
+			found = true
+			expected_type = int(entry.get("type", TYPE_NIL))
+			break
+	if not found:
+		return {"ok": false, "error": "%s has no property '%s'." % [node.get_class(), property]}
+	if expected_type == TYPE_OBJECT:
+		return {"ok": false, "error": "'%s' holds a resource, which this tool does not set. Use godot_node_material for materials, or godot_node_instance for a scene." % property}
+	var raw = payload.get("value")
+	var value = _coerce_property_value(raw, expected_type)
+	if value == null and raw != null:
+		return {"ok": false, "error": "Cannot use the given value for '%s' (expects %s)." % [property, type_string(expected_type)]}
+	var previous = node.get(property)
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: set %s.%s" % [String(node.name), property], UndoRedo.MERGE_DISABLE, node)
+	undo.add_do_property(node, property, value)
+	undo.add_undo_property(node, property, previous)
+	undo.commit_action()
+	# Read back from the node, not from the request.
+	var observed = node.get(property)
+	return {
+		"ok": true,
+		"node_path": String(root.get_path_to(node)),
+		"property": property,
+		"expected_type": type_string(expected_type),
+		"previous": _json_safe(previous),
+		"observed": _json_safe(observed),
+		"applied": _json_safe(observed) == _json_safe(value),
+	}
+
+func _coerce_property_value(raw: Variant, expected_type: int) -> Variant:
+	match expected_type:
+		TYPE_BOOL:
+			return bool(raw)
+		TYPE_INT:
+			return int(raw)
+		TYPE_FLOAT:
+			return float(raw)
+		TYPE_STRING, TYPE_STRING_NAME:
+			return String(raw)
+		TYPE_VECTOR2:
+			var v2 := _vector3(raw, Vector3.ZERO)
+			return Vector2(v2.x, v2.y)
+		TYPE_VECTOR3:
+			return _vector3(raw, Vector3.ZERO)
+		TYPE_COLOR:
+			return _color(raw, Color.WHITE)
+	return null
+
+func _json_safe(value: Variant) -> Variant:
+	match typeof(value):
+		TYPE_VECTOR2:
+			return [(value as Vector2).x, (value as Vector2).y]
+		TYPE_VECTOR3:
+			return [(value as Vector3).x, (value as Vector3).y, (value as Vector3).z]
+		TYPE_COLOR:
+			var c := value as Color
+			return [c.r, c.g, c.b, c.a]
+		TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_STRING, TYPE_NIL:
+			return value
+	return str(value)
+
 func _op_node_body(payload: Dictionary) -> Dictionary:
 	var root := EditorInterface.get_edited_scene_root()
 	if root == null:

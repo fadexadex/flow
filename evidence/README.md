@@ -114,3 +114,24 @@ y=13 to **y=1.09** — each exactly its half-extent above the floor's top face �
 
 (The 6 project errors in that run are the probe script calling `get_colliding_bodies()` without
 `contact_monitor` enabled. The tool's own calls produced none.)
+
+## phase-3-tools
+
+The five tools that reported "unsupported": three made real, two retired. The catalog no longer
+contains a stub.
+
+| File | Shows |
+| ---- | ----- |
+| `stub-tools-proof.png` | workspace switching, property setting with read-back, and a connected signal firing in the running game |
+
+- `godot_switch_mode` switches 2D / Script / 3D and confirms each by reading back the visible
+  editor control (`@CanvasItemEditor@`, `@ScriptEditor@`, `@Node3DEditor@`).
+- `godot_connect_signal_live` refuses a missing handler (*"OrbitalSanctuary has no method
+  '_on_nothing'"*) and a missing signal (*"Area3D has no signal 'not_a_signal'"*), then makes
+  the real connection: editor-confirmed, `source_synced: true`, `[connection]` written at the
+  end of the scene text, and **the running game logs `gate entered by BotanistPlayer total=1`**.
+- `godot_node_set_property` sets `light_energy` 1.8 → 4.5, a colour and a bool, each read back
+  off the node; refuses a resource-valued property and an unknown name by name.
+
+Fixed along the way: a rejection from the editor was being reported as *"not connected to an
+acknowledged Godot Editor command channel"* — which was not true, and hid the actual reason.

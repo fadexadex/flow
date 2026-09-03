@@ -45,6 +45,7 @@ FLow can:
 - Apply revision-checked file transactions and text patches.
 - Update eligible GDScript files without replacing the editor.
 - Add, transform, recolor, and delete supported 3D nodes through Godot editor commands.
+- Set node properties and connect signals on the live scene, through Godot's own undo stack.
 - Add physics bodies with collision shapes: static level geometry, simulated rigid bodies,
   character bodies, and trigger volumes.
 - Import images, fonts, and glTF models into the running editor, and place an imported model
@@ -120,7 +121,7 @@ result, instead of guessing at timings.
 
 ## Tool catalog
 
-57 tools, all prefixed `godot_`. The live catalog with full schemas is at `/api/mcp/tools`.
+55 tools, all prefixed `godot_`. None of them is a stub: every tool either does the thing or says why it could not. The live catalog with full schemas is at `/api/mcp/tools`.
 
 | Group | Tools |
 | ----- | ----- |
@@ -129,11 +130,10 @@ result, instead of guessing at timings.
 | Project uploads | `begin_project_upload`, `upload_project_file_chunk`, `upload_project_chunk_batch`, `get_project_upload_status`, `commit_project_upload`, `abort_project_upload` |
 | Files and scenes | `inspect_project_files`, `inspect_scene_graph`, `apply_file_transaction`, `apply_script_patch`, `apply_text_patch`, `undo_transaction`, `open_scene` |
 | Assets and audio | `import_asset`, `synthesize_audio_suite`, `generate_audio_fx` |
-| Live 3D editing | `node_spawn`, `node_body`, `node_instance`, `node_transform`, `node_material`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live` |
-| Camera and navigation | `camera_focus`, `camera_follow`, `workspace_follow` |
+| Live 3D editing | `node_spawn`, `node_body`, `node_instance`, `node_transform`, `node_material`, `node_set_property`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live`, `connect_signal_live` |
+| Camera and navigation | `camera_focus`, `camera_follow`, `workspace_follow`, `switch_mode` |
 | Running the game | `run_game`, `stop_game`, `send_input`, `send_input_sequence`, `get_input_sequence_status`, `send_pointer`, `get_game_telemetry`, `semantic_playtest_step` |
 | Capture | `capture_viewport`, `start_recording`, `stop_recording`, `list_recordings` |
-| Unsupported stubs | `connect_signal_live`, `resize_gizmo_live`, `live_code_diff`, `hot_reload_property`, `switch_mode` |
 
 ## State and persistence
 
@@ -213,9 +213,12 @@ than reporting success.
   GDScript restart the editor process. If an exit hangs, recovery needs a page reload; the
   project is safe in storage.
 - **The live mutator is 3D only.** It is not a general 2D editing system.
-- **`godot_connect_signal_live`, `godot_resize_gizmo_live`, `godot_live_code_diff`,
-  `godot_hot_reload_property`, and `godot_switch_mode` are deliberate stubs.** They report that
-  they are unsupported. They do not claim success.
+- **A property set live in the editor is not written into the scene file.**
+  `godot_node_set_property` changes the node in the running editor and reports `persisted:
+  false`; a transaction or a scene save is what makes it durable.
+- **Runtime property injection is not offered.** The playtest runs in a second engine with its
+  own filesystem, and there is no honest channel into it. A project that wants to be steered
+  while running should emit and accept its own telemetry, as the worked example does.
 - **Netlify, Vercel, and the Node server use manually synchronized configuration** and tool
   catalog data. `npm test` fails if the catalogs drift.
 

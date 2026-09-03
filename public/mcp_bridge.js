@@ -1738,6 +1738,19 @@
     throw error;
   }
 
+  // Two different failures, and conflating them tells the caller something false. A missing
+  // plugin is "no channel"; a channel that answered with a reason is a rejection, and prefixing
+  // it with "not connected to an acknowledged command channel" hid the actual reason behind a
+  // sentence that was not true.
+  function editorRejection(operation, reply, noChannelHint) {
+    if (reply?.unsupported) unsupportedEditorOperation(operation, noChannelHint);
+    const error = new Error(reply?.error || `${operation} was rejected by the Godot editor.`);
+    error.code = reply?.code || 'EDITOR_COMMAND_REJECTED';
+    if (reply?.candidates) error.candidates = reply.candidates;
+    if (reply?.available_signals) error.available_signals = reply.available_signals;
+    throw error;
+  }
+
   function recentGodotErrors(sinceTime) {
     // The web editor emits platform-level `ERROR:` diagnostics for unsupported
     // debugger sockets and Emscripten blocking warnings even when a project is
@@ -6339,34 +6352,47 @@
     {
       definition: {
         name: 'godot_connect_signal_live',
-        description: 'Requests a native Godot signal connection. Fails explicitly without editor acknowledgement; source-backed scene edits remain available.',
-        input_schema: { type: 'object', properties: { from_node: { type: 'string' }, signal: { type: 'string' }, to_node: { type: 'string' } }, additionalProperties: false },
+        description: "Connects a signal on the live scene - Area3D body_entered to a handler, Timer timeout to a callback - through Godot's own undo stack, and records it in the scene source as a [connection] entry. The target method must already exist on the receiving node's script: a connection to a missing method is refused by name here, because Godot would accept it and then only warn at load. Applied without restarting the editor.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            from_node: { type: 'string', description: 'Node emitting the signal' },
+            signal: { type: 'string', description: 'Signal name, for example body_entered' },
+            to_node: { type: 'string', default: '.', description: 'Node whose script has the handler (defaults to the scene root)' },
+            method: { type: 'string', description: 'Method on to_node to call' }
+          },
+          required: ['from_node', 'signal', 'method'],
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Live signal connection', 'Use godot_apply_file_transaction to add an acknowledged [connection] entry to the .tscn source.');
-      }
-    },
-    {
-      definition: {
-        name: 'godot_resize_gizmo_live',
-        description: 'Requests a native collision-gizmo resize. Fails explicitly without editor acknowledgement; source-backed shape edits remain available.',
-        input_schema: { type: 'object', properties: { node_path: { type: 'string' }, radius: { type: 'number' } }, additionalProperties: false },
-        annotations: { readOnlyHint: false, untrustedContentHint: false }
-      },
-      handler: async (args = {}) => {
-        unsupportedEditorOperation('Live gizmo resize', 'Use godot_apply_file_transaction to edit the shape resource in scene source.');
-      }
-    },
-    {
-      definition: {
-        name: 'godot_live_code_diff',
-        description: 'Legacy code-diff request. Fails explicitly because free-form diffs are not safely acknowledged; use revision-checked file transactions.',
-        input_schema: { type: 'object', properties: { script_path: { type: 'string' }, diff: { type: 'string' } }, additionalProperties: false },
-        annotations: { readOnlyHint: false, untrustedContentHint: false }
-      },
-      handler: async (args = {}) => {
-        unsupportedEditorOperation('Legacy code diff', 'Use godot_apply_file_transaction with expected_revision and complete replacement content.');
+        const toNode = args.to_node || '.';
+        const res = await liveMutateSceneFile((source, commandReply) => {
+          const from = commandReply?.from || args.from_node;
+          const to = commandReply?.to || toNode;
+          const line = `[connection signal="${args.signal}" from="${from}" to="${to}" method="${args.method}"]`;
+          if (source.includes(line)) return source;
+          // [connection] entries belong AFTER every [node] block, so this appends rather than
+          // reusing the insert-before-first-node path the sub-resources take.
+          return `${source.replace(/\n+$/, '')}\n\n${line}\n`;
+        }, {
+          command: { op: 'signal_connect', payload: { from_node: args.from_node, signal: args.signal, to_node: toNode, method: args.method } },
+          verify: (source, reply) => {
+            const line = `[connection signal="${args.signal}" from="${reply?.from || args.from_node}" to="${reply?.to || toNode}" method="${args.method}"]`;
+            return source.includes(line)
+              ? { synced: true, reason: 'connection_recorded' }
+              : { synced: false, mismatch: `The scene text does not contain ${line}` };
+          }
+        });
+        return liveMutationResult(res, {
+          from_node: res.commandReply?.from || args.from_node,
+          to_node: res.commandReply?.to || toNode,
+          signal: args.signal,
+          method: args.method,
+          already_connected: res.commandReply?.already_connected === true,
+          editor_confirmed: res.commandReply?.connected === true || res.commandReply?.already_connected === true
+        });
       }
     },
     {
@@ -6415,12 +6441,23 @@
     {
       definition: {
         name: 'godot_switch_mode',
-        description: 'Requests a native Godot workspace switch. Fails explicitly when no acknowledged editor command channel is installed.',
-        input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game'] } }, additionalProperties: false },
+        description: "Switches the visible Godot main-screen workspace. Reports which workspace the editor is actually showing afterwards, read back from the visible editor control, rather than echoing the request - a switch that did not take says so.",
+        input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game', 'AssetLib'], description: 'Which main-screen editor to show' } }, required: ['mode'], additionalProperties: false },
         annotations: { readOnlyHint: false, untrustedContentHint: false }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Godot workspace switch', 'Game viewport switching is supported by godot_run_game and godot_stop_game.');
+        const reply = EditorCommandChannel.call('workspace_set', { workspace: args.mode });
+        if (!reply.ok) {
+          editorRejection('Godot workspace switch', reply, 'The WebMCP editor plugin is not loaded in this project.');
+        }
+        return {
+          success: true,
+          requested: args.mode,
+          // What the editor is showing, not what was asked for.
+          workspace_control: reply.workspace_control || null,
+          workspace_confirmed: reply.workspace_confirmed,
+          editor_channel: 'command'
+        };
       }
     },
     {
@@ -6445,13 +6482,42 @@
     },
     {
       definition: {
-        name: 'godot_hot_reload_property',
-        description: 'Legacy hot-reload request. Fails explicitly because property-only patches cannot be applied safely without file and revision context.',
-        input_schema: { type: 'object', properties: { property_name: { type: 'string' }, value: {} }, additionalProperties: false },
+        name: 'godot_node_set_property',
+        description: "Sets one property on a node in the edited scene - light energy, camera fov, a body's mass, gravity_scale, visible - through Godot's own undo stack, and reads the value back from the node afterwards. Primitives, Vector2/Vector3 and Color only: a property that holds a resource is refused by name, because setting one blind is how a scene ends up looking right and being wrong. Use godot_node_material for materials and godot_node_transform for position, rotation and scale. This edits the EDITOR scene; it does not reach into a running game.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            node_path: { type: 'string', description: 'Path or name of the node' },
+            property: { type: 'string', description: 'Property name as Godot spells it, for example light_energy' },
+            value: { description: 'Number, boolean, string, [x, y], [x, y, z], or a #rrggbb colour' }
+          },
+          required: ['node_path', 'property'],
+          additionalProperties: false
+        },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        unsupportedEditorOperation('Legacy property hot reload', 'Use godot_inspect_project_files followed by godot_apply_file_transaction.');
+        const reply = EditorCommandChannel.call('node_set_property', {
+          node_path: args.node_path, property: args.property, value: args.value
+        });
+        if (!reply.ok) {
+          editorRejection('Set node property', reply, 'The WebMCP editor plugin is not loaded in this project.');
+        }
+        return {
+          success: true,
+          node_path: reply.node_path,
+          property: reply.property,
+          expected_type: reply.expected_type,
+          previous: reply.previous,
+          // Read back off the node. `applied` false means Godot took the assignment and kept
+          // something else - a clamp, or a setter with its own opinion.
+          observed: reply.observed,
+          applied: reply.applied === true,
+          editor_channel: 'command',
+          // Live in the editor only: this is not written into the .tscn, so a transaction or a
+          // scene save is what makes it durable.
+          persisted: false
+        };
       }
     },
     {
@@ -8035,6 +8101,9 @@
         godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
         godot_node_instance: `Placing ${input.name || 'model'} from ${String(input.scene_path || '').split('/').pop() || 'a scene'}`,
         godot_node_body: `Adding ${input.name || 'body'} (${input.body_type || 'static'} ${input.mesh_type || 'box'})`,
+        godot_switch_mode: `Switching to the ${input.mode || '3D'} workspace`,
+        godot_connect_signal_live: `Connecting ${input.from_node || 'node'}.${input.signal || 'signal'} to ${input.method || 'a handler'}`,
+        godot_node_set_property: `Setting ${input.node_path || 'node'}.${input.property || 'property'}`,
         godot_node_transform: `Transforming ${input.node_path || 'node'}`,
         godot_node_material: `Recolouring ${input.node_path || 'node'}`,
         godot_node_delete: `Deleting ${input.node_path || 'node'}`

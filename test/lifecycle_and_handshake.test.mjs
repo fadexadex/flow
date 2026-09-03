@@ -937,3 +937,61 @@ test('godot_node_spawn says out loud that it makes nothing solid', () => {
   assert.match(body, /no collision/);
   assert.match(body, /godot_node_body/);
 });
+
+// ---------------------------------------------------------------------------
+// The stub tools: made real, or retired. No tool may report "unsupported" now.
+// ---------------------------------------------------------------------------
+
+test('no tool in the catalog is a stub', () => {
+  // unsupportedEditorOperation survives only as a FALLBACK inside tools that first try the
+  // channel — never as the whole body of a handler.
+  const unconditional = /handler: async \([^)]*\) => \{\s*unsupportedEditorOperation\(/g;
+  assert.equal((bridgeText.match(unconditional) || []).length, 0);
+  for (const gone of ['godot_resize_gizmo_live', 'godot_live_code_diff', 'godot_hot_reload_property']) {
+    assert.ok(!bridgeText.includes(`name: '${gone}'`), `${gone} should be retired, not left reporting unsupported`);
+  }
+});
+
+test('switch_mode reports the workspace the editor is showing, not the one asked for', () => {
+  const start = bridgeText.indexOf("name: 'godot_switch_mode'");
+  const body = bridgeText.slice(start, start + 1600);
+  assert.match(body, /workspace_confirmed: reply\.workspace_confirmed/);
+  assert.match(body, /workspace_control: reply\.workspace_control/);
+  assert.match(body, /enum: \['2D', '3D', 'Script', 'Game', 'AssetLib'\]/);
+});
+
+test('a signal connection is refused when the handler does not exist', () => {
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  const at = plugin.indexOf('func _op_signal_connect');
+  const body = plugin.slice(at, at + 2600);
+  // Godot would accept the connection and warn at load; a warning nobody reads is not a result.
+  assert.match(body, /if not to\.has_method\(method_name\)/);
+  assert.match(body, /has no method/);
+  assert.match(body, /undo\.add_undo_method\(from, "disconnect"/);
+  // [connection] entries must land after every [node] block.
+  const tool = bridgeText.slice(bridgeText.indexOf("name: 'godot_connect_signal_live'"), bridgeText.indexOf("name: 'godot_connect_signal_live'") + 3000);
+  assert.match(tool, /\[connection\] entries belong AFTER every \[node\] block/);
+});
+
+test('setting a property reads the value back off the node', () => {
+  const start = bridgeText.indexOf("name: 'godot_node_set_property'");
+  const body = bridgeText.slice(start, start + 2600);
+  assert.match(body, /observed: reply\.observed/);
+  assert.match(body, /applied: reply\.applied === true/);
+  // A live editor property is not in the .tscn until something saves it.
+  assert.match(body, /persisted: false/);
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  const op = plugin.slice(plugin.indexOf('func _op_node_set_property'), plugin.indexOf('func _coerce_property_value'));
+  assert.match(op, /if expected_type == TYPE_OBJECT/, 'resource-valued properties must be refused');
+  assert.match(op, /var observed = node\.get\(property\)/);
+});
+
+test('an editor rejection is not reported as a missing command channel', () => {
+  const at = bridgeText.indexOf('function editorRejection');
+  assert.ok(at > 0);
+  const body = bridgeText.slice(at, at + 800);
+  // Only a genuinely absent plugin gets the "no channel" wording.
+  assert.match(body, /if \(reply\?\.unsupported\) unsupportedEditorOperation/);
+  assert.match(body, /EDITOR_COMMAND_REJECTED/);
+  assert.match(body, /reply\?\.error \|\|/);
+});

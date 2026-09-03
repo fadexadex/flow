@@ -345,20 +345,18 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_connect_signal_live',
-    description: 'Requests a native Godot signal connection and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { from_node: { type: 'string' }, signal: { type: 'string' }, to_node: { type: 'string' } }, additionalProperties: false },
-    annotations: { readOnlyHint: false, untrustedContentHint: false }
-  },
-  {
-    name: 'godot_resize_gizmo_live',
-    description: 'Requests a native collision-gizmo resize and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { node_path: { type: 'string' }, radius: { type: 'number' } }, additionalProperties: false },
-    annotations: { readOnlyHint: false, untrustedContentHint: false }
-  },
-  {
-    name: 'godot_live_code_diff',
-    description: 'Legacy diff request that fails explicitly; use revision-checked file transactions',
-    input_schema: { type: 'object', properties: { script_path: { type: 'string' }, diff: { type: 'string' } }, additionalProperties: false },
+    description: "Connects a signal on the live scene - Area3D body_entered to a handler, Timer timeout to a callback - through Godot's own undo stack, and records it in the scene source as a [connection] entry. The target method must already exist on the receiving node's script: a connection to a missing method is refused by name here, because Godot would accept it and then only warn at load. Applied without restarting the editor.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        from_node: { type: 'string', description: 'Node emitting the signal' },
+        signal: { type: 'string', description: 'Signal name, for example body_entered' },
+        to_node: { type: 'string', default: '.', description: 'Node whose script has the handler (defaults to the scene root)' },
+        method: { type: 'string', description: 'Method on to_node to call' }
+      },
+      required: ['from_node', 'signal', 'method'],
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -375,8 +373,8 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_switch_mode',
-    description: 'Requests a native Godot workspace switch and fails explicitly without editor acknowledgement',
-    input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game'] } }, additionalProperties: false },
+    description: "Switches the visible Godot main-screen workspace. Reports which workspace the editor is actually showing afterwards, read back from the visible editor control, rather than echoing the request - a switch that did not take says so.",
+    input_schema: { type: 'object', properties: { mode: { type: 'string', enum: ['2D', '3D', 'Script', 'Game', 'AssetLib'], description: 'Which main-screen editor to show' } }, required: ['mode'], additionalProperties: false },
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
@@ -386,9 +384,18 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: false }
   },
   {
-    name: 'godot_hot_reload_property',
-    description: 'Legacy property hot reload that fails explicitly; use revision-checked file transactions',
-    input_schema: { type: 'object', properties: { property_name: { type: 'string' }, value: {} }, additionalProperties: false },
+    name: 'godot_node_set_property',
+    description: "Sets one property on a node in the edited scene - light energy, camera fov, a body's mass, gravity_scale, visible - through Godot's own undo stack, and reads the value back from the node afterwards. Primitives, Vector2/Vector3 and Color only: a property that holds a resource is refused by name, because setting one blind is how a scene ends up looking right and being wrong. Use godot_node_material for materials and godot_node_transform for position, rotation and scale. This edits the EDITOR scene; it does not reach into a running game.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        node_path: { type: 'string', description: 'Path or name of the node' },
+        property: { type: 'string', description: 'Property name as Godot spells it, for example light_energy' },
+        value: { description: 'Number, boolean, string, [x, y], [x, y, z], or a #rrggbb colour' }
+      },
+      required: ['node_path', 'property'],
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
