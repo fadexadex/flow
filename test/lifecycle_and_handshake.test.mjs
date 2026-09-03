@@ -748,18 +748,36 @@ test('the orphan check uses the lenient identity, not the throwing validator', (
 });
 
 // ---------------------------------------------------------------------------
-// Audio: fatal wherever Godot's importer runs, in this WebAssembly build
+// Audio: an ordinary asset again, once the editor stopped booting on a Dummy driver
 // ---------------------------------------------------------------------------
 
-test('audio is refused from a project with an error that says what to do instead', () => {
-  const start = bridgeText.indexOf('function validateProjectFiles');
-  const body = bridgeText.slice(start, start + 2600);
-  assert.match(body, /AUDIO_IMPORT_UNSUPPORTED/);
-  assert.match(body, /wavdata/, 'the error must name the path that works');
-  // Only audio. Images, fonts and meshes import cleanly and a project holding one reboots
-  // healthy, so widening this back to all binaries would take working assets away.
-  assert.match(bridgeText, /const AUDIO_ASSET_PATTERN = \/\\\.\(wav\|ogg\|mp3\)\$\/i;/);
-  assert.doesNotMatch(bridgeText, /BOOT_UNSAFE_ASSET_PATTERN/);
+test('the editor boots on a real audio driver, because Dummy is what broke audio import', () => {
+  assert.match(bridgeText, /const EDITOR_AUDIO_DRIVER = 'AudioWorklet';/);
+  const at = bridgeText.indexOf("const EDITOR_AUDIO_DRIVER");
+  const note = bridgeText.slice(Math.max(0, at - 900), at);
+  // The reason has to survive in the code, or the flag gets 'optimised' back one day.
+  assert.match(note, /zero-length\s*\n?\s*\/\/ preview|zero-length preview/);
+  assert.match(note, /aborts the WebAssembly runtime/);
+});
+
+test('audio is no longer refused anywhere', () => {
+  assert.doesNotMatch(bridgeText, /AUDIO_IMPORT_UNSUPPORTED/);
+  assert.doesNotMatch(bridgeText, /AUDIO_ASSET_PATTERN/);
+  const validate = bridgeText.slice(bridgeText.indexOf('function validateProjectFiles'), bridgeText.indexOf('function validateProjectFiles') + 2000);
+  assert.doesNotMatch(validate, /wav\|ogg\|mp3/);
+});
+
+test('the sound suite ships real .wav files and confirms each with Godot', () => {
+  const start = bridgeText.indexOf("name: 'godot_synthesize_audio_suite'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_semantic_playtest_step'", start));
+  assert.match(body, /\$\{asset\.name\}\.wav`/);
+  // No path in the tool may still write the old sidecar extension.
+  assert.doesNotMatch(body, /\.wavdata`/);
+  // The only surviving mention is the note recording what changed and why.
+  assert.equal((bridgeText.match(/wavdata/g) || []).length, 1);
+  // imported_ok counts what Godot said it could load, not what we wrote.
+  assert.match(body, /await awaitAssetImport\(entry\.path/);
+  assert.match(body, /imported\.filter\(entry => entry\.loadable === true\)/);
 });
 
 test('the authoring template no longer stages audio into the boot it is about to perform', () => {
@@ -769,14 +787,6 @@ test('the authoring template no longer stages audio into the boot it is about to
     'a .wav in the project at boot aborts the engine');
   assert.match(body, /synthesizeSuite/);
   assert.match(body, /audio_import_hint/);
-});
-
-test('an asset import is refused for audio, and named as the reason', () => {
-  const start = bridgeText.indexOf("name: 'godot_import_asset'");
-  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_get_user_focus'", start));
-  assert.match(body, /AUDIO_ASSET_PATTERN\.test\(path\)/);
-  assert.match(body, /AUDIO_IMPORT_UNSUPPORTED/);
-  assert.match(body, /godot_synthesize_audio_suite/, 'the refusal must name the route that works');
 });
 
 test('an import waits for Godot to confirm, rather than reading its own request back', () => {

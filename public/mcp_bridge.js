@@ -1247,11 +1247,6 @@
     return { files: normalized, repairs, repairedPaths };
   }
 
-  // Narrowed from "all binary" by experiment. Images, fonts and meshes import cleanly, both
-  // live and during a boot scan: a project holding an imported PNG reopens healthy. Audio does
-  // not - Godot's WAV import aborts this WebAssembly build wherever it runs, so audio is the
-  // one family that never reaches the importer. See AUDIO_ASSET_PATTERN's note.
-  const AUDIO_ASSET_PATTERN = /\.(wav|ogg|mp3)$/i;
 
   function validateProjectFiles(files) {
     const entries = Object.entries(files);
@@ -1263,17 +1258,6 @@
       if (filePath !== rawPath) throw new Error(`Project paths must be normalized before commit: ${rawPath}`);
       if (!(typeof content === 'string' || content instanceof Uint8Array || content instanceof ArrayBuffer)) {
         throw new Error(`Unsupported content type for ${filePath}. Use text or binary bytes.`);
-      }
-      // Godot's WAV importer aborts this WebAssembly build - the runtime traps in
-      // ProgressDialog on an empty task stack and the editor goes black with no recovery.
-      // It happens at boot and equally on a live scan, so the file simply never reaches the
-      // importer. Refusing here turns an unrecoverable abort into an error that says what to
-      // do instead; godot_synthesize_audio_suite writes the same samples as .wavdata, which
-      // Godot has no importer for, and loads them as AudioStreamWAV at runtime.
-      if (AUDIO_ASSET_PATTERN.test(filePath)) {
-        const error = new Error(`${filePath} cannot be added to a project: Godot's audio import aborts this WebAssembly build of the editor. Ship the samples as .wavdata and build an AudioStreamWAV at runtime - godot_synthesize_audio_suite does exactly that.`);
-        error.code = 'AUDIO_IMPORT_UNSUPPORTED';
-        throw error;
       }
       const size = typeof content === 'string' ? new TextEncoder().encode(content).byteLength : content.byteLength;
       if (size > 5 * 1024 * 1024) throw new Error(`File exceeds the 5 MB limit: ${filePath}`);
@@ -1529,6 +1513,19 @@
   }
 
 
+  // 'Dummy' here is what made audio impossible, and it was ours, not Godot's.
+  //
+  // The editor was booted with --audio-driver Dummy so an editor AudioContext could not race
+  // the game's. The cost was invisible and large: Godot's audio import generates a waveform
+  // preview by mixing the stream through AudioServer, a Dummy driver returns a zero-length
+  // preview, and the editor then indexes it at -1 and aborts the WebAssembly runtime. Every
+  // "Godot cannot import audio in this build" conclusion traced back to this one flag.
+  //
+  // Measured with 'AudioWorklet': a .wav imports, appears in the FileSystem dock, is loadable,
+  // and a project holding one boots clean - the exact case that used to abort. Valid values
+  // are the three Godot names: AudioWorklet, ScriptProcessor, Dummy.
+  const EDITOR_AUDIO_DRIVER = 'AudioWorklet';
+
   async function restartEditorWithProject(files, projectName = DiagnosticState.activeProject, timeoutMs = 60000, operation = null) {
     if (typeof window === 'undefined' || typeof window.startEditor !== 'function') {
       throw new Error('Godot editor bootstrap is unavailable.');
@@ -1627,10 +1624,10 @@
     const onFailed = (event) => { failureMessage = event?.detail?.message || 'Godot editor failed to initialize.'; };
     window.addEventListener('godot-engine-ready', onReady, { once: true });
     window.addEventListener('godot-engine-failed', onFailed, { once: true });
-    // The editor and game share one generated Web audio module. Giving the
-    // editor a real AudioContext can race game teardown/restart and invalidate
-    // the next AudioWorkletNode. Authoring itself does not need audio output.
-    window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor', '--audio-driver', 'Dummy']);
+    // See EDITOR_AUDIO_DRIVER. Overridable so a session can put the old driver back without
+    // editing this file, and so the driver is visible in a bug report.
+    const audioDriver = (typeof window !== 'undefined' && window.__webmcpEditorAudioDriver) || EDITOR_AUDIO_DRIVER;
+    window.startEditor(null, ['--path', `/home/web_user/projects/${projectName}`, '--editor', '--audio-driver', audioDriver]);
     // Booting is frame-work: the engine only makes progress while the page is actually
     // painting. Spending a wall-clock budget declares a hidden or throttled tab dead when it
     // is merely paused, so the boot wait spends the same foreground-active budget the exit
@@ -2261,56 +2258,31 @@
   // stray backtick or backslash in an edit cannot silently change what ships.
   const SFX_LIBRARY_SOURCE = [
     "extends Node",
-    "## Runtime sample loader for the WebMCP audio suite.",
+    "## Convenience wrapper over the imported sound suite.",
     "##",
-    "## The samples ship as .wavdata rather than .wav on purpose: Godot's WAV importer aborts the",
-    "## WebAssembly build of the editor, and an extension it has no importer for never reaches that",
-    "## code. The bytes are an ordinary 16-bit PCM RIFF file, parsed here and handed to",
-    "## AudioStreamWAV, which needs no import step at all.",
+    "## The samples are ordinary imported .wav resources, so load() returns an AudioStreamWAV and",
+    "## nothing here has to parse anything. This exists only so a caller can say",
+    "## SfxLibrary.play(self, \"energy_pickup\") instead of wiring a player by hand.",
     "",
     "const SUITE_DIR := \"res://sfx\"",
     "",
-    "static func load_stream(path: String) -> AudioStreamWAV:",
-    "\tvar bytes := FileAccess.get_file_as_bytes(path)",
-    "\tif bytes.size() < 44:",
-    "\t\tpush_error(\"Sample is too small to be a RIFF file: \" + path)",
+    "static func load_stream(path: String) -> AudioStream:",
+    "\tif not ResourceLoader.exists(path):",
+    "\t\tpush_error(\"No sample at \" + path)",
     "\t\treturn null",
-    "\tvar mix_rate := bytes.decode_u32(24)",
-    "\tvar channels := bytes.decode_u16(22)",
-    "\tvar bits := bytes.decode_u16(34)",
-    "\t# Walk the chunk list rather than assuming data starts at 44: some writers add chunks.",
-    "\tvar offset := 12",
-    "\tvar data_start := -1",
-    "\tvar data_size := 0",
-    "\twhile offset + 8 <= bytes.size():",
-    "\t\tvar chunk_id := bytes.slice(offset, offset + 4).get_string_from_ascii()",
-    "\t\tvar chunk_size := bytes.decode_u32(offset + 4)",
-    "\t\tif chunk_id == \"data\":",
-    "\t\t\tdata_start = offset + 8",
-    "\t\t\tdata_size = chunk_size",
-    "\t\t\tbreak",
-    "\t\toffset += 8 + chunk_size + (chunk_size % 2)",
-    "\tif data_start < 0:",
-    "\t\tpush_error(\"No data chunk in \" + path)",
-    "\t\treturn null",
-    "\tif bits != 16:",
-    "\t\tpush_error(\"Only 16-bit PCM samples are supported: \" + path)",
-    "\t\treturn null",
-    "\tvar stream := AudioStreamWAV.new()",
-    "\tstream.format = AudioStreamWAV.FORMAT_16_BITS",
-    "\tstream.mix_rate = int(mix_rate)",
-    "\tstream.stereo = channels == 2",
-    "\tstream.data = bytes.slice(data_start, mini(data_start + data_size, bytes.size()))",
-    "\treturn stream",
+    "\treturn load(path) as AudioStream",
     "",
-    "## Loads every sample in the suite, keyed by name: load_all()[\"laser_fire\"].",
+    "## Every sample in the directory, keyed by name: load_all()[\"laser_fire\"].",
     "static func load_all(directory: String = SUITE_DIR) -> Dictionary:",
     "\tvar streams := {}",
     "\tvar dir := DirAccess.open(directory)",
     "\tif dir == null:",
     "\t\treturn streams",
     "\tfor file_name in dir.get_files():",
-    "\t\tif not file_name.ends_with(\".wavdata\"):",
+    "\t\t# The editor writes a .import sidecar next to each asset; skip it and anything else",
+    "\t\t# that is not one of the audio formats Godot imports.",
+    "\t\tvar extension := file_name.get_extension().to_lower()",
+    "\t\tif not extension in [\"wav\", \"ogg\", \"mp3\"]:",
     "\t\t\tcontinue",
     "\t\tvar stream := load_stream(directory.path_join(file_name))",
     "\t\tif stream != null:",
@@ -2319,7 +2291,7 @@
     "",
     "## Plays one sample once and frees the player when it finishes.",
     "static func play(parent: Node, name: String, directory: String = SUITE_DIR) -> AudioStreamPlayer:",
-    "\tvar stream := load_stream(directory.path_join(name + \".wavdata\"))",
+    "\tvar stream := load_stream(directory.path_join(name + \".wav\"))",
     "\tif stream == null:",
     "\t\treturn null",
     "\tvar player := AudioStreamPlayer.new()",
@@ -4861,7 +4833,7 @@
     {
       definition: {
         name: 'godot_import_asset',
-        description: "Imports a binary asset - image, font, or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+        description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
         input_schema: {
           type: 'object',
           properties: {
@@ -4877,12 +4849,6 @@
       handler: async (args = {}) => {
         const path = cleanProjectPath(args.path);
         if (!path) throw new Error('path is required.');
-        // The one family Godot cannot import here without aborting the editor.
-        if (AUDIO_ASSET_PATTERN.test(path)) {
-          const error = new Error(`Godot's audio import aborts this WebAssembly build of the editor, so ${path} cannot be imported. Use godot_synthesize_audio_suite, which writes the samples as .wavdata and builds an AudioStreamWAV at runtime.`);
-          error.code = 'AUDIO_IMPORT_UNSUPPORTED';
-          throw error;
-        }
         if (!EditorCommandChannel.available()) {
           const error = new Error('The editor command plugin is not available, so an asset cannot be imported.');
           error.code = 'EDITOR_COMMAND_UNSUPPORTED';
@@ -5202,7 +5168,7 @@
     {
       definition: {
         name: 'godot_synthesize_audio_suite',
-        description: "Procedurally synthesizes the 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to also write them into the project as .wavdata plus an sfx_library.gd that builds an AudioStreamWAV from the bytes at runtime. They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; an extension it has no importer for never reaches that code, and runtime loading behaves identically in the exported game. Reports per-file what Godot confirmed on disk.",
+        description: "Procedurally synthesizes a 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to write them into the project as ordinary .wav files, imported by Godot like any other asset, plus an sfx_library.gd convenience wrapper. They appear in the FileSystem dock, load() returns an AudioStreamWAV, and they can be assigned to an AudioStreamPlayer in the Inspector. Reports per-file what Godot confirmed - that it imported and is loadable - rather than what was written.",
         input_schema: {
           type: 'object',
           properties: {
@@ -5225,17 +5191,16 @@
             error.code = 'EDITOR_COMMAND_UNSUPPORTED';
             throw error;
           }
-          // .wavdata, not .wav: Godot's audio importer aborts this WebAssembly build, and an
-          // extension it has no importer for is never handed to that code. The bytes are an
-          // ordinary RIFF file; sfx_library.gd turns them into an AudioStreamWAV at runtime,
-          // which needs no import step and works the same in the exported game.
+          // Ordinary .wav files, imported by Godot like any other asset. They were .wavdata
+          // until the editor stopped booting with --audio-driver Dummy, which was what made
+          // the import abort - see EDITOR_AUDIO_DRIVER.
           const generations = {
             lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
             command: EditorCommandChannel.generation
           };
           const payload = {};
           for (const asset of suite) {
-            const path = directory ? `${directory}/${asset.name}.wavdata` : `${asset.name}.wavdata`;
+            const path = directory ? `${directory}/${asset.name}.wav` : `${asset.name}.wav`;
             payload[path] = decodeUploadChunk(asset.data_url.split(',')[1], 'base64');
             imported.push({ name: asset.name, path: `res://${path}`, bytes: payload[path].byteLength });
           }
@@ -5256,27 +5221,28 @@
           for (const [path, content] of Object.entries(payload)) activeFilesDict[path] = content;
           DiagnosticState.sceneRevision += 1;
           await persistActiveProjectState();
-          // Godot's FileSystem dock hides files it has no importer for, so .wavdata samples
-          // are invisible there by design. Our own project view is where the human sees them.
           BuildingBlocksHUD.updateFromFiles(activeFilesDict, DiagnosticState.sceneRevision);
-          // One scan picks up the whole directory; each file is then confirmed individually.
+          // One scan picks up the whole directory; each sample is then confirmed individually
+          // against what Godot itself reports, not against the write.
           const queued = EditorCommandChannel.call('asset_import', { path: `res://${libraryPath}`, reveal: true });
           if (queued.ok && queued.job_id) await HotScriptChannel.awaitJob(queued.job_id, 12000);
           for (const entry of imported) {
-            const state = EditorCommandChannel.call('asset_state', { path: entry.path });
-            entry.on_disk = state?.exists === true;
-            entry.bytes_on_disk = state?.size_bytes ?? null;
+            const settled = await awaitAssetImport(entry.path, 8000);
+            entry.on_disk = settled.exists === true;
+            entry.bytes_on_disk = settled.size_bytes ?? null;
+            entry.loadable = settled.loadable === true;
+            entry.import_metadata_written = settled.has_import === true;
           }
         }
         return {
           suite_count: suite.length,
           imported_into_project: wantsImport,
           imported: wantsImport ? imported : null,
-          imported_ok: wantsImport ? imported.filter(entry => entry.on_disk === true).length : 0,
+          imported_ok: wantsImport ? imported.filter(entry => entry.loadable === true).length : 0,
           runtime_loader: libraryPath ? `res://${libraryPath}` : null,
           // Said explicitly because the extension is unusual and deliberate.
           playback: wantsImport
-            ? `Load a sample with SfxLibrary.load_stream("res://${directory || '.'}/<name>.wavdata") or play one with SfxLibrary.play(self, "<name>"). They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; AudioStreamWAV is built from the bytes at runtime instead, which behaves identically in the exported game.`
+            ? `The samples are ordinary imported .wav resources: load("res://${directory || '.'}/<name>.wav") returns an AudioStreamWAV, and they can be assigned to an AudioStreamPlayer in the Inspector. sfx_library.gd is a convenience wrapper - SfxLibrary.play(self, "<name>").`
             : null,
           assets: suite.map(a => ({
             name: a.name,

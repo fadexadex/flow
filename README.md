@@ -83,10 +83,9 @@ Place an imported model in a scene with `godot_node_instance`. It accepts a `.gl
 or a `.tscn` already in the project, and the placed node moves, rotates, and scales like any
 other node. `godot_node_spawn` builds Godot's own primitive meshes and cannot place a model.
 
-Audio takes a different path. `godot_synthesize_audio_suite` writes the samples as `.wavdata`
-files next to an `sfx_library.gd` that builds an `AudioStreamWAV` from the bytes at run time.
-This needs no import step and behaves the same way in the exported game. See the audio entry
-under Godot Web editor limitations for why.
+Audio is an ordinary asset. `godot_synthesize_audio_suite` writes a procedural suite as `.wav`
+files with an `sfx_library.gd` convenience wrapper; `load()` returns an `AudioStreamWAV` and the
+samples can be assigned to an `AudioStreamPlayer` in the Inspector like any other resource.
 
 ## A worked example
 
@@ -191,19 +190,14 @@ FLow is built on the experimental Godot Web editor. These are constraints of tha
 design choices. Each one is measured, and the tool that meets it reports the constraint rather
 than reporting success.
 
-- **Audio cannot be imported.** Godot's WAV importer aborts this WebAssembly build of the
-  editor. The runtime traps in `ProgressDialog` on an empty task stack, the viewport goes
-  black, and the editor cannot be recovered in that page. It happens wherever the importer
-  runs: during a boot scan, from a deferred frame, or on a live rescan. `.wav`, `.ogg`, and
-  `.mp3` are refused with an error naming the route that works. Images, fonts, and glTF models
-  import normally, and a project holding them reopens healthy.
-- **Editor camera framing needs a focused page.** Godot's "frame selection" is a keyboard
-  shortcut, and a browser delivers no keyboard input to a document that does not have focus. In
-  an unfocused tab `godot_camera_focus` selects the node, places the overlay, and reports
-  `document_not_focused` instead of claiming a camera move.
+- **Keyboard shortcuts cannot be delivered to the editor.** A browser sends no keyboard input
+  to a document that does not have focus; `emit_signal("gui_input")` never reaches Godot's own
+  handling, because `Control._gui_input` is a virtual the engine calls rather than a signal
+  handler; and `Viewport.push_input` routes keys by GUI focus. Mouse events have none of these
+  problems, so anything an agent drives in the viewport is driven with the mouse.
 - **There is no scripted route to the editor camera.** Godot exposes the 3D viewport but no
-  method to move its camera, so framing is driven through the editor's own shortcut and the
-  resulting pose is measured afterwards.
+  method to move its camera. `godot_camera_focus` therefore pans and dollies the viewport and
+  measures the resulting pose, rather than setting it.
 - **A hidden or throttled tab pauses the engine.** Godot's main loop runs on
   `requestAnimationFrame`, so a backgrounded tab stops making progress. Long operations spend a
   foreground-active budget rather than wall-clock time, and say how much of the wait was spent
@@ -229,7 +223,6 @@ Named here so the gaps above read as a roadmap rather than a list of dead ends.
 - A 2D live mutator alongside the 3D one.
 - Editor camera control that does not depend on a keyboard shortcut, if a future Godot Web
   build exposes the viewport camera.
-- Audio through Godot's own importer, once that build no longer aborts on it.
 - Generated configuration for the three deployment targets from one source, replacing the
   manual synchronization.
 

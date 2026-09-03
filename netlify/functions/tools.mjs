@@ -30,7 +30,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_import_asset',
-    description: "Imports a binary asset - image, font, or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Audio is refused: Godot's WAV import aborts this WebAssembly build of the editor - use godot_synthesize_audio_suite instead. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+    description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
     input_schema: {
       type: 'object',
       properties: {
@@ -88,7 +88,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_synthesize_audio_suite',
-    description: "Procedurally synthesizes the 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to also write them into the project as .wavdata plus an sfx_library.gd that builds an AudioStreamWAV from the bytes at runtime. They are .wavdata because Godot's WAV importer aborts this WebAssembly build of the editor; an extension it has no importer for never reaches that code, and runtime loading behaves identically in the exported game. Reports per-file what Godot confirmed on disk.",
+    description: "Procedurally synthesizes a 6-piece 16-bit PCM sound suite in the browser, with duration, loudness and MIT licence metadata. By default this only returns previews: pass import_into_project to write them into the project as ordinary .wav files, imported by Godot like any other asset, plus an sfx_library.gd convenience wrapper. They appear in the FileSystem dock, load() returns an AudioStreamWAV, and they can be assigned to an AudioStreamPlayer in the Inspector. Reports per-file what Godot confirmed - that it imported and is loadable - rather than what was written.",
     input_schema: {
       type: 'object',
       properties: {

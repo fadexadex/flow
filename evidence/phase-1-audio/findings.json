@@ -1,0 +1,54 @@
+{
+  "captured_at": "2026-09-03T18:46:50.675Z",
+  "editor_audio_driver": "AudioWorklet",
+  "suite_files": [
+    {
+      "path": "res://sfx/laser_fire.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/rail_impact.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/energy_pickup.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/jump_boost.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/gate_warp.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/shield_down.wav",
+      "kind": "binary",
+      "size_bytes": 17684
+    },
+    {
+      "path": "res://sfx/sfx_library.gd",
+      "kind": "text",
+      "size_bytes": 1616
+    }
+  ],
+  "export": {
+    "filename": "audio_works.zip",
+    "total_files": 13,
+    "bytes": 115937,
+    "licenses": [
+      "MIT"
+    ]
+  },
+  "session": {
+    "health": "healthy",
+    "project_errors": 0,
+    "fatal_errors": []
+  }
+}

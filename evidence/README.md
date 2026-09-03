@@ -46,3 +46,29 @@ and re-reads the real camera pose between corrections.
 `document.hasFocus() === false` for all of it. Two targets moved and were reached; two were
 already framed and say so (`already_framed: true`) rather than reporting a camera that refused
 to move. Zero project errors, zero fatals.
+
+## phase-1-audio
+
+Audio import, which every earlier round concluded was impossible in this build.
+
+| File | Shows |
+| ---- | ----- |
+| `audio-works-proof.png` | a `.wav` in the dock, surviving a boot scan, the six-sample suite, and the running game |
+| `audio-playing-in-game.mp4` | the game playing all six imported samples |
+| `findings.json` | the driver in use, the imported files as the project sees them, and the export |
+| `audio_works.zip` | the exported project, six `.wav` files included |
+
+**The limitation was ours.** The editor was booted with `--audio-driver Dummy` so an editor
+AudioContext could not race the game's. Godot's audio import builds a waveform preview by
+mixing the stream through `AudioServer`; a Dummy driver returns a zero-length preview, and the
+editor then indexes it at -1 and aborts the runtime. Booting with `AudioWorklet` instead:
+
+- a `.wav` imports, `loadable: true`, and appears in the FileSystem dock with its audio icon;
+- a cold page opening a project that already contains one boots healthy — the exact case that
+  used to abort;
+- `godot_synthesize_audio_suite` reports `imported_ok: 6`, every sample with import metadata;
+- the running game loads all six as `AudioStreamWAV` and plays them;
+- the export contains them.
+
+Four game run/stop cycles on the real driver showed none of the AudioWorkletNode contention the
+Dummy flag was guarding against: `healthy`, 0 project errors, 0 fatals on every cycle.

@@ -162,30 +162,43 @@ Imported assets go into `activeFilesDict`. Keeping them out - the old behaviour 
 scene referencing one failed the missing-resource check, which blocked transactions and project
 switching outright, and the asset was silently absent from `godot_export_zip`.
 
-### Assets, and the one thing Godot cannot import here
+### Assets
 
 Binary assets go in through `godot_import_asset`: the bytes are written into the running
 editor's filesystem, then a deferred job calls `EditorFileSystem.update_file()` + `scan()` from
 `_process`, and the bridge polls the `asset_state` op until Godot itself reports the file
 loadable. Nothing reads the import request's own reply for the outcome — that reply is taken
 before the work happens, and reading it reported every asset as unimported while the write had
-in fact succeeded. Imported assets are real project files that survive editor restarts, but
-they live in Godot's filesystem rather than `activeFilesDict`, so they are absent from
-`godot_export_zip`; the tool says so in `included_in_export_zip`.
+in fact succeeded. Imported assets enter `activeFilesDict`, so they survive restarts, ride into
+the export, and satisfy the reference check for any scene using them.
 
-**Audio is the exception, and it is not a style choice.** Godot's WAV import aborts this
-WebAssembly build: the runtime traps in `ProgressDialog` on an empty task stack
-(`FATAL: Index p_index = -1 is out of bounds (size() = 0)`), the editor goes black, and there
-is no recovery. Measured, not assumed — the same bytes under a `.wavdata` extension scan
-cleanly, and a PNG imports and reboots fine, so it is the audio importer and not "binary assets"
-or any particular template. `godot_synthesize_audio_suite` therefore writes the samples as
-`sfx/<name>.wavdata` plus `sfx/sfx_library.gd`, which parses the RIFF header and builds an
-`AudioStreamWAV` at runtime — no import step, identical behaviour in the exported game. Both
-`validateProjectFiles` and `godot_import_asset` refuse `.wav`/`.ogg`/`.mp3` outright
-(`AUDIO_IMPORT_UNSUPPORTED`) and name the route that works.
+Models are placed with `godot_node_instance`, which instantiates a `.glb`/`.gltf`/`.tscn` as a
+child node through the command channel and writes the matching `instance=ExtResource(...)` into
+the scene text. `godot_node_spawn` is primitives only and cannot place a model.
+
+**Audio works, and the reason it did not is worth remembering.** Every `.wav` reaching Godot's
+import path used to abort the runtime (`FATAL: Index p_index = -1 is out of bounds (size() = 0)`
+after `ProgressDialog::end_task`), at boot, from `call_deferred`, and from `_process` alike.
+The cause was ours: the editor was booted with `--audio-driver Dummy` to keep an editor
+AudioContext away from the game's. Godot's audio import generates a waveform preview by mixing
+the stream through `AudioServer`; a Dummy driver returns a zero-length preview and the editor
+then indexes it at -1. Booting with `AudioWorklet` (see `EDITOR_AUDIO_DRIVER`) makes audio
+import, appear in the dock, load, and survive a boot scan — and four game run/stop cycles
+showed none of the AudioWorkletNode contention the flag was guarding against. Do not put
+`Dummy` back without re-measuring both.
 
 Do not call `reimport_files()`, and do not run a scan straight from a JavaScriptBridge callback
 or `call_deferred` — both were tried, and both abort the runtime.
+
+### The editor answers the mouse, not the keyboard
+
+A tool cannot deliver a keyboard shortcut to this editor by any route: not a DOM key event (no
+keys reach an unfocused document), not `emit_signal("gui_input")` (`Control._gui_input` is a
+virtual the engine calls, not a signal handler — so the plugin's shortcut path never once
+worked), and not `Viewport.push_input`, which routes keys by GUI focus. Mouse events go through
+that last route reliably, because the viewport routes them by position: `_push_viewport_event`
+in `plugin.gd` is the one place that knows this. `godot_camera_focus` is built on it as a
+closed loop — pan, dolly, re-read `camera_pose`, stop when the target projects where it should.
 
 ### Idempotency and long-running ops
 
