@@ -507,6 +507,41 @@
     }
   }
 
+  // The active row is a pointer to the project that should be restored, while the named row
+  // is the durable library copy. Older bridge versions could update only the named row before
+  // a reload, leaving the pointer several revisions behind. Prefer a strictly newer named
+  // snapshot of the SAME project; never jump to a different project merely because it was
+  // edited more recently.
+  function reconcileHydrationSnapshot(activeSnapshot, savedRows) {
+    if (!activeSnapshot?.project_name) {
+      return { snapshot: activeSnapshot || null, repaired: false, reason: null };
+    }
+    const candidates = (savedRows || [])
+      .filter(row => row?.project_name === activeSnapshot.project_name)
+      .sort((a, b) => (b.scene_revision || 0) - (a.scene_revision || 0)
+        || (b.updated_at || 0) - (a.updated_at || 0));
+    const newest = candidates[0];
+    if (!newest) return { snapshot: activeSnapshot, repaired: false, reason: null };
+    const newerRevision = Number(newest.scene_revision) > Number(activeSnapshot.scene_revision);
+    const newerDivergentBytes = Number(newest.scene_revision) === Number(activeSnapshot.scene_revision)
+      && (newest.updated_at || 0) > (activeSnapshot.updated_at || 0)
+      && newest.content_fingerprint && newest.content_fingerprint !== activeSnapshot.content_fingerprint;
+    if (!newerRevision && !newerDivergentBytes) {
+      return { snapshot: activeSnapshot, repaired: false, reason: null };
+    }
+    return {
+      snapshot: {
+        ...newest,
+        id: 'active',
+        // Library rows intentionally do not carry session-local histories.
+        undo_stack: [],
+        idempotent_mutations: []
+      },
+      repaired: true,
+      reason: newerRevision ? 'newer_library_revision' : 'newer_library_bytes'
+    };
+  }
+
   async function readSavedProject(projectName) {
     const database = await openRecordingDatabase();
     try {
@@ -607,11 +642,14 @@
         // Keep the reset a one-time, inspectable browser action rather than a sticky URL mode.
         window.history?.replaceState?.({}, '', window.location.pathname || '/');
       }
-      const snapshot = await new Promise((resolve, reject) => {
+      let snapshot = await new Promise((resolve, reject) => {
         const request = database.transaction('projects', 'readonly').objectStore('projects').get('active');
         request.onsuccess = () => resolve(request.result || null);
         request.onerror = () => reject(request.error || new Error('Failed to hydrate project state.'));
       });
+      const savedRows = await readSavedProjectRows(database);
+      const reconciliation = reconcileHydrationSnapshot(snapshot, savedRows);
+      snapshot = reconciliation.snapshot;
       const uploadSnapshots = await new Promise((resolve, reject) => {
         const request = database.transaction('uploads', 'readonly').objectStore('uploads').getAll();
         request.onsuccess = () => resolve(request.result || []);
@@ -672,6 +710,15 @@
         DiagnosticState.session = persistedProjectAvailable ? 'persisted' : 'empty';
         DiagnosticState.engine = 'loading';
         projectPersistenceError = null;
+        if (reconciliation.repaired) {
+          activeLogs.push({
+            level: 'info',
+            time: Date.now(),
+            msg: `[Persistence repair] Restored ${snapshot.project_name} rev ${snapshot.scene_revision} from its newer library snapshot (${reconciliation.reason}).`
+          });
+          // Repair the stale pointer immediately so the next reload observes the same state.
+          await persistActiveProjectState({ files: hydratedFiles, revision: snapshot.scene_revision });
+        }
         if (hydrationNormalization.repairs > 0) {
           activeLogs.push({
             level: 'info',
@@ -4880,10 +4927,23 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     };
   }
 
-  async function refreshVisiblePlaytest() {
+  async function refreshVisiblePlaytest(expectedSurface = activeGodotViewport()) {
     const running = typeof window !== 'undefined' && window.__godotGameState === 'running';
     if (!running) return 'not_running';
-    if (activeGodotViewport() !== 'game') return 'stale';
+    // The surface is captured when the authoring transaction begins. Engine lifecycle work
+    // may change display styles while the edit is in flight; it must not reinterpret an edit
+    // that began in the editor as permission to take the human into the game.
+    if (expectedSurface !== 'game') {
+      if (typeof window.showTab === 'function') window.showTab('editor');
+      window.__godotPreviewStale = true;
+      window.__godotPreviewStaleRevision = DiagnosticState.sceneRevision;
+      const gameTab = document.getElementById('btn-tab-game');
+      if (gameTab) {
+        gameTab.title = `Preview is behind editor revision ${DiagnosticState.sceneRevision}; it will refresh when opened.`;
+        gameTab.textContent = 'Live Preview • Update';
+      }
+      return 'stale';
+    }
     // Hold the last rendered frame across the relaunch. The runtime is a second Engine, so
     // refreshing it means tearing one down and building another, and without this the surface
     // the user is actually watching goes black for the whole restart - which reads as a crash,
@@ -4894,6 +4954,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       await stopGameRuntime(10000);
       await startGameRuntime({ visible: true, timeoutMs: 60000 });
       DiagnosticState.session = 'playtesting';
+      window.__godotPreviewStale = false;
+      window.__godotPreviewStaleRevision = null;
+      const gameTab = document.getElementById('btn-tab-game');
+      if (gameTab) {
+        gameTab.title = 'Browser-hosted playable preview — separate from Godot\'s internal Game workspace';
+        gameTab.textContent = 'Live Preview';
+      }
       return 'refreshed';
     } catch (previewError) {
       activeLogs.push({ level: 'warning', time: Date.now(), msg: `[Preview Refresh] ${previewError.message || String(previewError)}` });
@@ -4920,6 +4987,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
   // `dirty_unpersisted` and requires deliberate recovery — it NEVER starts a second Engine,
   // which is the whole reason this path exists.
   async function runHotScriptTransaction({ operations, label, operation, attach = null, reveal = true }) {
+    const authoringSurface = activeGodotViewport();
     const generations = {
       lifecycle: typeof window !== 'undefined' ? (window.__godotEditorLifecycle?.generation || 0) : 0,
       command: EditorCommandChannel.generation
@@ -5151,7 +5219,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // something the user is not looking at.
     // The preview IS the surface the user is on, so refresh the game Engine only — the editor
     // Engine is not touched. When the editor is visible, simply report that the preview is stale.
-    const previewState = await refreshVisiblePlaytest();
+    const previewState = await refreshVisiblePlaytest(authoringSurface);
 
     // Follow is user-owned. With it off, the FileSystem dock reveal that script_refresh
     // already performed is the whole of the visual feedback in Godot: no tab switch, no
@@ -5161,9 +5229,10 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     // refresh job, at the only honest moment for them: after Godot acknowledged the bytes.
     // What is left here is reporting what the editor observed, and one retry for the case
     // where the arrival worked but the reveal did not.
-    const acknowledged = following
-      ? (applied.refreshed || []).find(entry => entry.path === `res://${cleanProjectPath(primary.path)}`) || null
-      : null;
+    // Dock reveal happens independently of Follow mode. Preserve that acknowledgement even
+    // when Follow is off so the response matches what the human can actually see.
+    const acknowledged = (applied.refreshed || [])
+      .find(entry => entry.path === `res://${cleanProjectPath(primary.path)}`) || null;
     let navigation = opensScript
       ? {
           mode: 'script',
@@ -5190,7 +5259,15 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
             buffer_stale: acknowledged?.buffer?.stale === true,
             reason: null
           }
-        : { mode: FollowAgent.mode, arrived: false, reason: 'follow_disabled' };
+        : {
+            mode: FollowAgent.mode,
+            arrived: false,
+            workspace_preserved: true,
+            file_revealed: acknowledged?.dock_revealed === true,
+            buffer_synced: acknowledged?.buffer?.synced === true,
+            buffer_stale: acknowledged?.buffer?.stale === true,
+            reason: 'follow_disabled'
+          };
     if (opensScript && !navigation.revealed) {
       const retried = EditorCommandChannel.call('script_open', {
         path: primary.path,
@@ -6088,22 +6165,31 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       handler: async (args = {}, context = {}) => {
         const requested = String(args.project_name || '').trim();
         if (!requested) throw new Error('project_name is required.');
-        if (requested === DiagnosticState.activeProject
-          && DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
-          return {
-            success: true,
-            opened: false,
-            reason: 'already_active',
-            active_project: DiagnosticState.activeProject,
-            scene_revision: DiagnosticState.sceneRevision
-          };
-        }
         const row = await readSavedProject(requested);
         if (!row || !row.files || Object.keys(row.files).length === 0) {
           const available = (await listSavedProjects()).map(project => project.project_name);
           const error = new Error(`No saved project named ${requested}. Available: ${available.join(', ') || 'none'}.`);
           error.code = 'SAVED_PROJECT_NOT_FOUND';
           throw error;
+        }
+        if (requested === DiagnosticState.activeProject
+          && DiagnosticState.session === 'editor-ready' && DiagnosticState.engine === 'ready') {
+          const currentFingerprint = await computeProjectContentFingerprint(activeFilesDict);
+          const exactMatch = Number(row.scene_revision) === DiagnosticState.sceneRevision
+            && row.content_fingerprint === currentFingerprint;
+          // Never downgrade a live project. Persisting it updates the named snapshot and heals
+          // the inverse mismatch; a newer/different named row, however, must be restored.
+          if (exactMatch || DiagnosticState.sceneRevision > Number(row.scene_revision || 0)) {
+            if (!exactMatch) await persistActiveProjectState();
+            return {
+              success: true,
+              opened: false,
+              reason: exactMatch ? 'already_active' : 'active_newer_than_library',
+              active_project: DiagnosticState.activeProject,
+              scene_revision: DiagnosticState.sceneRevision,
+              content_fingerprint: currentFingerprint
+            };
+          }
         }
         // Persist what is open before replacing it, so switching away is never how work is
         // lost. A project with no files has nothing worth keeping and nothing to overwrite.
@@ -9993,7 +10079,6 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         strip.style.maxWidth = '100%';
         strip.style.width = '100%';
         strip.style.opacity = playtesting ? '0.82' : '1';
-        if (playtesting) AgentStatusRail.expanded = false;
       }
       this.publishShelfHeight();
     },
@@ -10115,9 +10200,18 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       const entry = AgentObservationHUD.entries.find(item => item.id === Number(entryId));
       const path = entry?.target?.resource_path;
       if (!path) return;
+      // Opening the script inside Godot is invisible while the host is still covering the
+      // editor with the playtest canvas. "View change" is an explicit navigation request, so
+      // return to the editor surface first; keep the runtime alive in the background so the
+      // user can go straight back to Live Preview afterwards.
+      if (activeGodotViewport() === 'game' && typeof window.showTab === 'function') {
+        window.showTab('editor');
+      }
       const reply = EditorCommandChannel.call('script_open', { path, line: entry.change?.start_line || 1 });
       if (!reply.ok) {
         this.setFocusNote(reply.unsupported ? 'Opening a script needs the editor command plugin' : `Could not open ${path}: ${reply.error}`);
+      } else {
+        this.setFocusNote(`Viewing ${path.replace(/^res:\/\//, '')}`);
       }
     },
 
@@ -10140,6 +10234,7 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       const actions = `<span style="display:inline-flex;align-items:center;gap:6px;flex:0 0 auto;margin-left:auto">`
         + (canView && mode !== 'narrow'
           ? `<button type="button" data-view-change="${latest.id}" style="${BUTTON_STYLE};min-height:28px;padding:4px 8px">View change</button>` : '')
+        + `<button type="button" data-project-library style="${BUTTON_STYLE};min-height:28px;padding:4px 8px">Projects</button>`
         + followButtonMarkup()
         + `</span>`;
       // An unavoidable restart that is simply not being given frames is a "waiting on you",
@@ -10200,6 +10295,13 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     },
 
     wireActions() {
+      const projects = this.node.querySelector('[data-project-library]');
+      if (projects) {
+        projects.onclick = (event) => {
+          event.stopPropagation();
+          ProjectLibraryPopover.toggle();
+        };
+      }
       const follow = this.node.querySelector('[data-follow-agent]');
       if (follow) {
         follow.onclick = (event) => {
@@ -10222,9 +10324,80 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
     }
   };
 
+  const ProjectLibraryPopover = {
+    node: null,
+    visible: false,
+
+    ensure() {
+      if (this.node || typeof document === 'undefined') return this.node;
+      this.node = document.createElement('section');
+      this.node.id = 'webmcp-project-library';
+      this.node.setAttribute('aria-label', 'Saved projects');
+      this.node.style.cssText = `${PANEL_STYLE};position:fixed;right:10px;bottom:calc(var(--webmcp-shelf-height, 52px) + 8px);z-index:calc(var(--gd-z-rail, 900) + 2);width:min(360px,calc(100vw - 20px));max-height:min(58vh,420px);overflow:auto;padding:10px;pointer-events:auto;display:none`;
+      document.body.appendChild(this.node);
+      return this.node;
+    },
+
+    async toggle() {
+      const node = this.ensure();
+      if (!node) return;
+      this.visible = !this.visible;
+      node.style.display = this.visible ? 'block' : 'none';
+      if (this.visible) await this.render();
+    },
+
+    async render() {
+      const node = this.ensure();
+      if (!node) return;
+      node.innerHTML = `<div style="color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.ui}">Loading saved projects…</div>`;
+      let projects = [];
+      try { projects = await listSavedProjects(); }
+      catch (error) {
+        node.innerHTML = `<div style="color:${RAIL_TOKENS.error}">${escapeHtml(error.message || String(error))}</div>`;
+        return;
+      }
+      const rows = projects.map(project => {
+        const active = project.project_name === DiagnosticState.activeProject;
+        return `<div style="display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:8px;padding:8px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
+          + `<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;font-weight:600">${escapeHtml(project.project_name)}</span>`
+          + `<span style="color:${RAIL_TOKENS.muted};font:400 10px/1 ${RAIL_TOKENS.mono}">Rev #${project.scene_revision}</span>`
+          + (active
+            ? `<span style="color:${RAIL_TOKENS.ok};font:500 10px/1 ${RAIL_TOKENS.ui}">CURRENT</span>`
+            : `<button type="button" data-library-open="${escapeHtml(project.project_name)}" style="${BUTTON_STYLE};padding:4px 8px">Open</button>`)
+          + `<span style="grid-column:1 / -1;color:${RAIL_TOKENS.muted};font:400 10px/1.3 ${RAIL_TOKENS.mono}">${escapeHtml(project.main_scene)} · ${project.file_count} files</span>`
+          + `</div>`;
+      }).join('');
+      node.innerHTML = `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">`
+        + `<strong style="font:600 12px/1.3 ${RAIL_TOKENS.ui}">Saved projects</strong>`
+        + `<span style="color:${RAIL_TOKENS.muted};font:400 10px/1 ${RAIL_TOKENS.mono}">${projects.length}/${SAVED_PROJECT_LIMIT}</span>`
+        + `<button type="button" data-library-close aria-label="Close saved projects" style="${BUTTON_STYLE};margin-left:auto;padding:3px 7px">×</button></div>`
+        + (rows || `<div style="color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.ui}">No saved projects yet.</div>`);
+      node.querySelector('[data-library-close]').onclick = () => this.toggle();
+      for (const button of node.querySelectorAll('[data-library-open]')) {
+        button.onclick = async () => {
+          const tool = MANIFEST_TOOLS.find(item => item.definition.name === 'godot_open_saved_project');
+          if (!tool) return;
+          button.disabled = true;
+          button.textContent = 'Opening…';
+          try {
+            await executeObservedTool(tool, { project_name: button.dataset.libraryOpen });
+            await this.render();
+          } catch (error) {
+            AgentStatusRail.setFocusNote(`Could not open ${button.dataset.libraryOpen}: ${error.message || error}`);
+            button.disabled = false;
+            button.textContent = 'Open';
+          }
+        };
+      }
+    }
+  };
+
   const SceneInspector = {
     node: null,
     expanded: false,
+    savedProjects: [],
+    projectsLoaded: false,
+    projectsLoading: false,
 
     ensure() {
       const slot = AgentRail.slot('webmcp-inspector-slot', 'flex-end');
@@ -10235,7 +10408,11 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         this.node.style.cssText = `${PANEL_STYLE};width:min(320px, calc(100vw - 32px));padding:6px 10px;cursor:pointer`;
         this.node.tabIndex = 0;
         this.node.setAttribute('aria-label', 'Scene details. Enter or Space expands the node list.');
-        const toggle = () => { this.expanded = !this.expanded; this.render(); };
+        const toggle = () => {
+          this.expanded = !this.expanded;
+          this.render();
+          if (this.expanded) this.refreshProjects();
+        };
         this.node.addEventListener('click', toggle);
         this.node.addEventListener('keydown', (event) => {
           if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggle(); }
@@ -10243,6 +10420,33 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         slot.appendChild(this.node);
       }
       return true;
+    },
+
+    async refreshProjects() {
+      if (this.projectsLoading) return;
+      this.projectsLoading = true;
+      this.render();
+      try {
+        this.savedProjects = await listSavedProjects();
+        this.projectsLoaded = true;
+      } catch (error) {
+        AgentStatusRail.setFocusNote(`Could not read saved projects: ${error.message || error}`);
+      } finally {
+        this.projectsLoading = false;
+        this.render();
+      }
+    },
+
+    async openProject(projectName) {
+      const tool = MANIFEST_TOOLS.find(item => item.definition.name === 'godot_open_saved_project');
+      if (!tool) return;
+      AgentStatusRail.setFocusNote(`Opening ${projectName}`);
+      try {
+        await executeObservedTool(tool, { project_name: projectName });
+        await this.refreshProjects();
+      } catch (error) {
+        AgentStatusRail.setFocusNote(`Could not open ${projectName}: ${error.message || error}`);
+      }
     },
 
     // Reads only what is actually in the parsed scene. The version this replaces invented
@@ -10270,7 +10474,30 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
         return;
       }
       const scene = sceneRowsMarkup(40);
-      this.node.innerHTML = `${head}<div style="margin-top:5px;max-height:min(40vh,240px);overflow-y:auto">${scene.rows}${scene.overflow}</div>`;
+      const projects = this.projectsLoading && !this.projectsLoaded
+        ? `<div style="color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.ui}">Loading saved projects…</div>`
+        : (this.savedProjects.length
+          ? this.savedProjects.map(project => {
+              const active = project.project_name === DiagnosticState.activeProject;
+              return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-top:1px solid ${RAIL_TOKENS.border}">`
+                + `<span style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;font:500 11px/1.4 ${RAIL_TOKENS.ui}">${escapeHtml(project.project_name)}</span>`
+                + `<span style="color:${RAIL_TOKENS.muted};font:400 10px/1 ${RAIL_TOKENS.mono}">Rev #${project.scene_revision}</span>`
+                + (active
+                  ? `<span style="color:${RAIL_TOKENS.ok};font:500 10px/1 ${RAIL_TOKENS.ui}">CURRENT</span>`
+                  : `<button type="button" data-open-project="${escapeHtml(project.project_name)}" style="${BUTTON_STYLE};padding:3px 7px;font-size:10px">Open</button>`)
+                + `</div>`;
+            }).join('')
+          : `<div style="color:${RAIL_TOKENS.muted};font:400 11px/1.5 ${RAIL_TOKENS.ui}">No saved projects yet.</div>`);
+      this.node.innerHTML = `${head}`
+        + `<div style="margin-top:6px;padding-top:6px;border-top:1px solid ${RAIL_TOKENS.border}">`
+        + `<div style="display:flex;align-items:center;margin-bottom:3px;color:${RAIL_TOKENS.muted};text-transform:uppercase;letter-spacing:.06em;font-size:10px">`
+        + `<span>Saved projects</span><button type="button" data-refresh-projects style="${BUTTON_STYLE};margin-left:auto;padding:2px 6px;font-size:10px">Refresh</button></div>${projects}</div>`
+        + `<div style="margin-top:6px;padding-top:6px;border-top:1px solid ${RAIL_TOKENS.border};max-height:min(32vh,190px);overflow-y:auto">${scene.rows}${scene.overflow}</div>`;
+      const refresh = this.node.querySelector('[data-refresh-projects]');
+      if (refresh) refresh.onclick = (event) => { event.stopPropagation(); this.refreshProjects(); };
+      for (const button of this.node.querySelectorAll('[data-open-project]')) {
+        button.onclick = (event) => { event.stopPropagation(); this.openProject(button.dataset.openProject); };
+      }
     }
   };
 
@@ -10425,10 +10652,30 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
       });
     }
 
+    // index.html makes the preview visible synchronously. If an editor-side change happened
+    // while that runtime was hidden, refresh it immediately after the click so returning to
+    // Live Preview can never resurrect an older character or scene revision.
+    const livePreviewTab = document.getElementById('btn-tab-game');
+    if (livePreviewTab) {
+      livePreviewTab.addEventListener('click', () => {
+        if (!window.__godotPreviewStale || window.__godotGameState !== 'running') return;
+        setTimeout(() => {
+          if (activeGodotViewport() === 'game') refreshVisiblePlaytest();
+        }, 0);
+      });
+    }
+
     window.addEventListener('godot-game-stopped', () => {
       // A deliberate close should return to the editor. A page reload, however,
       // keeps the preview intent so the host can rebuild the Game canvas.
       if (!window.__godotWebMcpPageUnloading) forgetPreviewWasRunning();
+      window.__godotPreviewStale = false;
+      window.__godotPreviewStaleRevision = null;
+      const gameTab = document.getElementById('btn-tab-game');
+      if (gameTab) {
+        gameTab.title = 'Browser-hosted playable preview — separate from Godot\'s internal Game workspace';
+        gameTab.textContent = 'Live Preview';
+      }
       if (DiagnosticState.session === 'playtesting') {
         DiagnosticState.session = 'editor-ready';
         DiagnosticHUD.render();

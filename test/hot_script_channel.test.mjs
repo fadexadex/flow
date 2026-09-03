@@ -537,8 +537,54 @@ test('file mode reports what it did, and does not claim an arrival', () => {
   const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
   assert.match(body, /mode: 'file'/);
   assert.match(body, /workspace_preserved: true/);
-  assert.match(body, /file_revealed: acknowledged \? acknowledged\.dock_revealed === true : false/,
+  assert.match(body, /file_revealed: acknowledged\?\.dock_revealed === true/,
     'the reveal is read back from the editor, not assumed from the request');
+});
+
+test('follow-off mode still reports the unconditional FileSystem reveal', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  assert.match(body, /reason: 'follow_disabled'/);
+  assert.match(body, /workspace_preserved: true/);
+  assert.match(body, /file_revealed: acknowledged\?\.dock_revealed === true/);
+});
+
+test('View change leaves the playtest surface before opening the script', () => {
+  const start = bridgeSource.indexOf('    viewChange(entryId)');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('    render() {', start));
+  assert.match(body, /activeGodotViewport\(\) === 'game'/);
+  assert.ok(body.indexOf("window.showTab('editor')") < body.indexOf("EditorCommandChannel.call('script_open'"),
+    'the host editor must be visible before Godot reveals the code behind it');
+});
+
+test('the activity history can remain expanded while the game is running', () => {
+  const start = bridgeSource.indexOf('  const AgentRail = {');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('  const CameraControls = {', start));
+  assert.doesNotMatch(body, /if \(playtesting\) AgentStatusRail\.expanded = false/,
+    'forcing collapse from ResizeObserver makes earlier View change actions unreachable');
+});
+
+test('a hidden running preview is marked stale and refreshes when its tab is opened', () => {
+  const refreshStart = bridgeSource.indexOf('async function refreshVisiblePlaytest');
+  const refreshBody = bridgeSource.slice(refreshStart, bridgeSource.indexOf('// The two-phase hot GDScript transaction', refreshStart));
+  assert.match(refreshBody, /window\.__godotPreviewStale = true/);
+  assert.match(refreshBody, /Live Preview • Update/);
+  const initStart = bridgeSource.indexOf('  function initDOM()');
+  const initBody = bridgeSource.slice(initStart, bridgeSource.indexOf("console.log(`[WebMCP", initStart));
+  assert.match(initBody, /livePreviewTab\.addEventListener\('click'/);
+  assert.match(initBody, /refreshVisiblePlaytest\(\)/);
+});
+
+test('a hot script edit honors the surface where the human began the transaction', () => {
+  const start = bridgeSource.indexOf('async function runHotScriptTransaction');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('// 6. Authoritative Native Tool Manifest', start));
+  assert.match(body, /const authoringSurface = activeGodotViewport\(\)/);
+  assert.match(body, /refreshVisiblePlaytest\(authoringSurface\)/);
+  const refreshStart = bridgeSource.indexOf('async function refreshVisiblePlaytest');
+  const refreshBody = bridgeSource.slice(refreshStart, bridgeSource.indexOf('// The two-phase hot GDScript transaction', refreshStart));
+  assert.match(refreshBody, /if \(expectedSurface !== 'game'\)/);
+  assert.match(refreshBody, /showTab\('editor'\)/,
+    'late lifecycle activity cannot steal the surface after an editor-side edit');
 });
 
 test('the dock reveal is carried back from the refresh job', async () => {

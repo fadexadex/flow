@@ -191,6 +191,32 @@ Mutating tools accept an `idempotency_key`; results are cached in `idempotentMut
 - The canvas is destroyed and recreated by `replaceCanvas` on every engine exit — never cache the element, and re-query after each `godot-engine-ready`.
 - Projection math works in CSS pixels via `getBoundingClientRect()`; the canvas backing store is `innerWidth * devicePixelRatio`, so mixing the two doubles every coordinate on a Retina display.
 
+## README limitations are a maintained contract
+
+`README.md` has a **Limitations** section that states, in public, what this system does not do:
+the five deliberate stub tools, the Neon-Skyrail-only semantic playtest, the relay's missing
+`initialize`/`tools/list`/stdio, single-tab in-memory state, background-tab timing, the
+reload-only recovery from a hung editor exit, `source_synced: null`, the manual sync across the
+three deploy targets, and the scope limits (two templates, 3D-only live mutator, no asset
+pipeline).
+
+**Whenever a refinement changes one of those facts, update the README's Limitations section in
+the same change** — do not leave it for later. Concretely:
+
+- A stub gets wired to a real editor acknowledgement → remove it from the stub list there *and*
+  from the honesty-rules list in this file.
+- A constraint is lifted (2D live mutation lands, the relay learns `tools/list`, a project syncs
+  across browsers) → delete or rewrite the bullet; a stale limitation is as dishonest as a faked
+  success.
+- A refinement *introduces* a constraint (a new tool that cannot observe its own outcome, a new
+  hand-synced file, a new browser requirement) → add the bullet.
+- Adding a tool → check whether it belongs in the README's catalog `<details>` groups and whether
+  its count line is still right.
+
+The same rule applies to the README's Testing table when `package.json`'s `test` script changes,
+and to its Deployment table when a target gains or loses functions. The README's technical
+sections are a summary of this file; if you change a mechanism described in both, change both.
+
 ## Verification harness
 
 Because most browsers (including the in-app browser used by this project's agent tooling) don't implement native WebMCP, `test/webmcp-harness.md` documents a dependency-free polyfill (`test/webmcp-polyfill.js`) that installs a spec-shaped `document.modelContext`/`navigator.modelContext` surface so a cheap model can still drive the `godot_*` tools via `javascript_tool`. The `webmcp-verifier` subagent (`.claude/agents/webmcp-verifier.md`, runs on `model: haiku`) bootstraps this polyfill against a live page and executes one of the numbered checklists in `test/checklists/` (`catalog.md`, `boot.md`, `camera.md`, `restarts.md`, `persistence.md`), reporting only observed PASS/FAIL/NOT_IMPLEMENTED facts — never fixes anything itself. Use it for cheap, repeatable, read-only regression passes against the tool catalog, boot sequence, camera-focus HUD, and live-mutator restart behavior.

@@ -579,6 +579,37 @@ test('a library row is summarised by what identifies the work, not by its bytes'
   });
 });
 
+const { reconcileHydrationSnapshot } = new Function(`
+  ${bridgeSlice('  function reconcileHydrationSnapshot', '  async function readSavedProject')}
+  return { reconcileHydrationSnapshot };
+`)();
+
+test('hydration repairs a stale active pointer from the newer snapshot of the same project', () => {
+  const active = { id: 'active', project_name: 'runner', scene_revision: 66, updated_at: 100, content_fingerprint: 'old', undo_stack: [{ undo_id: 'x' }] };
+  const newer = { id: 'project:runner', project_name: 'runner', scene_revision: 69, updated_at: 200, content_fingerprint: 'new', files: { 'main.gd': 'new' } };
+  const resolved = reconcileHydrationSnapshot(active, [newer]);
+  assert.equal(resolved.repaired, true);
+  assert.equal(resolved.snapshot.scene_revision, 69);
+  assert.deepEqual(resolved.snapshot.undo_stack, []);
+  assert.equal(resolved.reason, 'newer_library_revision');
+});
+
+test('hydration never jumps from the active project to a different newer project', () => {
+  const active = { id: 'active', project_name: 'runner', scene_revision: 4, updated_at: 100, content_fingerprint: 'a' };
+  const other = { id: 'project:puzzle', project_name: 'puzzle', scene_revision: 90, updated_at: 900, content_fingerprint: 'b' };
+  const resolved = reconcileHydrationSnapshot(active, [other]);
+  assert.equal(resolved.repaired, false);
+  assert.equal(resolved.snapshot, active);
+});
+
+test('hydration keeps a newer active pointer instead of downgrading it', () => {
+  const active = { id: 'active', project_name: 'runner', scene_revision: 12, updated_at: 300, content_fingerprint: 'new' };
+  const older = { id: 'project:runner', project_name: 'runner', scene_revision: 11, updated_at: 400, content_fingerprint: 'old' };
+  const resolved = reconcileHydrationSnapshot(active, [older]);
+  assert.equal(resolved.repaired, false);
+  assert.equal(resolved.snapshot, active);
+});
+
 test('every persist writes a library row beside the active slot', () => {
   const start = bridgeText.indexOf('async function persistActiveProjectState');
   const body = bridgeText.slice(start, bridgeText.indexOf('function isFreshStartRequested', start));
@@ -614,4 +645,21 @@ test('the rail names the project on screen, not only the scene', () => {
   const body = bridgeText.slice(start, start + 1400);
   assert.match(body, /DiagnosticState\.activeProject \|\| 'none'/);
   assert.match(body, />Project</);
+});
+
+test('the scene rail exposes the saved project library to the human', () => {
+  const start = bridgeText.indexOf('  const SceneInspector = {');
+  const body = bridgeText.slice(start, bridgeText.indexOf('// Back-compat shims', start));
+  assert.match(body, /Saved projects/);
+  assert.match(body, /data-open-project/);
+  assert.match(body, /godot_open_saved_project/);
+});
+
+test('saved projects remain reachable in the narrow browser layout', () => {
+  const railStart = bridgeText.indexOf('  const AgentStatusRail = {');
+  const body = bridgeText.slice(railStart, bridgeText.indexOf('  const SceneInspector = {', railStart));
+  assert.match(body, /data-project-library/);
+  assert.match(body, /const ProjectLibraryPopover/);
+  assert.match(body, /data-library-open/);
+  assert.match(body, /executeObservedTool\(tool, \{ project_name:/);
 });
