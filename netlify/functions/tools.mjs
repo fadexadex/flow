@@ -30,15 +30,16 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_import_asset',
-    description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+    description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Supply the bytes as content_base64, or a public http(s) url to fetch (the server fetches it, because this page is cross-origin isolated and cannot; the URL must end in an importable extension and must not resolve to a private address). The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
     input_schema: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav' },
-        content_base64: { type: 'string', description: 'Base64 of the raw file bytes', maxLength: 7000000 },
+        path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav. Omit it when passing a url and the file name from the url is used.' },
+        content_base64: { type: 'string', description: 'Base64 of the raw file bytes. Give this or url, not both.', maxLength: 7000000 },
+        url: { type: 'string', description: 'http(s) URL of an asset to fetch and import. Fetched by the server, not the browser, and only from a public address; the URL must end in an importable extension.' },
         reimport: { type: 'boolean', default: true, description: 'Ask Godot to import it into a loadable resource' }
       },
-      required: ['path', 'content_base64'],
+      required: [],
       additionalProperties: false
     },
     annotations: { readOnlyHint: false, untrustedContentHint: true }

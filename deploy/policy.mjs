@@ -35,7 +35,8 @@ export const PATH_RULES = [
 export const API_ROUTES = [
   { path: '/api/health', function: 'health' },
   { path: '/api/mcp/tools', function: 'tools' },
-  { path: '/api/mcp/rpc', function: 'rpc' }
+  { path: '/api/mcp/rpc', function: 'rpc' },
+  { path: '/api/fetch-asset', function: 'fetch-asset' }
 ];
 
 // Which rules apply to one request path, in declaration order.

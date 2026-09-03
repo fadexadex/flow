@@ -198,3 +198,29 @@ Two things stated rather than hidden:
 - Fixed during this phase: the 2D tools were bumping the scene revision without changing any
   file, which left every session permanently `degraded` with nothing to persist and made the
   next transaction's `expected_revision` wrong.
+
+## phase-7-url-import
+
+Assets from a URL or a dropped file, not only from base64 an agent had to carry.
+
+| File | Shows |
+| ---- | ----- |
+| `url-import-proof.png` | a model fetched from GitHub, imported and instanced |
+| `ssrf-guards.txt` | what the proxy refuses, and what it serves, against the running server |
+
+The page cannot fetch a third-party asset itself: it is cross-origin isolated, so a response
+without a `Cross-Origin-Resource-Policy` header never reaches JavaScript. The server fetches it
+instead — which makes this an SSRF surface, and it is treated as one. Refused, live:
+
+- `http://169.254.169.254/...` — the cloud metadata service, the reason this matters
+- `http://127.0.0.1:8100/...` — loopback, and any private range
+- `file:///etc/passwd` — only http and https
+- `https://example.com/index.html` — the URL must name an asset extension Godot can import
+
+Redirects are followed by hand so each hop is re-checked. Two real bugs were caught by the
+tests while writing it: `URL` keeps the brackets on an IPv6 literal, so `[::1]` was refused for
+the wrong reason; and it normalises `[::ffff:10.0.0.1]` to `[::ffff:a00:1]`, so a private IPv4
+in v6 clothing walked straight through until the mapped form was unwrapped properly.
+
+Measured: Khronos `Box.glb` fetched and imported in **991 ms**, `loadable: true`, `source_url`
+recorded in the result, included in the export, and instanced into the scene straight after.

@@ -48,8 +48,8 @@ FLow can:
 - Set node properties and connect signals on the live scene, through Godot's own undo stack.
 - Add physics bodies with collision shapes, in 2D or 3D: static level geometry, simulated
   rigid bodies, character bodies, and trigger volumes.
-- Import images, fonts, and glTF models into the running editor, and place an imported model
-  in the scene as an instanced node.
+- Import images, fonts, audio, and glTF models into the running editor — from bytes, from a
+  URL, or by dropping a file on the page — and place an imported model in the scene.
 - Synthesize a procedural sound suite and load it in the running game.
 - Run and stop the project, send input, capture the viewport, and record playtests.
 - Read what the person has selected in the editor, so a request like "make this taller" can be
@@ -84,7 +84,11 @@ Each mutating request can include an idempotency key. A retry with the same key 
 
 ## Assets
 
-Binary assets enter a project through `godot_import_asset`. The bytes are written into the
+Binary assets enter a project through `godot_import_asset` — as base64, as a public http(s)
+URL, or by dropping a file onto the page. A URL is fetched by the server rather than the
+browser, because this page is cross-origin isolated and cannot read a third-party response;
+`deploy/fetch_asset.mjs` holds that fetch and its guards, and refuses anything resolving to a
+private or loopback address, re-checking every redirect hop. The bytes are written into the
 running editor, Godot scans and imports them, and the tool reports what Godot confirmed rather
 than assuming the write succeeded. An imported asset is a real project file: it survives an
 editor replacement and it is included in the exported ZIP.
@@ -183,6 +187,7 @@ The server provides:
 | `/api/health`    | Server and connection status                |
 | `/api/mcp/tools` | Read-only tool catalog                      |
 | `/api/mcp/rpc`   | JSON-RPC `tools/list` only                  |
+| `/api/fetch-asset` | Server-side asset fetch for `godot_import_asset`, public addresses only |
 
 
 The server sets Cross-Origin Opener Policy and Cross-Origin Embedder Policy headers. The Godot
@@ -243,7 +248,6 @@ than reporting success.
 
 Named here so the gaps above read as a roadmap rather than a list of dead ends.
 
-- Asset import driven from a URL or a drag-and-drop, not only from base64 supplied by an agent.
 
 ## License
 

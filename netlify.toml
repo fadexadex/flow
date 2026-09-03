@@ -54,3 +54,8 @@
   from = "/api/mcp/rpc"
   to = "/.netlify/functions/rpc"
   status = 200
+
+[[redirects]]
+  from = "/api/fetch-asset"
+  to = "/.netlify/functions/fetch-asset"
+  status = 200

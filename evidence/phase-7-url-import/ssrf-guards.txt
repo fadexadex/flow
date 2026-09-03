@@ -1,0 +1,22 @@
+# Asset import from a URL, and the SSRF guards
+
+## The proxy refuses what it should
+```
+http://169.254.169.254/latest/meta-data/x.png
+  -> {"error":"169.254.169.254 resolves to a private or loopback address (169.254.169.254), which this endpoint will not fetch."}
+http://127.0.0.1:8100/crystal_pickup.glb
+  -> {"error":"127.0.0.1 resolves to a private or loopback address (127.0.0.1), which this endpoint will not fetch."}
+file:///etc/passwd
+  -> {"error":"Only http and https are fetched, not file:"}
+https://example.com/index.html
+  -> {"error":"The URL must end in an asset extension Godot can import. Allowed: .png, .jpg, .jpeg, .webp, .svg, .bmp, .wav, .ogg, .mp3, .glb, .gltf, .obj,
+```
+
+## And fetches what it should
+```
+$ curl -sI ".../api/fetch-asset?url=<Khronos Box.glb on raw.githubusercontent.com>"
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Cross-Origin-Resource-Policy: cross-origin
+X-Asset-Source: https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Box/glTF-Binary/Box.glb
+```

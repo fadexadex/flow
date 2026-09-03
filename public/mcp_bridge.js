@@ -5078,29 +5078,54 @@
     {
       definition: {
         name: 'godot_import_asset',
-        description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Content is base64. The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
+        description: "Imports a binary asset - image, font, audio (.wav/.ogg/.mp3), or model (.glb/.gltf) - into the RUNNING Godot editor and makes it loadable, without restarting. Supply the bytes as content_base64, or a public http(s) url to fetch (the server fetches it, because this page is cross-origin isolated and cannot; the URL must end in an importable extension and must not resolve to a private address). The asset becomes a real project file: it survives editor restarts and is included in godot_export_zip. Place an imported model into a scene with godot_node_instance. Reports what Godot confirmed - that it sees the file, its size on disk, and whether it imported into a loadable resource - rather than assuming the write succeeded.",
         input_schema: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav' },
-            content_base64: { type: 'string', description: 'Base64 of the raw file bytes', maxLength: 7000000 },
+            path: { type: 'string', description: 'Project-relative or res:// path, for example sfx/pickup.wav. Omit it when passing a url and the file name from the url is used.' },
+            content_base64: { type: 'string', description: 'Base64 of the raw file bytes. Give this or url, not both.', maxLength: 7000000 },
+            url: { type: 'string', description: 'http(s) URL of an asset to fetch and import. Fetched by the server, not the browser, and only from a public address; the URL must end in an importable extension.' },
             reimport: { type: 'boolean', default: true, description: 'Ask Godot to import it into a loadable resource' }
           },
-          required: ['path', 'content_base64'],
+          required: [],
           additionalProperties: false
         },
         annotations: { readOnlyHint: false, untrustedContentHint: true }
       },
       handler: async (args = {}) => {
-        const path = cleanProjectPath(args.path);
-        if (!path) throw new Error('path is required.');
+        if (args.url && args.content_base64) {
+          throw new Error('Give either url or content_base64, not both.');
+        }
+        let sourceUrl = null;
+        let fetchedBytes = null;
+        if (args.url) {
+          // Fetched through the server: this page is cross-origin isolated, so a third-party
+          // response without a Cross-Origin-Resource-Policy header never reaches JavaScript.
+          const proxied = `/api/fetch-asset?url=${encodeURIComponent(String(args.url))}`;
+          let response;
+          try {
+            response = await fetch(proxied);
+          } catch (error) {
+            throw new Error(`Could not reach the asset proxy at ${proxied}: ${error.message}. It is served by server.mjs and by the fetch-asset function on Netlify.`);
+          }
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            const error = new Error(detail.error || `The asset proxy returned HTTP ${response.status} for ${args.url}.`);
+            error.code = 'ASSET_FETCH_FAILED';
+            throw error;
+          }
+          fetchedBytes = new Uint8Array(await response.arrayBuffer());
+          sourceUrl = response.headers.get('X-Asset-Source') || String(args.url);
+        }
+        const path = cleanProjectPath(args.path || (sourceUrl ? decodeURIComponent(new URL(sourceUrl).pathname.split('/').pop() || '') : ''));
+        if (!path) throw new Error('path is required, unless a url is given whose file name can be used.');
         if (!EditorCommandChannel.available()) {
           const error = new Error('The editor command plugin is not available, so an asset cannot be imported.');
           error.code = 'EDITOR_COMMAND_UNSUPPORTED';
           throw error;
         }
-        const bytes = decodeUploadChunk(String(args.content_base64 || ''), 'base64');
-        if (!bytes.byteLength) throw new Error('content_base64 decoded to zero bytes.');
+        const bytes = fetchedBytes || decodeUploadChunk(String(args.content_base64 || ''), 'base64');
+        if (!bytes.byteLength) throw new Error(sourceUrl ? `${sourceUrl} returned zero bytes.` : 'content_base64 decoded to zero bytes.');
         if (bytes.byteLength > 5 * 1024 * 1024) throw new Error(`Asset exceeds the 5 MB limit: ${path}`);
 
         const generations = {
@@ -5160,6 +5185,8 @@
           // A real project file in both places that matter: Godot's filesystem, so it is
           // loadable now without a restart, and the project model, so it survives restarts,
           // rides into the export, and satisfies the reference check for any scene using it.
+          // Where it came from, so a project's own history says what is in it.
+          source_url: sourceUrl,
           persistence: 'project_file',
           survives_editor_restart: true,
           included_in_export_zip: true,
@@ -10403,10 +10430,69 @@
     connect();
   }
 
+  // Dropping a file onto the page imports it, through exactly the same tool an agent calls.
+  //
+  // The alternative was base64 in a tool argument, which is fine for an agent and useless for
+  // a person with a texture on their desktop. Nothing here bypasses the import path: it reads
+  // the bytes and hands them to godot_import_asset, so the same confirmation and the same
+  // refusals apply.
+  function installAssetDropTarget() {
+    if (typeof document === 'undefined' || document.__webmcpDropInstalled) return;
+    document.__webmcpDropInstalled = true;
+    const stop = (event) => { event.preventDefault(); event.stopPropagation(); };
+    document.addEventListener('dragover', (event) => {
+      if (!event.dataTransfer?.types?.includes('Files')) return;
+      stop(event);
+      event.dataTransfer.dropEffect = 'copy';
+      AgentStatusRail.setFocusNote('Drop to import into the project');
+    });
+    document.addEventListener('dragleave', (event) => {
+      if (event.relatedTarget) return;
+      AgentStatusRail.setFocusNote('');
+    });
+    document.addEventListener('drop', async (event) => {
+      const files = [...(event.dataTransfer?.files || [])];
+      if (files.length === 0) return;
+      stop(event);
+      AgentStatusRail.setFocusNote('');
+      const tool = MANIFEST_TOOLS.find(item => item.definition.name === 'godot_import_asset');
+      if (!tool) return;
+      for (const file of files) {
+        const target = ASSET_DROP_FOLDERS[extensionOfName(file.name)] || 'assets';
+        try {
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          let binary = '';
+          for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+          const result = await tool.handler({ path: `${target}/${file.name}`, content_base64: btoa(binary) });
+          AgentStatusRail.setFocusNote(`Imported ${file.name}${result.loadable ? '' : ' (Godot could not load it)'}`);
+        } catch (error) {
+          // Said on the rail rather than swallowed: a drop that did nothing is worse than a
+          // drop that says why.
+          AgentStatusRail.setFocusNote(`${file.name}: ${error.message || error}`);
+        }
+      }
+      setTimeout(() => AgentStatusRail.setFocusNote(''), 4000);
+    });
+  }
+
+  function extensionOfName(name) {
+    const dot = String(name).lastIndexOf('.');
+    return dot < 0 ? '' : String(name).slice(dot).toLowerCase();
+  }
+
+  // Where a dropped file lands, so a project does not become a flat pile of assets.
+  const ASSET_DROP_FOLDERS = {
+    '.png': 'art', '.jpg': 'art', '.jpeg': 'art', '.webp': 'art', '.svg': 'art', '.bmp': 'art',
+    '.wav': 'sfx', '.ogg': 'sfx', '.mp3': 'sfx',
+    '.glb': 'models', '.gltf': 'models', '.obj': 'models',
+    '.ttf': 'fonts', '.otf': 'fonts', '.woff': 'fonts', '.woff2': 'fonts'
+  };
+
   function initDOM() {
     DiagnosticHUD.init();
     AgentObservationHUD.ensure();
     BuildingBlocksHUD.ensure();
+    installAssetDropTarget();
     // The render heartbeat has to be running BEFORE anything needs an active-time budget:
     // a budget started with no heartbeat history cannot tell "throttled" from "not started".
     RenderHeartbeat.start();

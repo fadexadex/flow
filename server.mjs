@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { MCP_TOOL_CATALOG } from './netlify/functions/tools.mjs';
 import { headersForPath } from './deploy/policy.mjs';
+import { fetchAsset } from './deploy/fetch_asset.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +39,21 @@ app.get('/api/health', (req, res) => {
     agents_connected: agentClients.size,
     timestamp: new Date().toISOString()
   });
+});
+
+// Asset fetch proxy. The page is cross-origin isolated, so it cannot read a third-party
+// asset itself - see deploy/fetch_asset.mjs for that, and for the SSRF guards this needs.
+app.get('/api/fetch-asset', async (req, res) => {
+  try {
+    const asset = await fetchAsset(String(req.query.url || ''));
+    res.setHeader('Content-Type', asset.content_type);
+    // Without this the isolated page cannot read the response it just asked for.
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('X-Asset-Source', asset.url);
+    res.send(Buffer.from(asset.bytes));
+  } catch (error) {
+    res.status(error.status || 500).json({ error: error.message });
+  }
 });
 
 // MCP discovery & tool list endpoint
