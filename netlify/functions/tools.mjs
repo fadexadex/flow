@@ -198,7 +198,7 @@ export const MCP_TOOL_CATALOG = [
       type: 'object',
       properties: {
         project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
-        template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'custom'], default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; custom requires files.' },
+        template: { type: 'string', enum: ['orbital_garden', 'neon_skyrail_3d', 'arcade_2d', 'custom'], default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; arcade_2d is a side-on 2D scene with a CharacterBody2D runner, ground and camera; custom requires files.' },
         files: { type: 'object', description: 'Custom dictionary of normalized file paths to source strings or binary buffers' },
         idempotency_key: { type: 'string' }
       },
@@ -573,6 +573,55 @@ export const MCP_TOOL_CATALOG = [
           },
           additionalProperties: false
         }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_spawn_2d',
+    description: "Adds a 2D node to the live scene: a coloured rect, a label, a polygon, a line, or a sprite from an imported texture. Positions are in pixels with +Y downward, which is Godot's 2D convention and the opposite of the 3D tools. Use godot_node_body_2d for anything that needs collision. Applied through the editor command channel without restarting the engine. Requires a 2D scene open - create one with the arcade_2d template or godot_open_scene.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Unique name of the node' },
+        node_type: { type: 'string', enum: ['rect', 'label', 'polygon', 'line', 'sprite'], default: 'rect' },
+        parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+        position: { type: 'array', items: { type: 'number' }, description: 'Pixel position [x, y], +Y downward' },
+        rotation: { type: 'number', description: 'Rotation in degrees' },
+        scale: { type: 'array', items: { type: 'number' }, description: 'Scale factors [sx, sy]' },
+        size: { type: 'array', items: { type: 'number' }, description: 'Pixel size [w, h], for rect' },
+        color: { type: 'string', description: 'Hex colour, for rect / polygon / line' },
+        text: { type: 'string', description: 'Text, for label' },
+        width: { type: 'number', description: 'Stroke width, for line' },
+        points: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'Points [[x, y], ...] for polygon and line' },
+        texture: { type: 'string', description: 'res:// path of an imported texture, for sprite' }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_body_2d',
+    description: "Adds a 2D physics body with a collision shape - and by default a matching coloured rect - to the live scene. Static for level geometry, rigid for something that falls, character for something a script drives, area for a trigger. Positions are in pixels with +Y downward. The body, its collider and its rect are created in one undo action. Applied through the editor command channel without restarting the engine.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Unique name of the body node' },
+        body_type: { type: 'string', enum: ['static', 'rigid', 'character', 'area'], default: 'static' },
+        shape: { type: 'string', enum: ['rect', 'circle', 'capsule'], default: 'rect' },
+        parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+        size: { type: 'array', items: { type: 'number' }, description: 'Pixel size [w, h], for a rect shape' },
+        radius: { type: 'number', description: 'Radius in pixels, for circle and capsule' },
+        height: { type: 'number', description: 'Height in pixels, for capsule' },
+        mass: { type: 'number', default: 1, description: 'Mass, for body_type rigid' },
+        visible_rect: { type: 'boolean', default: true, description: 'Set false for an invisible collider or trigger' },
+        color: { type: 'string', description: 'Hex colour of the rect' },
+        position: { type: 'array', items: { type: 'number' }, description: 'Pixel position [x, y], +Y downward' },
+        rotation: { type: 'number', description: 'Rotation in degrees' },
+        scale: { type: 'array', items: { type: 'number' }, description: 'Scale factors [sx, sy]' }
       },
       required: ['name'],
       additionalProperties: false

@@ -2648,7 +2648,7 @@
   // ==========================================
   // The two built-in project templates are pure string builders and live in
   // public/project_templates.js, loaded before this file.
-  const { NeonSkyrail, OrbitalGarden } = window.GodotProjectTemplates || {};
+  const { NeonSkyrail, OrbitalGarden, Arcade2D } = window.GodotProjectTemplates || {};
   if (!NeonSkyrail || !OrbitalGarden) {
     throw new Error('project_templates.js must be loaded before mcp_bridge.js; the built-in project templates are unavailable.');
   }
@@ -4792,7 +4792,56 @@
   }
 
   // One list, so the schema enum and the runtime check cannot drift apart.
-  const PROJECT_TEMPLATES = ['orbital_garden', 'neon_skyrail_3d', 'custom'];
+  const PROJECT_TEMPLATES = ['orbital_garden', 'neon_skyrail_3d', 'arcade_2d', 'custom'];
+
+  // 2D mutations go through the command channel only.
+  //
+  // The 3D tools can fall back to rewriting .tscn text and replacing the editor. That fallback
+  // exists because 3D scene text is a shape this bridge has always generated; 2D is not, and a
+  // half-supported fallback that produces a scene Godot loads differently from what the editor
+  // shows would be worse than saying the channel is required.
+  async function nodeMutation2d(op, args, payload) {
+    const nodeName = payload.name;
+    if (!nodeName) throw new Error('name is required.');
+    if (!EditorCommandChannel.available()) {
+      const error = new Error('The editor command plugin is not available, so 2D nodes cannot be added.');
+      error.code = 'EDITOR_COMMAND_UNSUPPORTED';
+      throw error;
+    }
+    if (findNodeInActiveScene(activeFilesDict, nodeName)) {
+      throw new Error(`A node named '${nodeName}' already exists in the active scene. Godot renames name clashes on load, so pick a unique name or delete the existing node first.`);
+    }
+    const started = nowMs();
+    const reply = EditorCommandChannel.call(op, payload);
+    if (!reply.ok) editorRejection(op === 'node_body_2d' ? 'Add 2D body' : 'Add 2D node', reply, 'The WebMCP editor plugin is not loaded in this project.');
+    // The scene revision is the optimistic-concurrency counter for the FILE model, and this
+    // changed no file. Bumping it here left every session permanently 'degraded' - revision
+    // ahead of persisted revision, with nothing to persist - and made the next transaction's
+    // expected_revision wrong.
+    DiagnosticHUD.render();
+    return {
+      success: true,
+      node_name: reply.node_name,
+      node_path: reply.node_path,
+      type: reply.node_class,
+      dimension: '2d',
+      position: reply.position,
+      body_class: reply.body_class || null,
+      collision_path: reply.collision_path || null,
+      shape_class: reply.shape_class || null,
+      scene_revision: DiagnosticState.sceneRevision,
+      editor_channel: 'command',
+      editor_restarted: false,
+      // The node is live in the editor and NOT yet in the .tscn text this bridge holds: 2D
+      // scene serialization is not implemented here, so saying it were persisted would be a
+      // lie. Save the scene, or write the .tscn through a transaction, to make it durable.
+      applied: 'editor_command',
+      source_synced: false,
+      source_unverified_reason: 'live_2d_not_serialized',
+      persisted: false,
+      execution_time_ms: Number((nowMs() - started).toFixed(2))
+    };
+  }
 
   const MANIFEST_TOOLS = [
     {
@@ -5767,7 +5816,7 @@
           type: 'object',
           properties: {
             project_name: { type: 'string', default: 'echoes_of_the_orbital_garden' },
-            template: { type: 'string', enum: PROJECT_TEMPLATES, default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; custom requires files.' },
+            template: { type: 'string', enum: PROJECT_TEMPLATES, default: 'orbital_garden', description: 'orbital_garden is a 3D sanctuary with a CharacterBody3D player and camera; neon_skyrail_3d is a 3D endless runner; arcade_2d is a side-on 2D scene with a CharacterBody2D runner, ground and camera; custom requires files.' },
             files: { type: 'object', description: 'Custom dictionary of file paths to source strings/buffers to write into res://' },
             idempotency_key: { type: 'string' }
           },
@@ -5810,6 +5859,16 @@
           stagedFiles = Object.fromEntries(Object.entries(args.files).map(([filePath, content]) => [cleanProjectPath(filePath), content]));
           projectType = 'custom_injected';
           mainScene = inferMainScene(stagedFiles);
+        } else if (args.template === 'arcade_2d') {
+          stagedFiles = {
+            'project.godot': Arcade2D.generateProjectGodot(projName),
+            'main_2d.tscn': Arcade2D.generateMainScene(),
+            'arcade_2d.gd': Arcade2D.generateMainGd(),
+            'runner_2d.tscn': Arcade2D.generateRunnerTscn(),
+            'runner_2d.gd': Arcade2D.generateRunnerGd()
+          };
+          mainScene = 'res://main_2d.tscn';
+          projectType = 'arcade_2d';
         } else if (args.template === 'neon_skyrail_3d' || projName.includes('skyrail') || projName.includes('runner')) {
           stagedFiles = {
             'project.godot': NeonSkyrail.generateProjectGodot(),
@@ -7409,6 +7468,76 @@
     },
     {
       definition: {
+        name: 'godot_node_spawn_2d',
+        description: "Adds a 2D node to the live scene: a coloured rect, a label, a polygon, a line, or a sprite from an imported texture. Positions are in pixels with +Y downward, which is Godot's 2D convention and the opposite of the 3D tools. Use godot_node_body_2d for anything that needs collision. Applied through the editor command channel without restarting the engine. Requires a 2D scene open - create one with the arcade_2d template or godot_open_scene.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Unique name of the node' },
+            node_type: { type: 'string', enum: ['rect', 'label', 'polygon', 'line', 'sprite'], default: 'rect' },
+            parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+            position: { type: 'array', items: { type: 'number' }, description: 'Pixel position [x, y], +Y downward' },
+            rotation: { type: 'number', description: 'Rotation in degrees' },
+            scale: { type: 'array', items: { type: 'number' }, description: 'Scale factors [sx, sy]' },
+            size: { type: 'array', items: { type: 'number' }, description: 'Pixel size [w, h], for rect' },
+            color: { type: 'string', description: 'Hex colour, for rect / polygon / line' },
+            text: { type: 'string', description: 'Text, for label' },
+            width: { type: 'number', description: 'Stroke width, for line' },
+            points: { type: 'array', items: { type: 'array', items: { type: 'number' } }, description: 'Points [[x, y], ...] for polygon and line' },
+            texture: { type: 'string', description: 'res:// path of an imported texture, for sprite' }
+          },
+          required: ['name'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => nodeMutation2d('node_add_2d', args, {
+        name: cleanProjectName(args.name),
+        node_type: String(args.node_type || 'rect').toLowerCase(),
+        parent_path: args.parent_path || '.',
+        position: args.position, rotation: args.rotation, scale: args.scale,
+        size: args.size, color: args.color, text: args.text, width: args.width,
+        points: args.points, texture: args.texture
+      })
+    },
+    {
+      definition: {
+        name: 'godot_node_body_2d',
+        description: "Adds a 2D physics body with a collision shape - and by default a matching coloured rect - to the live scene. Static for level geometry, rigid for something that falls, character for something a script drives, area for a trigger. Positions are in pixels with +Y downward. The body, its collider and its rect are created in one undo action. Applied through the editor command channel without restarting the engine.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Unique name of the body node' },
+            body_type: { type: 'string', enum: ['static', 'rigid', 'character', 'area'], default: 'static' },
+            shape: { type: 'string', enum: ['rect', 'circle', 'capsule'], default: 'rect' },
+            parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+            size: { type: 'array', items: { type: 'number' }, description: 'Pixel size [w, h], for a rect shape' },
+            radius: { type: 'number', description: 'Radius in pixels, for circle and capsule' },
+            height: { type: 'number', description: 'Height in pixels, for capsule' },
+            mass: { type: 'number', default: 1, description: 'Mass, for body_type rigid' },
+            visible_rect: { type: 'boolean', default: true, description: 'Set false for an invisible collider or trigger' },
+            color: { type: 'string', description: 'Hex colour of the rect' },
+            position: { type: 'array', items: { type: 'number' }, description: 'Pixel position [x, y], +Y downward' },
+            rotation: { type: 'number', description: 'Rotation in degrees' },
+            scale: { type: 'array', items: { type: 'number' }, description: 'Scale factors [sx, sy]' }
+          },
+          required: ['name'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => nodeMutation2d('node_body_2d', args, {
+        name: cleanProjectName(args.name),
+        body_type: String(args.body_type || 'static').toLowerCase(),
+        shape: String(args.shape || 'rect').toLowerCase(),
+        parent_path: args.parent_path || '.',
+        size: args.size, radius: args.radius, height: args.height, mass: args.mass,
+        visible_rect: args.visible_rect !== false, color: args.color,
+        position: args.position, rotation: args.rotation, scale: args.scale
+      })
+    },
+    {
+      definition: {
         name: 'godot_node_body',
         description: "Adds a physics body with a collision shape - and, by default, a matching visible mesh - to the live 3D scene. This is what a floor, a wall, a solid prop or a pickup trigger needs: godot_node_spawn creates visual geometry only, so nothing stands on it and nothing collides with it. Choose static for level geometry, rigid for something that falls and is pushed, character for something a script drives, area for a trigger volume that detects overlap without blocking. The body, its collider and its mesh are created in one undo action and move together as one node. Applied through the editor command channel without restarting the engine when the plugin is present.",
         input_schema: {
@@ -7644,6 +7773,62 @@
         // to BranchB/TwinOrb land on BranchA/TwinOrb in the serialized scene.
         const requestedPath = args.node_path;
         const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : null;
+
+        // A 2D node is not in the .tscn text this bridge serializes, so the text rewrite below
+        // has nothing to edit and would refuse a move the editor can perform perfectly well.
+        // Ask the editor: it answers with dimension '2d' for a Node2D, and that is the whole
+        // decision. The same honesty applies as for the other 2D tools - the move is live and
+        // not in the file.
+        if (EditorCommandChannel.available()) {
+          const probe = EditorCommandChannel.call('node_transform', {
+            node_path: args.node_path, position: args.position,
+            rotation: args.rotation, scale: args.scale, relative: args.relative === true
+          });
+          if (probe.ok && probe.dimension === '2d') {
+            return {
+              success: true,
+              node_path: args.node_path,
+              resolved_node_path: probe.node_path,
+              dimension: '2d',
+              position: probe.position,
+              rotation: probe.rotation,
+              scale: probe.scale,
+              editor_channel: 'command',
+              editor_restarted: false,
+              applied: 'editor_command',
+              source_synced: false,
+              source_unverified_reason: 'live_2d_not_serialized',
+              persisted: false
+            };
+          }
+          if (probe.ok) {
+            // A 3D node, already moved by that call. Re-running it through the mutator below
+            // would apply the same relative offset twice.
+            const applied = await liveMutateSceneFile((source) => applyTransformToSceneText(source, resolvedNodePath(probe, requestedPath), {
+              position: args.position, rotation: args.rotation, scale: args.scale,
+              relative: args.relative === true, authoritative: probe.transform
+            }), {
+              verify: (source) => verifyTransformInSource(source, resolvedNodePath(probe, requestedPath), probe.transform)
+            });
+            applied.commandReply = probe;
+            applied.channel = 'command';
+            const navigation2 = await follow3DWorkspace(probe.node_path || requestedPath);
+            if (typeof window !== 'undefined') {
+              AgentFocusOverlay.settleWork(probe.node_path || requestedPath, pos || null, 'Moved', applied.ok !== false);
+              CameraGuidance.noteSceneChanged(probe.node_path || requestedPath);
+            }
+            return liveMutationResult(applied, {
+              node_path: args.node_path,
+              resolved_node_path: probe.node_path || null,
+              position: probe.position || pos,
+              rotation: args.rotation || null,
+              scale: args.scale || null,
+              relative: args.relative === true,
+              serialized_transform: probe.transform || null,
+              follow: navigation2
+            });
+          }
+        }
         // The light goes on before the edit, anchored to where the node is now, so the move is
         // something you watch happen instead of something you are told about afterwards.
         if (typeof window !== 'undefined') AgentFocusOverlay.beginWork(requestedPath, 'Moving');
@@ -8203,6 +8388,8 @@
         godot_node_instance: `Placing ${input.name || 'model'} from ${String(input.scene_path || '').split('/').pop() || 'a scene'}`,
         godot_node_body: `Adding ${input.name || 'body'} (${input.body_type || 'static'} ${input.mesh_type || 'box'})`,
         godot_switch_mode: `Switching to the ${input.mode || '3D'} workspace`,
+        godot_node_spawn_2d: `Adding 2D ${input.name || 'node'} (${input.node_type || 'rect'})`,
+        godot_node_body_2d: `Adding 2D ${input.name || 'body'} (${input.body_type || 'static'} ${input.shape || 'rect'})`,
         godot_connect_signal_live: `Connecting ${input.from_node || 'node'}.${input.signal || 'signal'} to ${input.method || 'a handler'}`,
         godot_node_set_property: `Setting ${input.node_path || 'node'}.${input.property || 'property'}`,
         godot_node_transform: `Transforming ${input.node_path || 'node'}`,

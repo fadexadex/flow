@@ -173,3 +173,28 @@ files are generated, and `npm test` fails if the checked-in ones stop matching.
 
 Verified in the page afterwards: `crossOriginIsolated: true`, SharedArrayBuffer available,
 55 tools on `/api/mcp/tools`, editor healthy with 0 project errors.
+
+## phase-6-2d
+
+The live mutator was 3D only. Now it is not.
+
+| File | Shows |
+| ---- | ----- |
+| `live-2d-proof.png` | the 2D template, seven live 2D operations, and the game running |
+| `arcade-2d-playing.mp4` | the runner responding to input in the running 2D game |
+
+`godot_create_project` gains an `arcade_2d` template — a Camera2D, a `StaticBody2D` ground and
+a `CharacterBody2D` runner with movement, so a 2D game has somewhere to start.
+`godot_node_spawn_2d` and `godot_node_body_2d` add rects, labels, polygons, lines, sprites and
+the four 2D body types, 1–2 ms each. `godot_node_transform` now asks the editor which dimension
+the node is rather than assuming 3D.
+
+Two things stated rather than hidden:
+
+- A live 2D edit reports `source_synced: false` and `persisted: false`. The bridge serializes
+  3D scene text, not 2D, so the node is real in the editor and not in the `.tscn`. That is why
+  the live-added platforms are absent from the running game in frame 3 — the game runs the
+  saved scene, and the tool said so.
+- Fixed during this phase: the 2D tools were bumping the scene revision without changing any
+  file, which left every session permanently `degraded` with nothing to persist and made the
+  next transaction's `expected_revision` wrong.

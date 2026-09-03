@@ -347,5 +347,122 @@ func _physics_process(delta):
   }
 };
 
-  window.GodotProjectTemplates = { NeonSkyrail: NeonSkyrail, OrbitalGarden: OrbitalGarden };
+// A 2D starting point. The live mutator spoke only Node3D, so an agent asked for a 2D game
+// had nowhere to begin - not because Godot cannot, but because nothing here did.
+const Arcade2D = {
+  generateProjectGodot(name = 'Arcade 2D') {
+    return `; Engine configuration file for ${name}
+config_version=5
+
+[application]
+config/name="${name}"
+run/main_scene="res://main_2d.tscn"
+config/features=PackedStringArray("4.7", "GL Compatibility")
+
+[display]
+window/size/viewport_width=1152
+window/size/viewport_height=648
+window/stretch/mode="canvas_items"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+environment/defaults/default_clear_color=Color(0.06, 0.07, 0.12, 1)
+`;
+  },
+
+  generateMainScene() {
+    return `[gd_scene load_steps=4 format=3 uid="uid://arcade_2d_main"]
+
+[ext_resource type="Script" path="res://arcade_2d.gd" id="1_arcade"]
+[ext_resource type="PackedScene" path="res://runner_2d.tscn" id="2_runner"]
+
+[sub_resource type="RectangleShape2D" id="Shape_Ground"]
+size = Vector2(1152, 64)
+
+[node name="Arcade" type="Node2D"]
+script = ExtResource("1_arcade")
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(576, 324)
+
+[node name="Ground" type="StaticBody2D" parent="."]
+position = Vector2(576, 600)
+
+[node name="GroundCollision" type="CollisionShape2D" parent="Ground"]
+shape = SubResource("Shape_Ground")
+
+[node name="GroundRect" type="ColorRect" parent="Ground"]
+offset_left = -576.0
+offset_top = -32.0
+offset_right = 576.0
+offset_bottom = 32.0
+color = Color(0.16, 0.2, 0.3, 1)
+mouse_filter = 2
+
+[node name="Runner" parent="." instance=ExtResource("2_runner")]
+position = Vector2(240, 400)
+`;
+  },
+
+  generateMainGd() {
+    return `extends Node2D
+## Arcade 2D - a starting point for a side-on game.
+
+var elapsed: float = 0.0
+
+func _ready() -> void:
+\tprint("[Arcade2D] ready; move the runner with the arrow keys, jump with space")
+
+func _process(delta: float) -> void:
+\telapsed += delta
+`;
+  },
+
+  generateRunnerTscn() {
+    return `[gd_scene load_steps=3 format=3 uid="uid://arcade_2d_runner"]
+
+[ext_resource type="Script" path="res://runner_2d.gd" id="1_runner"]
+
+[sub_resource type="RectangleShape2D" id="Shape_Runner"]
+size = Vector2(44, 64)
+
+[node name="Runner" type="CharacterBody2D"]
+script = ExtResource("1_runner")
+
+[node name="RunnerCollision" type="CollisionShape2D" parent="."]
+shape = SubResource("Shape_Runner")
+
+[node name="RunnerRect" type="ColorRect" parent="."]
+offset_left = -22.0
+offset_top = -32.0
+offset_right = 22.0
+offset_bottom = 32.0
+color = Color(0.35, 0.9, 0.7, 1)
+mouse_filter = 2
+`;
+  },
+
+  generateRunnerGd() {
+    return `extends CharacterBody2D
+
+@export var move_speed: float = 320.0
+@export var jump_velocity: float = -640.0
+var gravity: float = 1400.0
+
+func _physics_process(delta: float) -> void:
+\tif not is_on_floor():
+\t\tvelocity.y += gravity * delta
+\tif Input.is_action_just_pressed("ui_accept") and is_on_floor():
+\t\tvelocity.y = jump_velocity
+\tvar direction := Input.get_axis("ui_left", "ui_right")
+\tif direction != 0.0:
+\t\tvelocity.x = direction * move_speed
+\telse:
+\t\tvelocity.x = move_toward(velocity.x, 0.0, move_speed)
+\tmove_and_slide()
+`;
+  }
+};
+
+  window.GodotProjectTemplates = { NeonSkyrail: NeonSkyrail, OrbitalGarden: OrbitalGarden, Arcade2D: Arcade2D };
 }());

@@ -108,6 +108,8 @@ func _on_command(args: Array) -> String:
 		"viewport_api": reply = _op_viewport_api(payload)
 		"node_add": reply = _op_node_add(payload)
 		"node_body": reply = _op_node_body(payload)
+		"node_add_2d": reply = _op_node_add_2d(payload)
+		"node_body_2d": reply = _op_node_body_2d(payload)
 		"workspace_set": reply = _op_workspace_set(payload)
 		"signal_connect": reply = _op_signal_connect(payload)
 		"node_set_property": reply = _op_node_set_property(payload)
@@ -1377,8 +1379,195 @@ func _build_shape(payload: Dictionary) -> Shape3D:
 			return slab
 	return null
 
+## 2D authoring. The live mutator was 3D only, so a 2D game could not be built at all through
+## the tools - not because Godot cannot, but because nothing here spoke Node2D.
+func _op_node_add_2d(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var parent := _resolve_node(String(payload.get("parent_path", ".")))
+	if parent == null:
+		parent = root
+	var node_name := String(payload.get("name", ""))
+	if node_name == "":
+		return {"ok": false, "error": "node_add_2d requires a name."}
+	if _find_by_name(root, node_name) != null:
+		return {"ok": false, "error": "A node named '%s' already exists in this scene." % node_name}
+	var node := _build_node_2d(payload)
+	if node == null:
+		return {"ok": false, "error": "Unknown node_type '%s'. Supported: sprite, rect, polygon, line, label." % String(payload.get("node_type", "rect"))}
+	node.name = node_name
+	_apply_transform_2d(node, payload)
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: add 2D %s" % node_name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "add_child", node, true)
+	undo.add_do_method(node, "set_owner", root)
+	undo.add_do_reference(node)
+	undo.add_undo_method(parent, "remove_child", node)
+	undo.commit_action()
+	return _node_2d_reply(root, node)
+
+func _op_node_body_2d(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var parent := _resolve_node(String(payload.get("parent_path", ".")))
+	if parent == null:
+		parent = root
+	var node_name := String(payload.get("name", ""))
+	if node_name == "":
+		return {"ok": false, "error": "node_body_2d requires a name."}
+	if _find_by_name(root, node_name) != null:
+		return {"ok": false, "error": "A node named '%s' already exists in this scene." % node_name}
+	var shape := _build_shape_2d(payload)
+	if shape == null:
+		return {"ok": false, "error": "Unknown shape '%s'. Supported: rect, circle, capsule." % String(payload.get("shape", "rect"))}
+	var body := _build_body_2d(payload)
+	if body == null:
+		return {"ok": false, "error": "Unknown body_type '%s'. Supported: static, rigid, character, area." % String(payload.get("body_type", "static"))}
+	body.name = node_name
+	var collider := CollisionShape2D.new()
+	collider.name = node_name + "Collision"
+	collider.shape = shape
+	body.add_child(collider)
+	var visual: ColorRect = null
+	if bool(payload.get("visible_rect", true)):
+		visual = ColorRect.new()
+		visual.name = node_name + "Rect"
+		var size := _vector2(payload.get("size"), Vector2(64, 64))
+		visual.size = size
+		# ColorRect grows from its top-left; the collider is centred on the body, so the rect
+		# is offset by half its size or the two do not line up.
+		visual.position = -size * 0.5
+		visual.color = _color(payload.get("color"), Color(0.35, 0.65, 0.95))
+		visual.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		body.add_child(visual)
+	_apply_transform_2d(body, payload)
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: add 2D body %s" % node_name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "add_child", body, true)
+	undo.add_do_method(body, "set_owner", root)
+	undo.add_do_method(collider, "set_owner", root)
+	if visual != null:
+		undo.add_do_method(visual, "set_owner", root)
+	undo.add_do_reference(body)
+	undo.add_undo_method(parent, "remove_child", body)
+	undo.commit_action()
+	var reply := _node_2d_reply(root, body)
+	reply["body_class"] = body.get_class()
+	reply["collision_path"] = String(root.get_path_to(collider))
+	reply["shape_class"] = shape.get_class()
+	reply["rect_path"] = String(root.get_path_to(visual)) if visual != null else ""
+	return reply
+
+func _build_node_2d(payload: Dictionary) -> CanvasItem:
+	match String(payload.get("node_type", "rect")).to_lower():
+		"rect":
+			var rect := ColorRect.new()
+			rect.size = _vector2(payload.get("size"), Vector2(64, 64))
+			rect.color = _color(payload.get("color"), Color(0.35, 0.65, 0.95))
+			rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+			return rect
+		"label":
+			var label := Label.new()
+			label.text = String(payload.get("text", "Label"))
+			return label
+		"polygon":
+			var polygon := Polygon2D.new()
+			polygon.polygon = _packed_vector2(payload.get("points"))
+			polygon.color = _color(payload.get("color"), Color(0.95, 0.75, 0.35))
+			return polygon
+		"line":
+			var line := Line2D.new()
+			line.points = _packed_vector2(payload.get("points"))
+			line.width = float(payload.get("width", 4.0))
+			line.default_color = _color(payload.get("color"), Color(1, 1, 1))
+			return line
+		"sprite":
+			var texture_path := String(payload.get("texture", ""))
+			if texture_path == "" or not ResourceLoader.exists(texture_path):
+				return null
+			var sprite := Sprite2D.new()
+			sprite.texture = load(texture_path)
+			return sprite
+	return null
+
+func _build_body_2d(payload: Dictionary) -> Node2D:
+	match String(payload.get("body_type", "static")).to_lower():
+		"static":
+			return StaticBody2D.new()
+		"rigid":
+			var rigid := RigidBody2D.new()
+			rigid.mass = maxf(0.001, float(payload.get("mass", 1.0)))
+			return rigid
+		"character":
+			return CharacterBody2D.new()
+		"area":
+			var area := Area2D.new()
+			area.monitoring = bool(payload.get("monitoring", true))
+			return area
+	return null
+
+func _build_shape_2d(payload: Dictionary) -> Shape2D:
+	match String(payload.get("shape", "rect")).to_lower():
+		"rect":
+			var rect := RectangleShape2D.new()
+			rect.size = _vector2(payload.get("size"), Vector2(64, 64))
+			return rect
+		"circle":
+			var circle := CircleShape2D.new()
+			circle.radius = float(payload.get("radius", 32.0))
+			return circle
+		"capsule":
+			var capsule := CapsuleShape2D.new()
+			capsule.radius = float(payload.get("radius", 24.0))
+			capsule.height = float(payload.get("height", 80.0))
+			return capsule
+	return null
+
+func _apply_transform_2d(node: CanvasItem, payload: Dictionary) -> void:
+	var position := _vector2(payload.get("position"), Vector2.ZERO)
+	if node is Node2D:
+		var node2d := node as Node2D
+		node2d.position = position
+		node2d.rotation_degrees = float(payload.get("rotation", 0.0))
+		node2d.scale = _vector2(payload.get("scale"), Vector2.ONE)
+	elif node is Control:
+		(node as Control).position = position
+
+func _node_2d_reply(root: Node, node: CanvasItem) -> Dictionary:
+	var position := Vector2.ZERO
+	if node is Node2D:
+		position = (node as Node2D).position
+	elif node is Control:
+		position = (node as Control).position
+	return {
+		"ok": true,
+		"node_path": String(root.get_path_to(node)),
+		"node_name": String(node.name),
+		"node_class": node.get_class(),
+		"dimension": "2d",
+		"position": [position.x, position.y],
+	}
+
+func _vector2(value: Variant, fallback: Vector2) -> Vector2:
+	if typeof(value) == TYPE_ARRAY and (value as Array).size() >= 2:
+		return Vector2(float(value[0]), float(value[1]))
+	return fallback
+
+func _packed_vector2(value: Variant) -> PackedVector2Array:
+	var points := PackedVector2Array()
+	if typeof(value) != TYPE_ARRAY:
+		return points
+	for entry in value:
+		if typeof(entry) == TYPE_ARRAY and (entry as Array).size() >= 2:
+			points.append(Vector2(float(entry[0]), float(entry[1])))
+	return points
+
 func _op_node_transform(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
+	if node != null and node is Node2D:
+		return _transform_node_2d(node as Node2D, payload)
 	if node == null or not (node is Node3D):
 		return _resolve_error(String(payload.get("node_path", "")), "Node3D")
 	var node3d := node as Node3D
@@ -1404,6 +1593,35 @@ func _op_node_transform(payload: Dictionary) -> Dictionary:
 		"position": [target.origin.x, target.origin.y, target.origin.z],
 		"aabb": _aabb_of(node3d),
 		"transform": _transform_array(node3d),
+	}
+
+## The 2D arm of node_transform. Same tool, same undo behaviour; a Node2D simply has a
+## Vector2 position, one rotation angle and a Vector2 scale.
+func _transform_node_2d(node: Node2D, payload: Dictionary) -> Dictionary:
+	var relative := bool(payload.get("relative", false))
+	var position := _vector2(payload.get("position"), node.position)
+	var rotation := float(payload.get("rotation", node.rotation_degrees))
+	var scale := _vector2(payload.get("scale"), node.scale)
+	if relative:
+		position = node.position + _vector2(payload.get("position"), Vector2.ZERO)
+		rotation = node.rotation_degrees + float(payload.get("rotation", 0.0))
+		scale = node.scale * _vector2(payload.get("scale"), Vector2.ONE)
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: transform %s" % String(node.name), UndoRedo.MERGE_ENDS, node)
+	undo.add_do_property(node, "position", position)
+	undo.add_do_property(node, "rotation_degrees", rotation)
+	undo.add_do_property(node, "scale", scale)
+	undo.add_undo_property(node, "position", node.position)
+	undo.add_undo_property(node, "rotation_degrees", node.rotation_degrees)
+	undo.add_undo_property(node, "scale", node.scale)
+	undo.commit_action()
+	return {
+		"ok": true,
+		"dimension": "2d",
+		"node_path": String(EditorInterface.get_edited_scene_root().get_path_to(node)),
+		"position": [node.position.x, node.position.y],
+		"rotation": node.rotation_degrees,
+		"scale": [node.scale.x, node.scale.y],
 	}
 
 func _op_node_material(payload: Dictionary) -> Dictionary:

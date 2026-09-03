@@ -46,8 +46,8 @@ FLow can:
 - Update eligible GDScript files without replacing the editor.
 - Add, transform, recolor, and delete supported 3D nodes through Godot editor commands.
 - Set node properties and connect signals on the live scene, through Godot's own undo stack.
-- Add physics bodies with collision shapes: static level geometry, simulated rigid bodies,
-  character bodies, and trigger volumes.
+- Add physics bodies with collision shapes, in 2D or 3D: static level geometry, simulated
+  rigid bodies, character bodies, and trigger volumes.
 - Import images, fonts, and glTF models into the running editor, and place an imported model
   in the scene as an instanced node.
 - Synthesize a procedural sound suite and load it in the running game.
@@ -108,7 +108,7 @@ warm page. Every one of these calls is a tool an agent can make.
 
 | Step                                                                      | Tool                          | Time    |
 | ------------------------------------------------------------------------- | ----------------------------- | ------- |
-| Create the project from a template                                        | `godot_create_project`        | ~3 s    |
+| Create the project from a template (3D, or `arcade_2d` for a side-on 2D scene) | `godot_create_project`   | ~3 s    |
 | Import a glTF model                                                       | `godot_import_asset`          | ~1 s    |
 | Add the procedural sound suite                                            | `godot_synthesize_audio_suite`| ~1 s    |
 | Write an arena floor scene with collision                                 | `godot_apply_file_transaction`| ~4 s    |
@@ -128,7 +128,7 @@ result, instead of guessing at timings.
 
 ## Tool catalog
 
-55 tools, all prefixed `godot_`. None of them is a stub: every tool either does the thing or says why it could not. The live catalog with full schemas is at `/api/mcp/tools`.
+57 tools, all prefixed `godot_`. None of them is a stub: every tool either does the thing or says why it could not. The live catalog with full schemas is at `/api/mcp/tools`.
 
 | Group | Tools |
 | ----- | ----- |
@@ -137,6 +137,7 @@ result, instead of guessing at timings.
 | Project uploads | `begin_project_upload`, `upload_project_file_chunk`, `upload_project_chunk_batch`, `get_project_upload_status`, `commit_project_upload`, `abort_project_upload` |
 | Files and scenes | `inspect_project_files`, `inspect_scene_graph`, `apply_file_transaction`, `apply_script_patch`, `apply_text_patch`, `undo_transaction`, `open_scene` |
 | Assets and audio | `import_asset`, `synthesize_audio_suite`, `generate_audio_fx` |
+| Live 2D editing | `node_spawn_2d`, `node_body_2d` (`node_transform` handles both dimensions) |
 | Live 3D editing | `node_spawn`, `node_body`, `node_instance`, `node_transform`, `node_material`, `node_set_property`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live`, `connect_signal_live` |
 | Camera and navigation | `camera_focus`, `camera_follow`, `workspace_follow`, `switch_mode` |
 | Running the game | `run_game`, `stop_game`, `send_input`, `send_input_sequence`, `get_input_sequence_status`, `send_pointer`, `get_game_telemetry`, `semantic_playtest_step` |
@@ -225,7 +226,10 @@ than reporting success.
   the live editor tree and the undo history with no prompt, so that write replaces the editor
   instead. So do `project.godot`, `addons/`, deletes and binary content. If an editor exit
   hangs, recovery needs a page reload; the project is safe in storage.
-- **The live mutator is 3D only.** It is not a general 2D editing system.
+- **A live 2D edit is not written into the scene file.** The bridge serializes 3D scene text,
+  not 2D, so `godot_node_spawn_2d`, `godot_node_body_2d` and a 2D `godot_node_transform` report
+  `source_synced: false` and `persisted: false`: the node is real in the editor and absent from
+  the `.tscn` until the scene is saved or written through a transaction.
 - **A property set live in the editor is not written into the scene file.**
   `godot_node_set_property` changes the node in the running editor and reports `persisted:
   false`; a transaction or a scene save is what makes it durable.
@@ -240,7 +244,6 @@ than reporting success.
 Named here so the gaps above read as a roadmap rather than a list of dead ends.
 
 - Asset import driven from a URL or a drag-and-drop, not only from base64 supplied by an agent.
-- A 2D live mutator alongside the 3D one.
 
 ## License
 

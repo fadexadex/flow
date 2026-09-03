@@ -839,7 +839,7 @@ test('an unknown project template is refused, not quietly substituted', () => {
   assert.match(body, /!PROJECT_TEMPLATES\.includes\(args\.template\)/);
   assert.match(body, /Unknown template/);
   // Schema and runtime check read the same list, so they cannot drift.
-  assert.match(bridgeText, /const PROJECT_TEMPLATES = \['orbital_garden', 'neon_skyrail_3d', 'custom'\];/);
+  assert.match(bridgeText, /const PROJECT_TEMPLATES = \['orbital_garden', 'neon_skyrail_3d', 'arcade_2d', 'custom'\];/);
   assert.match(body, /enum: PROJECT_TEMPLATES/);
 });
 
@@ -994,4 +994,64 @@ test('an editor rejection is not reported as a missing command channel', () => {
   assert.match(body, /if \(reply\?\.unsupported\) unsupportedEditorOperation/);
   assert.match(body, /EDITOR_COMMAND_REJECTED/);
   assert.match(body, /reply\?\.error \|\|/);
+});
+
+// ---------------------------------------------------------------------------
+// 2D: the live mutator is no longer 3D only
+// ---------------------------------------------------------------------------
+
+test('2D mutations require the command channel and never fake a source sync', () => {
+  const at = bridgeText.indexOf('async function nodeMutation2d');
+  assert.ok(at > 0);
+  const body = bridgeText.slice(at, at + 2600);
+  assert.match(body, /EDITOR_COMMAND_UNSUPPORTED/);
+  // The 3D tools can fall back to rewriting scene text; 2D serialization is not implemented
+  // here, so the result says the node is live and not in the file rather than claiming both.
+  assert.match(body, /source_synced: false/);
+  assert.match(body, /source_unverified_reason: 'live_2d_not_serialized'/);
+  assert.match(body, /persisted: false/);
+  assert.doesNotMatch(body, /editor_restarted: true/);
+  // The revision counts file-model changes; this changes none, and bumping it left the
+  // session permanently degraded with nothing to persist.
+  assert.doesNotMatch(body, /DiagnosticState\.sceneRevision \+= 1/);
+});
+
+test('node_transform handles a Node2D through the same tool', () => {
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  const at = plugin.indexOf('func _op_node_transform');
+  const body = plugin.slice(at, at + 500);
+  assert.match(body, /if node != null and node is Node2D:/);
+  const two = plugin.slice(plugin.indexOf('func _transform_node_2d'), plugin.indexOf('func _op_node_material'));
+  assert.match(two, /add_undo_property\(node, "position", node\.position\)/);
+  assert.match(two, /"dimension": "2d"/);
+});
+
+test('a 2D body owns every child it creates', () => {
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  const body = plugin.slice(plugin.indexOf('func _op_node_body_2d'), plugin.indexOf('func _build_node_2d'));
+  assert.match(body, /undo\.add_do_method\(collider, "set_owner", root\)/);
+  assert.match(body, /undo\.add_do_method\(visual, "set_owner", root\)/);
+  // ColorRect grows from its top-left; the collider is centred, so the rect needs the offset.
+  assert.match(body, /visual\.position = -size \* 0\.5/);
+});
+
+test('the 2D template is a real starting point, not a stub', () => {
+  const templates = fs.readFileSync(new URL('../public/project_templates.js', import.meta.url), 'utf8');
+  const at = templates.indexOf('const Arcade2D');
+  assert.ok(at > 0);
+  const body = templates.slice(at);
+  assert.match(body, /run\/main_scene="res:\/\/main_2d\.tscn"/);
+  assert.match(body, /type="CharacterBody2D"/);
+  assert.match(body, /type="StaticBody2D"/);
+  assert.match(body, /type="Camera2D"/);
+  assert.match(body, /move_and_slide\(\)/);
+});
+
+test('node_transform asks the editor which dimension the node is, before rewriting scene text', () => {
+  const start = bridgeText.indexOf("name: 'godot_node_transform'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_node_material'", start));
+  assert.match(body, /probe\.dimension === '2d'/);
+  assert.match(body, /source_unverified_reason: 'live_2d_not_serialized'/);
+  // The 3D branch must not re-run the command: a relative offset would be applied twice.
+  assert.match(body, /would apply the same relative offset twice/);
 });
