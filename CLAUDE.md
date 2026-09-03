@@ -244,8 +244,9 @@ the same change** — do not leave it for later. Concretely:
   this is going**; a stale limitation is as dishonest as a faked success.
 - A refinement *introduces* a constraint (a new tool that cannot observe its own outcome, a new
   hand-synced file, a new browser requirement) → add the bullet.
-- Adding a tool → check whether it belongs in the README's catalog `<details>` groups and whether
-  its count line is still right.
+- Adding a tool → add it to the README's **Tool catalog** table under the right group, and update
+  the tool count in the line above it. The table lists every tool by design; a name in it that
+  the catalog does not export, or a tool missing from it, is a documentation bug.
 
 The same rule applies to the README's Testing table when `package.json`'s `test` script changes,
 and to its Deployment table when a target gains or loses functions. The README's technical

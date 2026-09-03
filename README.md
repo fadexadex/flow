@@ -88,6 +88,48 @@ files next to an `sfx_library.gd` that builds an `AudioStreamWAV` from the bytes
 This needs no import step and behaves the same way in the exported game. See the audio entry
 under Godot Web editor limitations for why.
 
+## A worked example
+
+This is the sequence that builds a small pickup game, and roughly what each step costs on a
+warm page. Every one of these calls is a tool an agent can make.
+
+| Step                                                                      | Tool                          | Time    |
+| ------------------------------------------------------------------------- | ----------------------------- | ------- |
+| Create the project from a template                                        | `godot_create_project`        | ~3 s    |
+| Import a glTF model                                                       | `godot_import_asset`          | ~1 s    |
+| Add the procedural sound suite                                            | `godot_synthesize_audio_suite`| ~1 s    |
+| Write an arena floor scene with collision                                 | `godot_apply_file_transaction`| ~4 s    |
+| Place the floor and five copies of the model                              | `godot_node_instance`         | 5-16 ms |
+| Write the game loop                                                       | `godot_apply_script_patch`    | ~1 s    |
+| Frame a pickup in the editor viewport                                     | `godot_camera_focus`          | ~150 ms |
+| Run it and drive the player                                               | `godot_run_game`, `godot_send_input` | - |
+| Export it                                                                  | `godot_export_zip`            | ~1 s    |
+
+Steps that replace the editor take seconds; live scene edits take milliseconds. The split is
+the same one described under Project change paths.
+
+For playtesting, have the project emit its own state. `godot_get_game_telemetry` reads
+`godot-game-telemetry` events the project dispatches; it never substitutes simulated state. A
+project that reports the player's position lets an agent steer toward a target and check the
+result, instead of guessing at timings.
+
+## Tool catalog
+
+56 tools, all prefixed `godot_`. The live catalog with full schemas is at `/api/mcp/tools`.
+
+| Group | Tools |
+| ----- | ----- |
+| Session and diagnostics | `get_session_status`, `diagnose_session`, `get_logs`, `get_operation_status`, `get_user_focus` |
+| Projects | `create_project`, `list_saved_projects`, `open_saved_project`, `restore_project_session`, `adopt_open_project`, `author_3d_runner`, `export_zip` |
+| Project uploads | `begin_project_upload`, `upload_project_file_chunk`, `upload_project_chunk_batch`, `get_project_upload_status`, `commit_project_upload`, `abort_project_upload` |
+| Files and scenes | `inspect_project_files`, `inspect_scene_graph`, `apply_file_transaction`, `apply_script_patch`, `apply_text_patch`, `undo_transaction`, `open_scene` |
+| Assets and audio | `import_asset`, `synthesize_audio_suite`, `generate_audio_fx` |
+| Live 3D editing | `node_spawn`, `node_instance`, `node_transform`, `node_material`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live` |
+| Camera and navigation | `camera_focus`, `camera_follow`, `workspace_follow` |
+| Running the game | `run_game`, `stop_game`, `send_input`, `send_input_sequence`, `get_input_sequence_status`, `send_pointer`, `get_game_telemetry`, `semantic_playtest_step` |
+| Capture | `capture_viewport`, `start_recording`, `stop_recording`, `list_recordings` |
+| Unsupported stubs | `connect_signal_live`, `resize_gizmo_live`, `live_code_diff`, `hot_reload_property`, `switch_mode` |
+
 ## State and persistence
 
 The active project first lives in page memory. FLow persists project snapshots, recordings, and uploads in IndexedDB.
@@ -131,6 +173,17 @@ The server provides:
 
 
 The server sets Cross-Origin Opener Policy and Cross-Origin Embedder Policy headers. The Godot Web build needs these headers for SharedArrayBuffer and threading support.
+
+## Tests
+
+```bash
+npm test
+```
+
+The suite is pure over the bridge's logic and runs without a browser. It checks tool-catalog
+parity between the in-page manifest and the HTTP catalog, the operation state machine, scene
+projection maths, the hot-script channel, the editor lifecycle and playtest handshake, and
+that the editor plugin dispatches every op the bridge calls.
 
 ## Godot Web editor limitations
 
@@ -179,3 +232,7 @@ Named here so the gaps above read as a roadmap rather than a list of dead ends.
 - Audio through Godot's own importer, once that build no longer aborts on it.
 - Generated configuration for the three deployment targets from one source, replacing the
   manual synchronization.
+
+## License
+
+ISC. See `LICENSE`.
