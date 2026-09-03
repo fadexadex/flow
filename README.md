@@ -45,6 +45,8 @@ FLow can:
 - Apply revision-checked file transactions and text patches.
 - Update eligible GDScript files without replacing the editor.
 - Add, transform, recolor, and delete supported 3D nodes through Godot editor commands.
+- Add physics bodies with collision shapes: static level geometry, simulated rigid bodies,
+  character bodies, and trigger volumes.
 - Import images, fonts, and glTF models into the running editor, and place an imported model
   in the scene as an instanced node.
 - Synthesize a procedural sound suite and load it in the running game.
@@ -78,6 +80,10 @@ Binary assets enter a project through `godot_import_asset`. The bytes are writte
 running editor, Godot scans and imports them, and the tool reports what Godot confirmed rather
 than assuming the write succeeded. An imported asset is a real project file: it survives an
 editor replacement and it is included in the exported ZIP.
+
+`godot_node_body` adds a floor, a wall, a solid prop or a trigger volume: a physics body, its
+collision shape and a matching mesh, created in one undo action. `godot_node_spawn` makes
+visual geometry only — nothing stands on it and nothing collides with it.
 
 Place an imported model in a scene with `godot_node_instance`. It accepts a `.glb`, a `.gltf`,
 or a `.tscn` already in the project, and the placed node moves, rotates, and scales like any
@@ -114,7 +120,7 @@ result, instead of guessing at timings.
 
 ## Tool catalog
 
-56 tools, all prefixed `godot_`. The live catalog with full schemas is at `/api/mcp/tools`.
+57 tools, all prefixed `godot_`. The live catalog with full schemas is at `/api/mcp/tools`.
 
 | Group | Tools |
 | ----- | ----- |
@@ -123,7 +129,7 @@ result, instead of guessing at timings.
 | Project uploads | `begin_project_upload`, `upload_project_file_chunk`, `upload_project_chunk_batch`, `get_project_upload_status`, `commit_project_upload`, `abort_project_upload` |
 | Files and scenes | `inspect_project_files`, `inspect_scene_graph`, `apply_file_transaction`, `apply_script_patch`, `apply_text_patch`, `undo_transaction`, `open_scene` |
 | Assets and audio | `import_asset`, `synthesize_audio_suite`, `generate_audio_fx` |
-| Live 3D editing | `node_spawn`, `node_instance`, `node_transform`, `node_material`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live` |
+| Live 3D editing | `node_spawn`, `node_body`, `node_instance`, `node_transform`, `node_material`, `node_delete`, `select_node_live`, `transform_node_live`, `inspect_property_live` |
 | Camera and navigation | `camera_focus`, `camera_follow`, `workspace_follow` |
 | Running the game | `run_game`, `stop_game`, `send_input`, `send_input_sequence`, `get_input_sequence_status`, `send_pointer`, `get_game_telemetry`, `semantic_playtest_step` |
 | Capture | `capture_viewport`, `start_recording`, `stop_recording`, `list_recordings` |
@@ -217,8 +223,6 @@ than reporting success.
 
 Named here so the gaps above read as a roadmap rather than a list of dead ends.
 
-- A collision and physics vocabulary in the live mutator, so a floor, a wall, or a trigger
-  volume can be added without writing scene text by hand.
 - Asset import driven from a URL or a drag-and-drop, not only from base64 supplied by an agent.
 - A 2D live mutator alongside the 3D one.
 - Editor camera control that does not depend on a keyboard shortcut, if a future Godot Web

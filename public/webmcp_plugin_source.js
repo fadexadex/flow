@@ -121,6 +121,7 @@ func _on_command(args: Array) -> String:
 		"viewport_tree": reply = _op_viewport_tree()
 		"viewport_api": reply = _op_viewport_api(payload)
 		"node_add": reply = _op_node_add(payload)
+		"node_body": reply = _op_node_body(payload)
 		"node_instance": reply = _op_node_instance(payload)
 		"node_transform": reply = _op_node_transform(payload)
 		"node_material": reply = _op_node_material(payload)
@@ -1126,6 +1127,123 @@ func _op_node_instance(payload: Dictionary) -> Dictionary:
 		"transform": _transform_array(instance) if instance is Node3D else null,
 	}
 
+## Physics bodies, so a floor or a trigger volume does not need hand-written scene text.
+##
+## The whole subtree is built OUTSIDE the tree and added in one undo action. Recording each
+## add_child as its own do-method looks equivalent and is not: undo removes only the body, so
+## redo would re-parent a child that still has a parent and corrupt the scene tree.
+func _op_node_body(payload: Dictionary) -> Dictionary:
+	var root := EditorInterface.get_edited_scene_root()
+	if root == null:
+		return {"ok": false, "error": "No scene is open in the editor."}
+	var parent := _resolve_node(String(payload.get("parent_path", ".")))
+	if parent == null:
+		parent = root
+	var node_name := String(payload.get("name", ""))
+	if node_name == "":
+		return {"ok": false, "error": "node_body requires a name."}
+	if _find_by_name(root, node_name) != null:
+		return {"ok": false, "error": "A node named '%s' already exists in this scene." % node_name}
+	var shape := _build_shape(payload)
+	if shape == null:
+		return {"ok": false, "error": "No collision shape matches mesh_type '%s'. Supported: box, sphere, capsule, cylinder, plane." % String(payload.get("mesh_type", "box"))}
+	var body := _build_body(payload)
+	if body == null:
+		return {"ok": false, "error": "Unknown body_type '%s'. Supported: static, rigid, character, area." % String(payload.get("body_type", "static"))}
+	body.name = node_name
+
+	var collider := CollisionShape3D.new()
+	collider.name = node_name + "Collision"
+	collider.shape = shape
+	body.add_child(collider)
+
+	var visual: MeshInstance3D = null
+	if bool(payload.get("visible_mesh", true)):
+		visual = MeshInstance3D.new()
+		visual.name = node_name + "Mesh"
+		visual.mesh = _build_mesh(payload)
+		if typeof(payload.get("material")) == TYPE_DICTIONARY:
+			visual.set_surface_override_material(0, _build_material(payload["material"]))
+		body.add_child(visual)
+
+	body.transform = _compose_transform(
+		_vector3(payload.get("position"), Vector3.ZERO),
+		_vector3(payload.get("rotation"), Vector3.ZERO),
+		_vector3(payload.get("scale"), Vector3.ONE))
+
+	var undo := get_undo_redo()
+	undo.create_action("WebMCP: add body %s" % node_name, UndoRedo.MERGE_DISABLE, root)
+	undo.add_do_method(parent, "add_child", body, true)
+	# set_owner on EVERY descendant, or the node is live but absent from the saved .tscn -
+	# a collider that exists until the next save and then silently does not.
+	undo.add_do_method(body, "set_owner", root)
+	undo.add_do_method(collider, "set_owner", root)
+	if visual != null:
+		undo.add_do_method(visual, "set_owner", root)
+	undo.add_do_reference(body)
+	undo.add_undo_method(parent, "remove_child", body)
+	undo.commit_action()
+
+	return {
+		"ok": true,
+		"node_path": String(root.get_path_to(body)),
+		"node_name": node_name,
+		"body_class": body.get_class(),
+		"collision_path": String(root.get_path_to(collider)),
+		"shape_class": shape.get_class(),
+		"mesh_path": String(root.get_path_to(visual)) if visual != null else "",
+		"aabb": _aabb_of(body),
+		"transform": _transform_array(body),
+	}
+
+func _build_body(payload: Dictionary) -> Node3D:
+	match String(payload.get("body_type", "static")).to_lower():
+		"static":
+			return StaticBody3D.new()
+		"rigid":
+			var rigid := RigidBody3D.new()
+			rigid.mass = maxf(0.001, float(payload.get("mass", 1.0)))
+			return rigid
+		"character":
+			return CharacterBody3D.new()
+		"area":
+			var area := Area3D.new()
+			area.monitoring = bool(payload.get("monitoring", true))
+			area.monitorable = bool(payload.get("monitorable", true))
+			return area
+	return null
+
+## Analytic shapes only. A prism or a torus has no matching Shape3D, and quietly substituting a
+## box would give a collider that does not match what the player can see.
+func _build_shape(payload: Dictionary) -> Shape3D:
+	var mesh_type := String(payload.get("mesh_type", "box")).to_lower()
+	match mesh_type:
+		"box":
+			var box := BoxShape3D.new()
+			box.size = _vector3(payload.get("size"), Vector3(2, 2, 2))
+			return box
+		"sphere":
+			var sphere := SphereShape3D.new()
+			sphere.radius = float(payload.get("radius", 1.0))
+			return sphere
+		"capsule":
+			var capsule := CapsuleShape3D.new()
+			capsule.radius = float(payload.get("radius", 0.5))
+			capsule.height = float(payload.get("height", 2.0))
+			return capsule
+		"cylinder":
+			var cylinder := CylinderShape3D.new()
+			cylinder.radius = float(payload.get("radius", 0.5))
+			cylinder.height = float(payload.get("height", 2.0))
+			return cylinder
+		"plane":
+			# A floor wants thickness: an infinitely thin box lets fast bodies tunnel through.
+			var slab := BoxShape3D.new()
+			var plane_size := _vector3(payload.get("size"), Vector3(10, 10, 0))
+			slab.size = Vector3(plane_size.x, float(payload.get("thickness", 0.2)), plane_size.y)
+			return slab
+	return null
+
 func _op_node_transform(payload: Dictionary) -> Dictionary:
 	var node := _resolve_node(String(payload.get("node_path", "")))
 	if node == null or not (node is Node3D):
@@ -1288,15 +1406,31 @@ func _op_node_state(payload: Dictionary) -> Dictionary:
 			}
 	return state
 
+## A body is not a VisualInstance3D and has no bounds of its own, so its bounds are its
+## visible children's. Returning nothing here left camera framing and the focus overlay with
+## no target for every physics node.
 func _aabb_of(node: Node) -> Array:
+	var box := _visual_aabb(node)
+	if box == null:
+		return []
+	var world: AABB = box
+	return [
+		world.position.x, world.position.y, world.position.z,
+		world.size.x, world.size.y, world.size.z,
+	]
+
+func _visual_aabb(node: Node) -> Variant:
+	var merged: Variant = null
 	if node is VisualInstance3D:
-		var box := (node as VisualInstance3D).get_aabb()
-		var origin := (node as Node3D).global_transform.origin
-		return [
-			origin.x + box.position.x, origin.y + box.position.y, origin.z + box.position.z,
-			box.size.x, box.size.y, box.size.z,
-		]
-	return []
+		var local := (node as VisualInstance3D).get_aabb()
+		var world := (node as Node3D).global_transform
+		merged = AABB(world.origin + local.position, local.size)
+	for child in node.get_children():
+		var child_box: Variant = _visual_aabb(child)
+		if child_box == null:
+			continue
+		merged = child_box if merged == null else (merged as AABB).merge(child_box as AABB)
+	return merged
 
 # ---------------------------------------------------------------------------
 # Hot GDScript channel

@@ -94,3 +94,23 @@ folder answers the question properly by measuring the signal instead of the inte
 One browser rule applies and is not ours to fix: an `AudioContext` cannot start without a user
 gesture, so a page that has never been clicked produces no sound however correct the project
 is. The context reported `running` here only after a real click.
+
+## phase-2-collision
+
+`godot_node_body` — physics in the live mutator, so a game no longer needs hand-written scene
+text for a floor.
+
+| File | Shows |
+| ---- | ----- |
+| `collision-bodies-proof.png` | four bodies placed, then the same scene running with the rigid bodies at rest |
+
+A `StaticBody3D` floor, two `RigidBody3D` props and an `Area3D` trigger, each 7-10 ms through
+the command channel with no editor restart and `source_synced: true`. `mesh_type: 'prism'` is
+refused by name rather than silently given a box collider.
+
+The proof is where the bodies stopped: the crate fell from y=9 to **y=0.993** and the ball from
+y=13 to **y=1.09** — each exactly its half-extent above the floor's top face — both reporting
+`sleeping=true`, and the `Area3D` reporting `overlaps=1`.
+
+(The 6 project errors in that run are the probe script calling `get_colliding_bodies()` without
+`contact_monitor` enabled. The tool's own calls produced none.)

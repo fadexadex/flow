@@ -3897,6 +3897,31 @@
   // ==========================================
   // Mesh half-extents keyed to `generateMeshSubResource`'s own defaults, so the parser
   // and the emitter can never disagree about how big a primitive is.
+  // The collision twin of meshHalfExtents. Without it a CollisionShape3D has no bounds, and a
+  // body - which has no geometry of its own at all - reports nothing for the camera to frame.
+  function shapeHalfExtents(shape) {
+    if (!shape || !shape.type) return null;
+    const p = shape.params || {};
+    switch (shape.type) {
+      case 'BoxShape3D': {
+        const size = p.size || [2, 2, 2];
+        return [size[0] / 2, size[1] / 2, size[2] / 2];
+      }
+      case 'SphereShape3D': {
+        const r = Number(p.radius) || 1;
+        return [r, r, r];
+      }
+      case 'CapsuleShape3D':
+      case 'CylinderShape3D': {
+        const r = Number(p.radius) || 0.5;
+        const h = Number(p.height) || 2;
+        return [r, h / 2, r];
+      }
+      default:
+        return null;
+    }
+  }
+
   function meshHalfExtents(type, params = {}) {
     const number = (value, fallback) => (Number.isFinite(Number(value)) ? Number(value) : fallback);
     switch (String(type || '').toLowerCase()) {
@@ -4032,6 +4057,8 @@
         }
         const meshMatch = body.match(/^mesh\s*=\s*SubResource\("([^"]+)"\)/m);
         const meshResource = meshMatch ? subResources.get(meshMatch[1]) : null;
+        const shapeMatch = body.match(/^shape\s*=\s*SubResource\("([^"]+)"\)/m);
+        const shapeResource = shapeMatch ? subResources.get(shapeMatch[1]) : null;
         local.push({
           path: `res://${path}`,
           name,
@@ -4039,7 +4066,9 @@
           parent: parent || null,
           node_path: parent ? (parent === '.' ? name : `${parent}/${name}`) : '.',
           local_transform: localTransform,
-          mesh: meshResource ? { type: meshResource.type, params: meshResource.params } : null
+          mesh: meshResource ? { type: meshResource.type, params: meshResource.params } : null,
+          // A CollisionShape3D carries shape=, not mesh=. Recorded so a body gets bounds.
+          shape: shapeResource ? { type: shapeResource.type, params: shapeResource.params } : null
         });
       }
 
@@ -4058,14 +4087,30 @@
       for (const node of local) {
         const world = worldTransformOf(node);
         node.world_position = [...world.origin];
-        if (node.mesh) {
+        const half = node.mesh
+          ? meshHalfExtents(node.mesh.type, node.mesh.params)
+          : (node.shape ? shapeHalfExtents(node.shape) : null);
+        if (half) {
           const scale = basisScale(world.basis);
-          const half = meshHalfExtents(node.mesh.type, node.mesh.params);
           node.aabb = {
             center: [...world.origin],
             half_extents: [half[0] * scale[0], half[1] * scale[1], half[2] * scale[2]]
           };
         }
+      }
+      // A physics body has no geometry of its own; its bounds are its children's. Without
+      // this a floor or a trigger volume is unframeable and the focus overlay has no target.
+      for (const node of local) {
+        if (node.aabb) continue;
+        const children = local.filter(child => child.parent === node.node_path && child.aabb);
+        if (children.length === 0) continue;
+        const lo = [0, 1, 2].map(axis => Math.min(...children.map(c => c.aabb.center[axis] - c.aabb.half_extents[axis])));
+        const hi = [0, 1, 2].map(axis => Math.max(...children.map(c => c.aabb.center[axis] + c.aabb.half_extents[axis])));
+        node.aabb = {
+          center: [0, 1, 2].map(axis => (lo[axis] + hi[axis]) / 2),
+          half_extents: [0, 1, 2].map(axis => (hi[axis] - lo[axis]) / 2),
+          from_children: true
+        };
       }
       nodes.push(...local);
     }
@@ -4243,6 +4288,48 @@
       }
     }
   }
+
+  // The collision twin of generateMeshSubResource. Analytic shapes only: a prism or a torus
+  // has no matching Shape3D, and a silently substituted box is a collider that does not match
+  // what the player can see.
+  const COLLISION_SHAPE_CLASSES = {
+    box: 'BoxShape3D', sphere: 'SphereShape3D', capsule: 'CapsuleShape3D',
+    cylinder: 'CylinderShape3D', plane: 'BoxShape3D'
+  };
+
+  function generateShapeSubResource(meshType = 'box', args = {}, subResId) {
+    switch (String(meshType).toLowerCase()) {
+      case 'sphere': {
+        const rad = Number(args.radius) || 1.0;
+        return `[sub_resource type="SphereShape3D" id="${subResId}"]\nradius = ${rad}\n`;
+      }
+      case 'capsule': {
+        const rad = Number(args.radius) || 0.5;
+        const h = Number(args.height) || 2.0;
+        return `[sub_resource type="CapsuleShape3D" id="${subResId}"]\nradius = ${rad}\nheight = ${h}\n`;
+      }
+      case 'cylinder': {
+        const rad = Number(args.radius) || 0.5;
+        const h = Number(args.height) || 2.0;
+        return `[sub_resource type="CylinderShape3D" id="${subResId}"]\nradius = ${rad}\nheight = ${h}\n`;
+      }
+      case 'plane': {
+        // A floor wants thickness: an infinitely thin box lets fast bodies tunnel through it.
+        const size = Array.isArray(args.size) && args.size.length >= 2 ? args.size : [10, 10];
+        const thickness = Number(args.thickness) || 0.2;
+        return `[sub_resource type="BoxShape3D" id="${subResId}"]\nsize = Vector3(${size[0]}, ${thickness}, ${size[1]})\n`;
+      }
+      case 'box':
+      default: {
+        const size = Array.isArray(args.size) && args.size.length >= 3 ? args.size : [2, 2, 2];
+        return `[sub_resource type="BoxShape3D" id="${subResId}"]\nsize = Vector3(${size[0]}, ${size[1]}, ${size[2]})\n`;
+      }
+    }
+  }
+
+  const PHYSICS_BODY_CLASSES = {
+    static: 'StaticBody3D', rigid: 'RigidBody3D', character: 'CharacterBody3D', area: 'Area3D'
+  };
 
   function generateMaterialSubResource(mat = {}, subResId) {
     const lines = [`[sub_resource type="StandardMaterial3D" id="${subResId}"]`];
@@ -7050,7 +7137,7 @@
     {
       definition: {
         name: 'godot_node_spawn',
-        description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
+        description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. This is visual geometry only: it has no collision, so nothing stands on it and nothing collides with it. Use godot_node_body for floors, walls, solid props and trigger volumes, and godot_node_instance to place an imported model. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
         input_schema: {
           type: 'object',
           properties: {
@@ -7149,6 +7236,142 @@
           parent_path: parentPath,
           position: pos,
           mesh_type: meshType,
+          follow: navigation
+        });
+      }
+    },
+    {
+      definition: {
+        name: 'godot_node_body',
+        description: "Adds a physics body with a collision shape - and, by default, a matching visible mesh - to the live 3D scene. This is what a floor, a wall, a solid prop or a pickup trigger needs: godot_node_spawn creates visual geometry only, so nothing stands on it and nothing collides with it. Choose static for level geometry, rigid for something that falls and is pushed, character for something a script drives, area for a trigger volume that detects overlap without blocking. The body, its collider and its mesh are created in one undo action and move together as one node. Applied through the editor command channel without restarting the engine when the plugin is present.",
+        input_schema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Unique name of the body node' },
+            body_type: { type: 'string', enum: ['static', 'rigid', 'character', 'area'], default: 'static', description: 'static = immovable level geometry; rigid = simulated, falls and is pushed; character = script-driven; area = trigger volume that detects overlap without blocking' },
+            parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+            mesh_type: { type: 'string', enum: ['box', 'sphere', 'capsule', 'cylinder', 'plane'], default: 'box', description: 'Shape of both the collider and the visible mesh. prism and torus are not offered: they have no analytic collision shape.' },
+            size: { type: 'array', items: { type: 'number' }, description: 'Vector3 dimensions [x, y, z] for box; [width, depth] for plane' },
+            radius: { type: 'number', description: 'Radius for sphere/capsule/cylinder' },
+            height: { type: 'number', description: 'Height for capsule/cylinder' },
+            thickness: { type: 'number', default: 0.2, description: 'Slab thickness for a plane floor. A zero-thickness floor lets fast bodies tunnel through it.' },
+            mass: { type: 'number', default: 1, description: 'Mass, for body_type rigid' },
+            visible_mesh: { type: 'boolean', default: true, description: 'Set false for an invisible collider or trigger volume' },
+            position: { type: 'array', items: { type: 'number' }, description: '3D position coordinates [X, Y, Z]' },
+            rotation: { type: 'array', items: { type: 'number' }, description: '3D rotation in degrees [Pitch, Yaw, Roll]' },
+            scale: { type: 'array', items: { type: 'number' }, description: '3D scale factors [sx, sy, sz]' },
+            material: {
+              type: 'object',
+              properties: {
+                albedo_color: { type: 'string', description: 'Hex color (e.g. #538dda) or rgba string' },
+                metallic: { type: 'number', minimum: 0, maximum: 1 },
+                roughness: { type: 'number', minimum: 0, maximum: 1 },
+                emission: { type: 'string', description: 'Hex emissive color' },
+                emission_energy: { type: 'number', description: 'Emissive energy multiplier' }
+              },
+              additionalProperties: false
+            }
+          },
+          required: ['name'],
+          additionalProperties: false
+        },
+        annotations: { readOnlyHint: false, untrustedContentHint: true }
+      },
+      handler: async (args = {}) => {
+        const nodeName = cleanProjectName(args.name);
+        if (findNodeInActiveScene(activeFilesDict, nodeName)) {
+          throw new Error(`A node named '${nodeName}' already exists in the active scene. Godot renames name clashes on load, so pick a unique name or delete the existing node first.`);
+        }
+        const meshType = String(args.mesh_type || 'box').toLowerCase();
+        if (!COLLISION_SHAPE_CLASSES[meshType]) {
+          throw new Error(`mesh_type '${meshType}' has no analytic collision shape. Supported: ${Object.keys(COLLISION_SHAPE_CLASSES).join(', ')}. Use godot_node_spawn if the geometry does not need collision.`);
+        }
+        const bodyType = String(args.body_type || 'static').toLowerCase();
+        const bodyClass = PHYSICS_BODY_CLASSES[bodyType];
+        if (!bodyClass) {
+          throw new Error(`Unknown body_type '${bodyType}'. Supported: ${Object.keys(PHYSICS_BODY_CLASSES).join(', ')}.`);
+        }
+        const parentPath = args.parent_path || '.';
+        const pos = Array.isArray(args.position) && args.position.length >= 3 ? args.position : [0, 0, 0];
+        const rot = Array.isArray(args.rotation) && args.rotation.length >= 3 ? args.rotation : [0, 0, 0];
+        const scale = Array.isArray(args.scale) && args.scale.length >= 3 ? args.scale : [1, 1, 1];
+        const withMesh = args.visible_mesh !== false;
+        const localBasis = basisFromEulerScale(rot, scale);
+
+        const shapeSubResId = `Shape_${nodeName}`;
+        const meshSubResId = `Mesh_${nodeName}`;
+        const matSubResId = `Mat_${nodeName}`;
+        const colliderName = `${nodeName}Collision`;
+        const meshName = `${nodeName}Mesh`;
+        // A child's parent= is a path from the scene root, not from the block above it.
+        const bodyPath = parentPath === '.' ? nodeName : `${parentPath}/${nodeName}`;
+
+        const res = await liveMutateSceneFile((source, commandReply) => {
+          const authoritative = Array.isArray(commandReply?.transform) && commandReply.transform.length >= 12
+            ? commandReply.transform
+            : [...localBasis, ...pos];
+          const subResources = generateShapeSubResource(meshType, args, shapeSubResId)
+            + (withMesh ? generateMeshSubResource(meshType, args, meshSubResId) + generateMaterialSubResource(args.material || {}, matSubResId) : '');
+          const bodyProperties = bodyType === 'rigid' && Number.isFinite(Number(args.mass)) ? `mass = ${Number(args.mass)}\n` : '';
+          // Only the body carries a transform; the children sit at identity so the whole
+          // thing moves as one node through godot_node_transform.
+          let block = `\n[node name="${nodeName}" type="${bodyClass}" parent="${parentPath}"]\ntransform = ${formatTransform3D(authoritative.slice(0, 9), authoritative.slice(9, 12))}\n${bodyProperties}`;
+          block += `\n[node name="${colliderName}" type="CollisionShape3D" parent="${bodyPath}"]\nshape = SubResource("${shapeSubResId}")\n`;
+          if (withMesh) {
+            block += `\n[node name="${meshName}" type="MeshInstance3D" parent="${bodyPath}"]\nmesh = SubResource("${meshSubResId}")\nsurface_material_override/0 = SubResource("${matSubResId}")\n`;
+          }
+          let updated = source;
+          const firstNodeIdx = updated.indexOf('\n[node name="');
+          if (firstNodeIdx > 0) {
+            updated = updated.slice(0, firstNodeIdx) + '\n' + subResources + updated.slice(firstNodeIdx);
+          } else {
+            updated = updated + '\n' + subResources;
+          }
+          return updated + block;
+        }, {
+          command: {
+            op: 'node_body',
+            payload: {
+              name: nodeName, body_type: bodyType, parent_path: parentPath, mesh_type: meshType,
+              size: args.size, radius: args.radius, height: args.height, thickness: args.thickness,
+              mass: args.mass, visible_mesh: withMesh,
+              position: pos, rotation: rot, scale, material: args.material || {}
+            }
+          },
+          verify: (source, reply) => {
+            const path = reply?.node_path || bodyPath;
+            const body = verifyNodePresence(source, path, true);
+            if (!body.synced) return body;
+            const collider = verifyNodePresence(source, `${path}/${colliderName}`, true);
+            if (!collider.synced) return collider;
+            // A dangling SubResource is how this fails silently: the scene loads, the node is
+            // there, and there is no collider.
+            const shapeClass = reply?.shape_class || COLLISION_SHAPE_CLASSES[meshType];
+            if (!new RegExp(`\\[sub_resource type="${shapeClass}" id="${shapeSubResId}"\\]`).test(source)) {
+              return { synced: false, mismatch: `The collision shape sub-resource ${shapeSubResId} (${shapeClass}) is not in the scene text.` };
+            }
+            return Array.isArray(reply?.transform)
+              ? verifyTransformInSource(source, path, reply.transform)
+              : { synced: true, node_path: path, reason: 'no_authoritative_transform_to_compare' };
+          }
+        });
+
+        const navigation = await follow3DWorkspace(res.commandReply?.node_path || nodeName);
+        if (typeof window !== 'undefined') {
+          AgentFocusOverlay.settleWork(nodeName, pos, 'Added', res.ok !== false);
+          CameraGuidance.noteSceneChanged(nodeName);
+        }
+
+        return liveMutationResult(res, {
+          node_name: nodeName,
+          type: res.commandReply?.body_class || bodyClass,
+          body_type: bodyType,
+          parent_path: parentPath,
+          position: pos,
+          mesh_type: meshType,
+          collision_path: res.commandReply?.collision_path || `${bodyPath}/${colliderName}`,
+          shape_class: res.commandReply?.shape_class || COLLISION_SHAPE_CLASSES[meshType],
+          mesh_path: withMesh ? (res.commandReply?.mesh_path || `${bodyPath}/${meshName}`) : null,
           follow: navigation
         });
       }
@@ -7811,6 +8034,7 @@
         godot_workspace_follow: `${input.enabled === false ? 'Disabling' : input.enabled === true ? 'Enabling' : 'Reading'} workspace follow`,
         godot_node_spawn: `Spawning ${input.name || 'Node3D'} (${input.mesh_type || 'box'})`,
         godot_node_instance: `Placing ${input.name || 'model'} from ${String(input.scene_path || '').split('/').pop() || 'a scene'}`,
+        godot_node_body: `Adding ${input.name || 'body'} (${input.body_type || 'static'} ${input.mesh_type || 'box'})`,
         godot_node_transform: `Transforming ${input.node_path || 'node'}`,
         godot_node_material: `Recolouring ${input.node_path || 'node'}`,
         godot_node_delete: `Deleting ${input.node_path || 'node'}`

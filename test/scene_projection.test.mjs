@@ -16,11 +16,11 @@ function slice(startMarker, endMarker) {
   return bridgeSource.slice(start, end);
 }
 
-const sceneGraphSource = slice('function meshHalfExtents', '  // ==========================================\n  // 6B.');
+const sceneGraphSource = slice('  // The collision twin of meshHalfExtents', '  // ==========================================\n  // 6B.');
 const projectionSource = slice('function projectWorldPoint', '  // ==========================================\n  // Real-Time 3D Live Scene Mutator');
 
-const { sceneGraphFromFiles, findSceneNode, projectWorldPoint, projectedRadius, meshHalfExtents } =
-  new Function(`${sceneGraphSource}\n${projectionSource}\nreturn { sceneGraphFromFiles, findSceneNode, projectWorldPoint, projectedRadius, meshHalfExtents };`)();
+const { sceneGraphFromFiles, findSceneNode, projectWorldPoint, projectedRadius, meshHalfExtents, shapeHalfExtents } =
+  new Function(`${sceneGraphSource}\n${projectionSource}\nreturn { sceneGraphFromFiles, findSceneNode, projectWorldPoint, projectedRadius, meshHalfExtents, shapeHalfExtents };`)();
 
 const SCENE = `[gd_scene load_steps=3 format=3]
 
@@ -223,4 +223,42 @@ test('the comfort margin scales with the frame, not with fixed pixels', () => {
   const narrow = framingComfort({ onScreen: true, x: 150, y: 350 }, 90, { left: 0, top: 0, width: 600, height: 700 });
   assert.equal(wide.comfortable, false, '150px into a 1200px frame is inside the edge margin');
   assert.equal(narrow.comfortable, true, 'the same 150px is comfortably inside a 600px frame');
+});
+
+test('a collision shape has bounds, and a body inherits its children\'s', () => {
+  const scene = [
+    '[gd_scene load_steps=2 format=3]',
+    '',
+    '[sub_resource type="BoxShape3D" id="Shape_Floor"]',
+    'size = Vector3(40, 0.2, 40)',
+    '',
+    '[node name="Main" type="Node3D"]',
+    '',
+    '[node name="Floor" type="StaticBody3D" parent="."]',
+    'transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1, 0)',
+    '',
+    '[node name="FloorCollision" type="CollisionShape3D" parent="Floor"]',
+    'shape = SubResource("Shape_Floor")',
+    ''
+  ].join('\n');
+  const graph = sceneGraphFromFiles({ 'main.tscn': scene });
+  const collider = graph.nodes.find(n => n.name === 'FloorCollision');
+  assert.deepEqual(collider.shape.type, 'BoxShape3D');
+  const round = v => v.map(n => Math.round(n * 1e6) / 1e6);
+  assert.deepEqual(round(collider.aabb.half_extents), [20, 0.1, 20]);
+  // The body has no geometry of its own; framing it must still have something to aim at.
+  const body = graph.nodes.find(n => n.name === 'Floor');
+  assert.ok(body.aabb, 'a StaticBody3D should take its bounds from its collider');
+  assert.equal(body.aabb.from_children, true);
+  assert.deepEqual(round(body.aabb.half_extents), [20, 0.1, 20]);
+});
+
+test('shapeHalfExtents covers exactly the shapes the body tool offers', () => {
+  assert.deepEqual(shapeHalfExtents({ type: 'BoxShape3D', params: { size: [4, 2, 6] } }), [2, 1, 3]);
+  assert.deepEqual(shapeHalfExtents({ type: 'SphereShape3D', params: { radius: 3 } }), [3, 3, 3]);
+  assert.deepEqual(shapeHalfExtents({ type: 'CapsuleShape3D', params: { radius: 0.5, height: 2 } }), [0.5, 1, 0.5]);
+  assert.deepEqual(shapeHalfExtents({ type: 'CylinderShape3D', params: { radius: 1, height: 4 } }), [1, 2, 1]);
+  // Anything else reports nothing rather than a guess.
+  assert.equal(shapeHalfExtents({ type: 'ConvexPolygonShape3D', params: {} }), null);
+  assert.equal(shapeHalfExtents(null), null);
 });

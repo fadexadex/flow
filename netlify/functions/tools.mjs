@@ -540,7 +540,7 @@ export const MCP_TOOL_CATALOG = [
   },
   {
     name: 'godot_node_spawn',
-    description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
+    description: 'Adds a 3D mesh node with position, rotation, scale, and material to the live scene. This is visual geometry only: it has no collision, so nothing stands on it and nothing collides with it. Use godot_node_body for floors, walls, solid props and trigger volumes, and godot_node_instance to place an imported model. Applied through the editor command channel without restarting the engine when the WebMCP editor plugin is present; otherwise falls back to a full editor restart. Reports the measured elapsed time and which channel was used.',
     input_schema: {
       type: 'object',
       properties: {
@@ -559,6 +559,42 @@ export const MCP_TOOL_CATALOG = [
           type: 'object',
           properties: {
             albedo_color: { type: 'string', description: 'Hex color (e.g. #00e5ff) or rgba string' },
+            metallic: { type: 'number', minimum: 0, maximum: 1 },
+            roughness: { type: 'number', minimum: 0, maximum: 1 },
+            emission: { type: 'string', description: 'Hex emissive color' },
+            emission_energy: { type: 'number', description: 'Emissive energy multiplier' }
+          },
+          additionalProperties: false
+        }
+      },
+      required: ['name'],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
+    name: 'godot_node_body',
+    description: "Adds a physics body with a collision shape - and, by default, a matching visible mesh - to the live 3D scene. This is what a floor, a wall, a solid prop or a pickup trigger needs: godot_node_spawn creates visual geometry only, so nothing stands on it and nothing collides with it. Choose static for level geometry, rigid for something that falls and is pushed, character for something a script drives, area for a trigger volume that detects overlap without blocking. The body, its collider and its mesh are created in one undo action and move together as one node. Applied through the editor command channel without restarting the engine when the plugin is present.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Unique name of the body node' },
+        body_type: { type: 'string', enum: ['static', 'rigid', 'character', 'area'], default: 'static', description: 'static = immovable level geometry; rigid = simulated, falls and is pushed; character = script-driven; area = trigger volume that detects overlap without blocking' },
+        parent_path: { type: 'string', default: '.', description: 'Parent node path (defaults to root .)' },
+        mesh_type: { type: 'string', enum: ['box', 'sphere', 'capsule', 'cylinder', 'plane'], default: 'box', description: 'Shape of both the collider and the visible mesh. prism and torus are not offered: they have no analytic collision shape.' },
+        size: { type: 'array', items: { type: 'number' }, description: 'Vector3 dimensions [x, y, z] for box; [width, depth] for plane' },
+        radius: { type: 'number', description: 'Radius for sphere/capsule/cylinder' },
+        height: { type: 'number', description: 'Height for capsule/cylinder' },
+        thickness: { type: 'number', default: 0.2, description: 'Slab thickness for a plane floor. A zero-thickness floor lets fast bodies tunnel through it.' },
+        mass: { type: 'number', default: 1, description: 'Mass, for body_type rigid' },
+        visible_mesh: { type: 'boolean', default: true, description: 'Set false for an invisible collider or trigger volume' },
+        position: { type: 'array', items: { type: 'number' }, description: '3D position coordinates [X, Y, Z]' },
+        rotation: { type: 'array', items: { type: 'number' }, description: '3D rotation in degrees [Pitch, Yaw, Roll]' },
+        scale: { type: 'array', items: { type: 'number' }, description: '3D scale factors [sx, sy, sz]' },
+        material: {
+          type: 'object',
+          properties: {
+            albedo_color: { type: 'string', description: 'Hex color (e.g. #538dda) or rgba string' },
             metallic: { type: 'number', minimum: 0, maximum: 1 },
             roughness: { type: 'number', minimum: 0, maximum: 1 },
             emission: { type: 'string', description: 'Hex emissive color' },

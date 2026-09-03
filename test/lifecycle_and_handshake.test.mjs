@@ -905,3 +905,35 @@ test('a target that is already framed is not reported as a camera that refused t
   assert.match(tail, /if \(!moved && !satisfied\)/);
   assert.match(tail, /already_framed: satisfied && !moved/);
 });
+
+test('a physics body is one undo action, and every child is owned by the scene', () => {
+  const plugin = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
+  const at = plugin.indexOf('func _op_node_body');
+  assert.ok(at > 0);
+  const body = plugin.slice(at, at + 3200);
+  assert.match(body, /undo\.create_action\("WebMCP: add body/);
+  // Without set_owner on each descendant the collider is live but absent from the saved .tscn.
+  assert.match(body, /undo\.add_do_method\(collider, "set_owner", root\)/);
+  assert.match(body, /undo\.add_do_method\(visual, "set_owner", root\)/);
+  // add_child per child as a do-method would make redo re-parent an already-parented node.
+  assert.equal((body.match(/add_do_method\(parent, "add_child"/g) || []).length, 1);
+  assert.doesNotMatch(body, /add_do_method\(body, "add_child"/);
+});
+
+test('the body tool refuses a mesh type with no analytic collision shape', () => {
+  const start = bridgeText.indexOf("name: 'godot_node_body'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_node_instance'", start));
+  assert.match(body, /has no analytic collision shape/);
+  // The enum must not offer a shape it cannot build a collider for.
+  assert.doesNotMatch(body, /enum: \['box', 'sphere', 'capsule', 'cylinder', 'plane', 'prism'/);
+  // The verify has to catch a dangling SubResource: the scene loads and there is no collider.
+  assert.match(body, /is not in the scene text/);
+  assert.match(body, /verifyNodePresence\(source, `\$\{path\}\/\$\{colliderName\}`, true\)/);
+});
+
+test('godot_node_spawn says out loud that it makes nothing solid', () => {
+  const start = bridgeText.indexOf("name: 'godot_node_spawn'");
+  const body = bridgeText.slice(start, start + 900);
+  assert.match(body, /no collision/);
+  assert.match(body, /godot_node_body/);
+});
