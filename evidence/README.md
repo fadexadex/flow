@@ -72,3 +72,25 @@ editor then indexes it at -1 and aborts the runtime. Booting with `AudioWorklet`
 
 Four game run/stop cycles on the real driver showed none of the AudioWorkletNode contention the
 Dummy flag was guarding against: `healthy`, 0 project errors, 0 fatals on every cycle.
+
+### phase-1-audio-audible
+
+`audio-playing-in-game.mp4` in the folder above was captured with `canvas.captureStream()`,
+which carries video only — it is silent, and a silent video is not evidence of audio. This
+folder answers the question properly by measuring the signal instead of the intent.
+
+`findings.json` is an `AnalyserNode` tapped onto Godot's master bus while the six samples play:
+
+| Measure | Value |
+| ------- | ----- |
+| AudioContext state | `running` |
+| Peak RMS on the master bus | 0.775 (**-2.2 dBFS**) |
+| Frames above the noise floor | 22 of 793 sampled at 40 ms — one burst per sample |
+| Driver / output | `AudioWorklet` / `Default` |
+
+`godot_start_recording` does mix the master bus into the capture (`audio_tracks: 1`,
+`video/webm;codecs=vp8,opus`); the ad-hoc recorder used for the other clips did not.
+
+One browser rule applies and is not ours to fix: an `AudioContext` cannot start without a user
+gesture, so a page that has never been clicked produces no sound however correct the project
+is. The context reported `running` here only after a real click.
