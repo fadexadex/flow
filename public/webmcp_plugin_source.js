@@ -1,4 +1,19 @@
-@tool
+// GENERATED FILE - do not edit.
+// Regenerate with: python3 scripts/embed_plugin.py
+// Source of truth: public/addons/webmcp/plugin.gd and plugin.cfg
+//
+// Loaded before mcp_bridge.js, which injects this source into every authored project so
+// the editor command channel exists inside Godot itself.
+window.__WEBMCP_PLUGIN_SOURCE = {
+  cfg: `[plugin]
+
+name="WebMCP Command Channel"
+description="Publishes a synchronous JS-callable command channel on window.__godotEditorCommand so the in-page WebMCP bridge can select, focus, and mutate the edited scene without restarting the editor."
+author="Godot WebMCP"
+version="1.0.0"
+script="plugin.gd"
+`,
+  gd: `@tool
 extends EditorPlugin
 
 ## WebMCP command channel.
@@ -1470,3 +1485,5 @@ func _op_node_script_restore(payload: Dictionary) -> Dictionary:
 		"node_path": String(root.get_path_to(node)),
 		"script_path": path if path != "" else null,
 	}
+`
+};

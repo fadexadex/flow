@@ -9,14 +9,20 @@ import fs from 'node:fs';
 //   python3 scripts/embed_plugin.py
 const bridgeSource = fs.readFileSync(new URL('../public/mcp_bridge.js', import.meta.url), 'utf8');
 
+// The generated copy now lives in its own file rather than as two ~1500-line template
+// literals inside mcp_bridge.js. The parity guarantee is unchanged: this fails if the copy
+// Godot loads from disk and the copy the bridge injects ever differ.
+const generatedSource = fs.readFileSync(new URL('../public/webmcp_plugin_source.js', import.meta.url), 'utf8');
+
 function embeddedConstant(name) {
-  const opening = `const ${name} = \``;
-  const start = bridgeSource.indexOf(opening);
-  assert.ok(start >= 0, `${name} is not embedded in public/mcp_bridge.js`);
+  const key = name === 'WEBMCP_PLUGIN_GD' ? 'gd' : 'cfg';
+  const opening = `  ${key}: \``;
+  const start = generatedSource.indexOf(opening);
+  assert.ok(start >= 0, `${key} is not present in public/webmcp_plugin_source.js`);
   const bodyStart = start + opening.length;
-  const bodyEnd = bridgeSource.indexOf('`;', bodyStart);
-  assert.ok(bodyEnd > bodyStart, `${name} has no closing template literal`);
-  return bridgeSource.slice(bodyStart, bodyEnd);
+  const bodyEnd = generatedSource.indexOf('`', bodyStart);
+  assert.ok(bodyEnd > bodyStart, `${key} has no closing template literal`);
+  return generatedSource.slice(bodyStart, bodyEnd);
 }
 
 test('embedded plugin.gd matches public/addons/webmcp/plugin.gd byte for byte', () => {
@@ -142,4 +148,23 @@ test('a workspace switch reports the main screen Godot is actually showing', () 
   assert.match(body, /"workspace_confirmed"/);
   // Unknown mapping must stay null: reporting false would claim an observation nobody made.
   assert.match(body, /var confirmed = null/);
+});
+
+test('a view preset drives the viewport menu and is verified from its label', () => {
+  const body = pluginFunction('_op_view_preset');
+  // Emitting a synthetic numpad key reported ok on every call and moved nothing.
+  assert.doesNotMatch(body, /KEY_KP_/, 'presets must not be synthesised keyboard shortcuts');
+  assert.match(body, /popup\.id_pressed\.emit/, 'the same signal a click emits');
+  assert.match(body, /"applied": after\.to_lower\(\)\.contains\(preset\)/,
+    'applied is read back from the button label, not assumed from the request');
+  // Godot labels the direction entries "Top View", not "Top".
+  assert.match(pluginSource, /"top": "Top View"/);
+  assert.match(pluginSource, /"perspective": "Perspective"/);
+});
+
+test('the preset control reflects the view the editor reported', () => {
+  const start = bridgeSource.indexOf('async applyPreset(preset)');
+  const body = bridgeSource.slice(start, bridgeSource.indexOf('render()', start));
+  assert.match(body, /reply\.applied === false/, 'an accepted-but-unapplied preset must say so');
+  assert.match(body, /this\.currentView = reply\.label_after/);
 });

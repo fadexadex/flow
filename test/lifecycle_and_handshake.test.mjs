@@ -479,6 +479,7 @@ test('a genuine project error is still an error even beside a bridge note', () =
 // ---------------------------------------------------------------------------
 
 const bridgeText = fs.readFileSync(new URL('../public/mcp_bridge.js', import.meta.url), 'utf8');
+const pluginText = fs.readFileSync(new URL('../public/addons/webmcp/plugin.gd', import.meta.url), 'utf8');
 
 function bridgeSlice(startMarker, endMarker) {
   const start = bridgeText.indexOf(startMarker);
@@ -661,5 +662,87 @@ test('saved projects remain reachable in the narrow browser layout', () => {
   assert.match(body, /data-project-library/);
   assert.match(body, /const ProjectLibraryPopover/);
   assert.match(body, /data-library-open/);
-  assert.match(body, /executeObservedTool\(tool, \{ project_name:/);
+  // Every popover action runs the real tool, so a click and an agent call produce the same
+  // rail entry and the same failure reporting.
+  assert.match(body, /await this\.run\('godot_open_saved_project', \{ project_name: name \}/);
+  assert.match(body, /executeObservedTool\(tool, args\)/);
+});
+
+test('the popover can create a project, adopt what Godot has open, and re-ask the editor', () => {
+  const start = bridgeText.indexOf('  const ProjectLibraryPopover = {');
+  const body = bridgeText.slice(start, bridgeText.indexOf('  const EditorTruth = {', start));
+  // Creating a project had no entry point in the UI at all.
+  assert.match(body, /data-library-create/);
+  assert.match(body, /this\.run\('godot_create_project'/);
+  // A project opened through Godot's own project manager was invisible here forever.
+  assert.match(body, /data-library-adopt/);
+  assert.match(body, /godot_adopt_open_project/);
+  // Refresh has to re-ask the editor, not just re-read the store: the reason a project is
+  // missing is usually that the editor knows something the store does not.
+  assert.match(body, /data-library-refresh/);
+  assert.match(body, /EditorTruth\.refresh\(\)/);
+});
+
+// ---------------------------------------------------------------------------
+// The human's half of the loop: what the agent is allowed to assume "this" means
+// ---------------------------------------------------------------------------
+
+test('user focus reports the selection instead of guessing at one', () => {
+  const start = bridgeText.indexOf("name: 'godot_get_user_focus'");
+  const body = bridgeText.slice(start, bridgeText.indexOf("name: 'godot_adopt_open_project'", start));
+  // A pronoun is only unambiguous with exactly one node selected.
+  assert.match(body, /focused_node: nodes\.length === 1 \? nodes\[0\]\.node_path : null/);
+  // No editor, no selection: report that, do not invent one.
+  assert.match(body, /selection_count: 0,\s*\n\s*selected_nodes: \[\]/);
+  assert.match(body, /readOnlyHint: true/);
+  // It must never move the human.
+  assert.doesNotMatch(body, /set_main_screen|workspace_3d|script_open/);
+});
+
+test('the selection op reads the editor and never changes it', () => {
+  const start = pluginText.indexOf('func _op_selection_state');
+  const body = pluginText.slice(start, pluginText.indexOf('func _op_project_state', start));
+  assert.match(body, /EditorInterface\.get_selection\(\)/);
+  assert.match(body, /get_selected_nodes\(\)/);
+  assert.match(body, /"caret_line"/);
+  assert.doesNotMatch(body, /add_node|clear\(\)|set_main_screen/,
+    'reading what the human selected must not change what the human selected');
+});
+
+// ---------------------------------------------------------------------------
+// Project identity: two projects from one template are not the same project
+// ---------------------------------------------------------------------------
+
+const { normalizeProjectIdentity } = new Function(`
+  ${bridgeSlice('  function normalizeProjectIdentity', '  function cleanProjectName')}
+  return { normalizeProjectIdentity };
+`)();
+
+test('project identity survives display names and never throws', () => {
+  assert.equal(normalizeProjectIdentity('Neon Skyrail 3D'), 'neon_skyrail_3d');
+  assert.equal(normalizeProjectIdentity('beacon_run'), 'beacon_run');
+  assert.equal(normalizeProjectIdentity('  Spaced  Name  '), 'spaced_name');
+  // cleanProjectName throws on these; a comparison must not.
+  assert.equal(normalizeProjectIdentity(null), '');
+  assert.equal(normalizeProjectIdentity(undefined), '');
+  assert.equal(normalizeProjectIdentity(''), '');
+});
+
+test('agreement compares the project, not just the scene path', () => {
+  const start = bridgeText.indexOf('    describe() {\n      const editor = this.state;');
+  const body = bridgeText.slice(start, start + 1600);
+  // Two projects built from the same template open the same scene path. Comparing scenes
+  // alone reported them as the same project.
+  assert.match(body, /const projectMatches = Boolean\(editorName\) && editorName === ourName/);
+  assert.match(body, /matches: projectMatches && sceneMatches/);
+  assert.match(body, /project_matches: projectMatches/);
+  assert.match(body, /scene_matches: sceneMatches/);
+});
+
+test('the orphan check uses the lenient identity, not the throwing validator', () => {
+  const start = bridgeText.indexOf('  const ProjectLibraryPopover = {');
+  const body = bridgeText.slice(start, bridgeText.indexOf('  const EditorTruth = {', start));
+  assert.match(body, /normalizeProjectIdentity\(truth\.editor_project\)/);
+  assert.doesNotMatch(body, /cleanProjectName\(truth\.editor_project\)/,
+    'a display name with a space must not throw while rendering the project list');
 });

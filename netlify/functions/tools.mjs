@@ -29,6 +29,22 @@ export const MCP_TOOL_CATALOG = [
     annotations: { readOnlyHint: false, untrustedContentHint: true }
   },
   {
+    name: 'godot_get_user_focus',
+    description: "Reports what the human is currently pointed at in the editor: which nodes they have selected, which workspace they are in, which script is open and at what line, and which scene is being edited. Use it to resolve a pronoun - \"make this taller\", \"rename that\" - instead of asking which node was meant. Reports selection_count 0 rather than guessing when nothing is selected, and is read-only: it never changes the selection or the workspace.",
+    input_schema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, untrustedContentHint: false }
+  },
+  {
+    name: 'godot_adopt_open_project',
+    description: "Adopts the project Godot currently has open into this browser's project library, without restarting the editor. Use it when the editor is holding a project the bridge did not create - one made through Godot's own project manager - which otherwise cannot be listed, reopened, or persisted. Reads the open project's text files back out of the editor filesystem and publishes them as the active project. Binary assets are named in skipped_files rather than carried, because the bridge's project model is text; the WebMCP addon itself is never adopted.",
+    input_schema: {
+      type: 'object',
+      properties: { project_name: { type: 'string', description: "Overrides the name; defaults to the project's own application/config/name" } },
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: false, untrustedContentHint: true }
+  },
+  {
     name: 'godot_get_operation_status',
     description: 'Returns status and final results for long-running authoring operations that outlive a browser tool-call deadline',
     input_schema: {

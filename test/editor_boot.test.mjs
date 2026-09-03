@@ -427,3 +427,60 @@ test('both call sites catch their boot, so no rejection can go unhandled', () =>
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// A quit racing a boot: the Engine is torn down between init() and the copy
+// ---------------------------------------------------------------------------
+
+// init() resolving does not guarantee the instance is still inited when the very next
+// continuation runs. A concurrent quit clears it, and every copyToFS then throws
+// "Engine must be inited before copying files" - which is what produced
+// EDITOR_FS_COPY_FAILED naming all four project files at once.
+function uninitedUntilReinit(engine) {
+  let inits = 0;
+  const realInit = engine.init.bind(engine);
+  const realCopy = engine.copyToFS.bind(engine);
+  engine.init = (what) => { inits += 1; return realInit(what); };
+  engine.copyToFS = (path, bytes) => {
+    if (inits < 2) {
+      engine.calls.push(['copyToFS', path]);
+      throw new Error('Engine must be inited before copying files');
+    }
+    return realCopy(path, bytes);
+  };
+  return { initCount: () => inits };
+}
+
+test('an engine torn down between init and the copy is re-inited once, then boots', async () => {
+  const life = lifecycle(1);
+  const engine = fakeEngine();
+  const probe = uninitedUntilReinit(engine);
+  const booting = runEditorBoot(bootOptions(engine, life, 1));
+  engine.finishInit();
+  await Promise.resolve();
+  await Promise.resolve();
+  engine.finishStart();
+
+  const result = await booting;
+  assert.equal(result.status, 'running');
+  assert.equal(probe.initCount(), 2, 'the same engine is re-inited; a second Engine is never built');
+  assert.equal(engine.started(), true);
+});
+
+test('the same teardown while superseded is reported as superseded, not as a copy failure', async () => {
+  const life = lifecycle(1);
+  const engine = fakeEngine();
+  uninitedUntilReinit(engine);
+  const booting = runEditorBoot(bootOptions(engine, life, 1));
+  engine.finishInit();
+  await Promise.resolve();
+  life.supersede();
+
+  const result = await booting;
+  assert.equal(result.status, 'superseded');
+  // Either side of the retry is correct; what matters is that a takeover is reported as a
+  // takeover and never as an unwritable-project error.
+  assert.ok(['copy', 'reinit'].includes(result.at), `unexpected supersede point: ${result.at}`);
+  assert.equal(engine.started(), false, 'a superseded boot must never start');
+  assert.ok(life.state.stale.length > 0, 'the takeover is recorded');
+});

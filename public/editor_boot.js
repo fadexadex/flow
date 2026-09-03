@@ -36,6 +36,15 @@
     return failures;
   }
 
+  // "Engine must be inited before copying files" is not a filesystem problem: it means the
+  // Engine instance was torn down between init() resolving and this continuation running,
+  // which is what a quit racing a boot looks like from here. It is worth telling apart,
+  // because the answer is to re-init and try once more rather than to report the project
+  // files as unwritable.
+  function isUninitedEngineFailure(failures) {
+    return failures.length > 0 && failures.every(failure => /must be inited/i.test(failure.error || ''));
+  }
+
   function filesystemCopyError(failures) {
     const detail = failures.map(failure => failure.path + ': ' + failure.error).join('; ');
     const error = new Error('EDITOR_FS_COPY_FAILED: ' + failures.length
@@ -105,7 +114,24 @@
 
     setPhase('Mounting virtual filesystem');
     if (projectFiles) {
-      const failures = copyProjectFilesIntoEngine(engine, projectFiles, projectName, encoder);
+      let failures = copyProjectFilesIntoEngine(engine, projectFiles, projectName, encoder);
+      if (isUninitedEngineFailure(failures)) {
+        // A newer boot taking over is not a failure; it is the whole reason generations exist.
+        if (!isCurrent()) {
+          noteStale(generation, 'copyToFS on a torn-down engine');
+          return { status: 'superseded', at: 'copy' };
+        }
+        // Still the current boot, so the teardown was not a takeover. Re-init THIS engine -
+        // never construct a second one - and copy again. One retry: if the instance is still
+        // not inited afterwards the failure is real and is reported as such.
+        setPhase('Re-mounting virtual filesystem');
+        await engine.init(initArgument);
+        if (!isCurrent()) {
+          noteStale(generation, 're-init() continuation');
+          return { status: 'superseded', at: 'reinit' };
+        }
+        failures = copyProjectFilesIntoEngine(engine, projectFiles, projectName, encoder);
+      }
       if (failures.length > 0) throw filesystemCopyError(failures);
     }
     if (zip) engine.copyToFS('/tmp/preload.zip', zip);
