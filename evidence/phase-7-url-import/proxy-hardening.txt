@@ -1,0 +1,22 @@
+Asset proxy hardening verification — 2026-09-03
+
+Implementation:
+- DNS is resolved and every returned address is rejected if private or loopback.
+- The outgoing HTTP/TLS connection is pinned to the exact validated address, while retaining
+  the original hostname for Host and TLS SNI. This closes the DNS-rebinding gap.
+- Redirects are resolved, validated and pinned again at every hop.
+- Response bytes are counted while streaming and the connection is destroyed immediately
+  above 5 MiB. The limit is no longer checked only after buffering the complete response.
+
+Automated checks:
+- exact-limit streamed response accepted
+- limit + 1 byte streamed response rejected with HTTP status 413
+- loopback, RFC1918, link-local, IPv4-mapped IPv6 and NAT64 private targets rejected
+- redirect validation and pinned lookup are required by the test suite
+
+Live Node check on http://localhost:8072:
+- Khronos Box.glb: HTTP 200, 1,664 bytes, application/octet-stream
+- X-Asset-Source preserved
+- Cross-Origin-Resource-Policy: cross-origin
+- http://169.254.169.254/x.png: HTTP 403
+- tool catalog: 57

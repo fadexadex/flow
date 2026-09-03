@@ -2,6 +2,9 @@
 node_modules/
 artifacts/
 .gstack/
+.DS_Store
+.playwright-cli/
+output/
 
 # Local Netlify folder
 .netlify

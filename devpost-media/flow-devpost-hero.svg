@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1800" height="1200" viewBox="0 0 1800 1200">
+  <defs>
+    <linearGradient id="shade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#020711" stop-opacity="0.98"/>
+      <stop offset="0.46" stop-color="#03101f" stop-opacity="0.78"/>
+      <stop offset="1" stop-color="#03101f" stop-opacity="0.12"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7fe9ff"/>
+      <stop offset="1" stop-color="#38a9ff"/>
+    </linearGradient>
+    <linearGradient id="cardStroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8bedff" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#3c8fff" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#9a55ff" stop-opacity="0.55"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="28" result="blur"/>
+      <feColorMatrix in="blur" values="0 0 0 0 0.05 0 0 0 0 0.5 0 0 0 0 1 0 0 0 .55 0"/>
+      <feOffset dy="22" result="offset"/>
+      <feMerge><feMergeNode in="offset"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="mainClip"><rect x="0" y="0" width="1000" height="650" rx="30"/></clipPath>
+    <clipPath id="gameClip"><rect x="0" y="0" width="520" height="338" rx="24"/></clipPath>
+  </defs>
+
+  <image href="generated-flow-background.png" x="0" y="0" width="1800" height="1200" preserveAspectRatio="xMidYMid slice"/>
+  <rect width="1800" height="1200" fill="url(#shade)"/>
+  <circle cx="1460" cy="234" r="320" fill="#087dff" opacity="0.08"/>
+  <circle cx="1250" cy="985" r="370" fill="#753bff" opacity="0.08"/>
+
+  <g transform="translate(96 42)">
+    <rect width="270" height="48" rx="24" fill="#0c2034" stroke="#48c9ff" stroke-opacity="0.5"/>
+    <circle cx="27" cy="24" r="7" fill="#62eaff" filter="url(#glow)"/>
+    <text x="157" y="31" text-anchor="middle" fill="#c9f7ff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="3">WEBMCP NATIVE</text>
+  </g>
+
+  <g transform="translate(96 205)">
+    <text fill="#f6fbff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="122" font-weight="700" letter-spacing="-5">FLow</text>
+    <rect y="150" width="102" height="8" rx="4" fill="url(#cyan)" filter="url(#glow)"/>
+    <text y="235" fill="#f6fbff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="66" font-weight="650" letter-spacing="-2">
+      <tspan x="0">Build games with AI.</tspan>
+      <tspan x="0" dy="78">Right inside Godot.</tspan>
+    </text>
+    <text y="430" fill="#afc4d8" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="27" font-weight="400">
+      <tspan x="0">Through WebMCP, your AI agent builds,</tspan>
+      <tspan x="0" dy="41">inspects, and playtests inside a real</tspan>
+      <tspan x="0" dy="41">browser-hosted Godot editor.</tspan>
+    </text>
+    <g transform="translate(0 548)">
+      <rect width="178" height="52" rx="26" fill="#0b1828" stroke="#286184"/>
+      <text x="89" y="34" text-anchor="middle" fill="#d8f7ff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="2">GODOT 4</text>
+      <rect x="194" width="206" height="52" rx="26" fill="#0b1828" stroke="#286184"/>
+      <text x="297" y="34" text-anchor="middle" fill="#d8f7ff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="2">IN-BROWSER</text>
+      <rect x="416" width="174" height="52" rx="26" fill="#0b1828" stroke="#286184"/>
+      <text x="503" y="34" text-anchor="middle" fill="#d8f7ff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="18" font-weight="600" letter-spacing="2">AGENTIC</text>
+    </g>
+  </g>
+
+  <g transform="translate(770 125) rotate(2 500 325)" filter="url(#shadow)">
+    <rect x="-4" y="-4" width="1008" height="658" rx="34" fill="url(#cardStroke)"/>
+    <g clip-path="url(#mainClip)">
+      <image href="source-frames/game-105s.png" x="0" y="0" width="1000" height="650" preserveAspectRatio="xMidYMid slice"/>
+    </g>
+    <circle cx="28" cy="28" r="7" fill="#ff5f57"/>
+    <circle cx="52" cy="28" r="7" fill="#febc2e"/>
+    <circle cx="76" cy="28" r="7" fill="#28c840"/>
+  </g>
+
+  <g transform="translate(1130 770) rotate(-3 260 169)" filter="url(#shadow)">
+    <rect x="-4" y="-4" width="528" height="346" rx="28" fill="url(#cardStroke)"/>
+    <g clip-path="url(#gameClip)">
+      <image href="source-frames/game-155s.png" x="0" y="0" width="520" height="338" preserveAspectRatio="xMidYMid slice"/>
+    </g>
+    <rect x="24" y="278" width="192" height="38" rx="19" fill="#02111f" fill-opacity="0.86" stroke="#4de1ff" stroke-opacity="0.6"/>
+    <text x="120" y="303" text-anchor="middle" fill="#d8fbff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="15" font-weight="650" letter-spacing="1.8">LIVE PLAYTEST</text>
+  </g>
+
+  <g transform="translate(96 1080)">
+    <path d="M0 0H1608" stroke="#4ecfff" stroke-opacity="0.22"/>
+    <text y="54" fill="#76dcff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="3">IDEA</text>
+    <path d="M72 47H210" stroke="#4ecfff" stroke-width="2" stroke-opacity="0.5"/>
+    <text x="236" y="54" fill="#76dcff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="3">SCENE</text>
+    <path d="M330 47H468" stroke="#4ecfff" stroke-width="2" stroke-opacity="0.5"/>
+    <text x="494" y="54" fill="#76dcff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="3">PLAYTEST</text>
+    <path d="M622 47H760" stroke="#4ecfff" stroke-width="2" stroke-opacity="0.5"/>
+    <text x="786" y="54" fill="#f2faff" font-family="Avenir Next, Helvetica, Arial, sans-serif" font-size="20" font-weight="650" letter-spacing="3">ITERATE IN FLOW</text>
+  </g>
+</svg>

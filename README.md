@@ -6,7 +6,7 @@ It uses the experimental Godot Web editor. The editor, project files, and tool b
 
 ## Purpose
 
-Godot is powerful, but its editor has a large learning surface. FLow gives an agent direct, controlled access to that editor. This lets a people turn game ideas into working Godot projects without the steep learning curve of learning game engine fundamentals. 
+Godot is powerful, but its editor has a large learning surface. FLow gives an agent direct, controlled access to that editor. This lets people turn game ideas into working Godot projects without the steep learning curve of learning game engine fundamentals.
 
 FLow also supports repeatable work for experienced Godot users. An agent can create starter files, change scene data, run playtests, capture results, and do other routine tasks.
 
@@ -207,47 +207,6 @@ The suite is pure over the bridge's logic and runs without a browser. It checks 
 parity between the in-page manifest and the HTTP catalog, the operation state machine, scene
 projection maths, the hot-script channel, the editor lifecycle and playtest handshake, and
 that the editor plugin dispatches every op the bridge calls.
-
-## Godot Web editor limitations
-
-FLow is built on the experimental Godot Web editor. These are constraints of that build, not
-design choices. Each one is measured, and the tool that meets it reports the constraint rather
-than reporting success.
-
-- **Keyboard shortcuts cannot be delivered to the editor.** A browser sends no keyboard input
-  to a document that does not have focus; `emit_signal("gui_input")` never reaches Godot's own
-  handling, because `Control._gui_input` is a virtual the engine calls rather than a signal
-  handler; and `Viewport.push_input` routes keys by GUI focus. Mouse events have none of these
-  problems, so anything an agent drives in the viewport is driven with the mouse.
-- **There is no scripted route to the editor camera.** Godot exposes the 3D viewport but no
-  method to move its camera. `godot_camera_focus` therefore pans and dollies the viewport and
-  measures the resulting pose, rather than setting it.
-- **A hidden or throttled tab pauses the engine.** Godot's main loop runs on
-  `requestAnimationFrame`, so a backgrounded tab stops making progress. Long operations spend a
-  foreground-active budget rather than wall-clock time, and say how much of the wait was spent
-  hidden.
-- **One tab owns the editor.** The active editor state is not shared across tabs or browsers.
-- **A scene the editor has open cannot be written live.** Reloading it from disk would discard
-  the live editor tree and the undo history with no prompt, so that write replaces the editor
-  instead. So do `project.godot`, `addons/`, deletes and binary content. If an editor exit
-  hangs, recovery needs a page reload; the project is safe in storage.
-- **A live 2D edit is not written into the scene file.** The bridge serializes 3D scene text,
-  not 2D, so `godot_node_spawn_2d`, `godot_node_body_2d` and a 2D `godot_node_transform` report
-  `source_synced: false` and `persisted: false`: the node is real in the editor and absent from
-  the `.tscn` until the scene is saved or written through a transaction.
-- **A property set live in the editor is not written into the scene file.**
-  `godot_node_set_property` changes the node in the running editor and reports `persisted:
-  false`; a transaction or a scene save is what makes it durable.
-- **Runtime property injection is not offered.** The playtest runs in a second engine with its
-  own filesystem, and there is no honest channel into it. A project that wants to be steered
-  while running should emit and accept its own telemetry, as the worked example does.
-- **The tool catalog is duplicated** between the in-page manifest and the HTTP catalog.
-  `npm test` fails if the two drift.
-
-## Where this is going
-
-Named here so the gaps above read as a roadmap rather than a list of dead ends.
-
 
 ## License
 

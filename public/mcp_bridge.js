@@ -110,17 +110,28 @@
     }
   }
 
+  function recordGameTelemetry(state) {
+    const entry = {
+      sequence: ++GameTelemetryState.sequence,
+      received_at: Date.now(),
+      state: state ?? null
+    };
+    GameTelemetryState.latest = entry;
+    GameTelemetryState.recent.push(entry);
+    if (GameTelemetryState.recent.length > 100) GameTelemetryState.recent.shift();
+    return entry.sequence;
+  }
+
   if (typeof window !== 'undefined') {
     window.addEventListener('godot-game-telemetry', (event) => {
-      const entry = {
-        sequence: ++GameTelemetryState.sequence,
-        received_at: Date.now(),
-        state: event?.detail ?? null
-      };
-      GameTelemetryState.latest = entry;
-      GameTelemetryState.recent.push(entry);
-      if (GameTelemetryState.recent.length > 100) GameTelemetryState.recent.shift();
+      recordGameTelemetry(event?.detail ?? null);
     });
+    // Godot's JavaScriptBridge can call a function with an object literal reliably, while a
+    // CustomEvent dispatched from its isolated eval context arrives with `detail: null` in
+    // some browsers. Projects can publish the same structured state through this narrow hook.
+    window.__godotWebMcpPublishTelemetry = (state) => {
+      return recordGameTelemetry(state);
+    };
   }
 
   function openRecordingDatabase() {
@@ -6803,11 +6814,14 @@
         const event = new KeyboardEvent(pressed ? 'keydown' : 'keyup', { key, code: key, bubbles: true });
         canvas.dispatchEvent(event);
         document.dispatchEvent(event);
+        let releaseCompleted = null;
         if (durationMs > 0) {
           let released = false;
           let observedFrames = 0;
           const pressedAt = Date.now();
           let safetyTimer = null;
+          let resolveRelease;
+          releaseCompleted = new Promise(resolve => { resolveRelease = resolve; });
           const releaseKey = () => {
             if (released) return;
             released = true;
@@ -6816,6 +6830,7 @@
             canvas.dispatchEvent(release);
             document.dispatchEvent(release);
             clearTimeout(safetyTimer);
+            resolveRelease();
           };
           const advanceRelease = () => {
             observedFrames++;
@@ -6825,7 +6840,9 @@
           requestAnimationFrame(advanceRelease);
           // Avoid a permanently held key if the page stops rendering entirely.
           safetyTimer = setTimeout(releaseKey, Math.max(durationMs + 5000, 6500));
-        } else if (args.await_telemetry !== false) {
+        }
+        if (args.await_telemetry !== false) {
+          if (releaseCompleted) await releaseCompleted;
           await waitFor(() => GameTelemetryState.latest?.sequence > (before?.sequence || 0), 900, 50);
         }
         const after = GameTelemetryState.latest;
@@ -6837,6 +6854,7 @@
           pressed,
           duration_ms: durationMs || null,
           release_scheduled: durationMs > 0,
+          release_completed: durationMs > 0 ? true : null,
           release_requires_rendered_frames: durationMs > 0 ? 2 : null,
           target: canvas.id,
           input_acknowledged: inputAcknowledged,

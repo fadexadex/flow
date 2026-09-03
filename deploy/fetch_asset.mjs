@@ -12,6 +12,8 @@
 // than trusted because the first URL looked fine.
 
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024;
@@ -67,7 +69,7 @@ export function extensionOf(pathname) {
   return dot < 0 ? '' : pathname.slice(dot).toLowerCase();
 }
 
-export async function assertFetchable(rawUrl) {
+async function resolveFetchable(rawUrl) {
   let url;
   try {
     url = new URL(rawUrl);
@@ -95,12 +97,12 @@ export async function assertFetchable(rawUrl) {
   };
   if (net.isIP(host)) {
     if (isPrivateAddress(host)) refuse(host);
-    return url;
+    return { url, address: host, family: net.isIP(host) };
   }
   // Resolve. A hostname that answers with a private address is the whole attack.
   let addresses = [];
   try {
-    addresses = await dns.lookup(host, { all: true });
+    addresses = await dns.lookup(host, { all: true, verbatim: true });
   } catch (_) {
     throw Object.assign(new Error(`Could not resolve ${url.hostname}`), { status: 400 });
   }
@@ -110,45 +112,108 @@ export async function assertFetchable(rawUrl) {
   for (const { address } of addresses) {
     if (isPrivateAddress(address)) refuse(address);
   }
-  return url;
+  // The request below is pinned to this exact checked address. Resolving once here and then
+  // letting the HTTP client resolve the hostname again leaves a DNS-rebinding gap between the
+  // check and the connection.
+  return { url, address: addresses[0].address, family: addresses[0].family };
+}
+
+export async function assertFetchable(rawUrl) {
+  return (await resolveFetchable(rawUrl)).url;
+}
+
+export async function readResponseBody(response, limit = MAX_ASSET_BYTES) {
+  const chunks = [];
+  let total = 0;
+  for await (const rawChunk of response) {
+    const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk);
+    total += chunk.byteLength;
+    if (total > limit) {
+      response.destroy();
+      throw Object.assign(new Error(`That asset exceeds the ${limit}-byte limit.`), { status: 413 });
+    }
+    chunks.push(chunk);
+  }
+  return new Uint8Array(Buffer.concat(chunks, total));
+}
+
+function requestPinned(target) {
+  return new Promise((resolve, reject) => {
+    const transport = target.url.protocol === 'https:' ? https : http;
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+    const request = transport.request(target.url, {
+      method: 'GET',
+      headers: { Accept: '*/*', 'User-Agent': 'FLow-asset-import/1.0' },
+      // Keep the original hostname for Host and TLS SNI, but connect only to the address that
+      // resolveFetchable checked. Support both lookup callback shapes used by Node releases.
+      lookup(_hostname, options, callback) {
+        if (typeof options === 'function') {
+          callback = options;
+          options = {};
+        }
+        if (options?.all) callback(null, [{ address: target.address, family: target.family }]);
+        else callback(null, target.address, target.family);
+      }
+    }, async (response) => {
+      const status = response.statusCode || 0;
+      const location = response.headers.location || null;
+      if (status >= 300 && status < 400 && location) {
+        response.resume();
+        finish(resolve, { redirect: location });
+        return;
+      }
+      if (status < 200 || status >= 300) {
+        response.resume();
+        finish(reject, Object.assign(new Error(`${target.url.href} returned HTTP ${status}`), { status: 502 }));
+        return;
+      }
+      const declared = Number(response.headers['content-length'] || 0);
+      if (Number.isFinite(declared) && declared > MAX_ASSET_BYTES) {
+        response.destroy();
+        finish(reject, Object.assign(new Error(`That asset is ${declared} bytes; the limit is ${MAX_ASSET_BYTES}.`), { status: 413 }));
+        return;
+      }
+      try {
+        const bytes = await readResponseBody(response);
+        finish(resolve, {
+          bytes,
+          content_type: response.headers['content-type'] || 'application/octet-stream'
+        });
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+    const timer = setTimeout(() => {
+      request.destroy(new Error(`Timed out fetching ${target.url.href} after ${TIMEOUT_MS} ms.`));
+    }, TIMEOUT_MS);
+    request.on('error', (error) => {
+      finish(reject, Object.assign(new Error(`Could not fetch ${target.url.href}: ${error.message}`), { status: error.status || 502 }));
+    });
+    request.end();
+  });
 }
 
 // Redirects are followed by hand: each hop goes back through assertFetchable, so a public URL
 // that redirects to 169.254.169.254 is stopped at the hop that matters.
 export async function fetchAsset(rawUrl) {
-  let target = await assertFetchable(rawUrl);
+  let target = await resolveFetchable(rawUrl);
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    let response;
-    try {
-      response = await fetch(target, { redirect: 'manual', signal: controller.signal });
-    } catch (error) {
-      clearTimeout(timer);
-      throw Object.assign(new Error(`Could not fetch ${target.href}: ${error.message}`), { status: 502 });
-    }
-    clearTimeout(timer);
-    if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
-      target = await assertFetchable(new URL(response.headers.get('location'), target).href);
+    const response = await requestPinned(target);
+    if (response.redirect) {
+      target = await resolveFetchable(new URL(response.redirect, target.url).href);
       continue;
     }
-    if (!response.ok) {
-      throw Object.assign(new Error(`${target.href} returned HTTP ${response.status}`), { status: 502 });
-    }
-    const declared = Number(response.headers.get('content-length') || 0);
-    if (declared > MAX_ASSET_BYTES) {
-      throw Object.assign(new Error(`That asset is ${declared} bytes; the limit is ${MAX_ASSET_BYTES}.`), { status: 413 });
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    // Checked again after reading: content-length is a claim, not a measurement.
-    if (bytes.byteLength > MAX_ASSET_BYTES) {
-      throw Object.assign(new Error(`That asset is ${bytes.byteLength} bytes; the limit is ${MAX_ASSET_BYTES}.`), { status: 413 });
-    }
     return {
-      bytes,
-      url: target.href,
-      extension: extensionOf(target.pathname),
-      content_type: response.headers.get('content-type') || 'application/octet-stream'
+      bytes: response.bytes,
+      url: target.url.href,
+      extension: extensionOf(target.url.pathname),
+      content_type: response.content_type
     };
   }
   throw Object.assign(new Error(`Too many redirects (limit ${MAX_REDIRECTS}).`), { status: 502 });

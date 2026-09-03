@@ -31,6 +31,17 @@ test('the bridge refuses to run rather than silently losing an extracted module'
   assert.match(bridgeSource, /project_templates\.js must be loaded before mcp_bridge\.js/);
 });
 
+test('custom games have a structured telemetry publisher that does not depend on CustomEvent detail', () => {
+  assert.match(bridgeSource, /function recordGameTelemetry\(state\)/);
+  assert.match(bridgeSource, /window\.__godotWebMcpPublishTelemetry = \(state\) =>/);
+  assert.match(bridgeSource, /return recordGameTelemetry\(state\)/);
+});
+
+test('timed input waits for release before returning telemetry by default', () => {
+  assert.match(bridgeSource, /if \(releaseCompleted\) await releaseCompleted/);
+  assert.match(bridgeSource, /release_completed: durationMs > 0 \? true : null/);
+});
+
 test('both built-in templates still emit every file the editor needs', () => {
   const { NeonSkyrail, OrbitalGarden } = loadTemplates();
   for (const [name, template, scene] of [

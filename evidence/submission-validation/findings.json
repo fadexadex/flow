@@ -1,0 +1,57 @@
+{
+  "captured_at": "2026-09-03T22:42:00Z",
+  "browser_origin": "http://localhost:8072",
+  "project": "flow_submission_validation_3d",
+  "agent_flow": [
+    "create orbital_garden project",
+    "verify editor and persisted project agreement",
+    "add four live 3D physics bodies",
+    "import a public GLB through the hardened URL proxy",
+    "instance the imported model into the scene",
+    "synthesize and import six WAV assets",
+    "hot-compile a structured telemetry script",
+    "launch the real playtest engine",
+    "read project-owned collision telemetry",
+    "drive the player with an agent-dispatched ArrowUp input and verify movement from telemetry",
+    "capture and record the running game",
+    "reload the page and automatically restore the project",
+    "export the project ZIP with provenance"
+  ],
+  "checks": {
+    "registered_tools": 57,
+    "cross_origin_isolated": true,
+    "editor_project_agreement": true,
+    "project_persisted": true,
+    "url_asset_loadable": true,
+    "url_asset_included_in_export": true,
+    "audio_files_imported": 6,
+    "audio_files_loadable": 6,
+    "structured_runtime_telemetry": true,
+    "agent_input_verified": {
+      "key": "ArrowUp",
+      "player_z_before": 52.0,
+      "player_z_in_tool_response": 45.4,
+      "player_z_after": 42.7,
+      "release_completed": true,
+      "telemetry_observed_after_dispatch": true
+    },
+    "recording_persisted": true,
+    "automatic_restore_after_reload": true,
+    "export_file_count": 14,
+    "export_size_bytes": 121365,
+    "project_errors": 0,
+    "warnings": 0,
+    "fatal_errors": []
+  },
+  "automated_tests": {
+    "passed": 268,
+    "failed": 0,
+    "catalog_parity_tools": 57
+  },
+  "artifacts": {
+    "export": "flow_submission_validation_3d.zip",
+    "collision_video": "../phase-2-collision/collision-bodies-clean.webm",
+    "collision_game_frame": "../phase-2-collision/02-bodies-at-rest-in-game.png",
+    "collision_editor_frame": "../phase-2-collision/01-bodies-placed.png"
+  }
+}

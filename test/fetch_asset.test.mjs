@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { assertFetchable, extensionOf, ALLOWED_EXTENSIONS, MAX_ASSET_BYTES } from '../deploy/fetch_asset.mjs';
+import { Readable } from 'node:stream';
+import { assertFetchable, extensionOf, ALLOWED_EXTENSIONS, MAX_ASSET_BYTES, readResponseBody } from '../deploy/fetch_asset.mjs';
 
 // A deployed copy of this app will be asked to fetch http://169.254.169.254/ by whoever finds
 // the endpoint. These tests are the reason that request fails.
@@ -47,12 +48,25 @@ test('extensions and limits are the ones the import tool enforces', () => {
   assert.equal(MAX_ASSET_BYTES, 5 * 1024 * 1024, 'must match the import tool limit');
 });
 
-test('redirects are re-checked rather than trusted', () => {
+test('redirects are re-checked and every request is pinned to the checked address', () => {
   const source = fs.readFileSync(new URL('../deploy/fetch_asset.mjs', import.meta.url), 'utf8');
-  // redirect: 'manual' plus a re-check per hop, or a public URL that redirects to the
-  // metadata service walks straight through.
-  assert.match(source, /redirect: 'manual'/);
-  assert.match(source, /target = await assertFetchable\(new URL\(response\.headers\.get\('location'\), target\)\.href\)/);
+  // A re-check per hop stops redirects to metadata. A custom lookup that returns the exact
+  // checked address closes the DNS-rebinding gap between validation and connection.
+  assert.match(source, /target = await resolveFetchable\(new URL\(response\.redirect, target\.url\)\.href\)/);
+  assert.match(source, /callback\(null, target\.address, target\.family\)/);
+});
+
+test('the byte limit is enforced while streaming, not after buffering the response', async () => {
+  const exact = await readResponseBody(Readable.from([
+    Buffer.alloc(MAX_ASSET_BYTES - 3),
+    Buffer.alloc(3)
+  ]));
+  assert.equal(exact.byteLength, MAX_ASSET_BYTES);
+
+  await assert.rejects(
+    () => readResponseBody(Readable.from([Buffer.alloc(MAX_ASSET_BYTES), Buffer.alloc(1)])),
+    error => error.status === 413 && /exceeds/.test(error.message)
+  );
 });
 
 test('the proxy answers with a header the isolated page can actually read', () => {

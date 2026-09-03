@@ -102,18 +102,18 @@ text for a floor.
 
 | File | Shows |
 | ---- | ----- |
-| `collision-bodies-proof.png` | four bodies placed, then the same scene running with the rigid bodies at rest |
+| `01-bodies-placed.png` | the persisted physics-body subtrees in the real Godot editor |
+| `02-bodies-at-rest-in-game.png` | the same scene running with both rigid bodies at rest |
+| `collision-bodies-clean.webm` | a fresh 6.5 s playtest recording with one audio track |
+| `findings.json` | structured body creation, rest positions, overlaps and clean session health |
 
-A `StaticBody3D` floor, two `RigidBody3D` props and an `Area3D` trigger, each 7-10 ms through
-the command channel with no editor restart and `source_synced: true`. `mesh_type: 'prism'` is
-refused by name rather than silently given a box collider.
+A `StaticBody3D` floor, two `RigidBody3D` props and an `Area3D` trigger, each through the
+command channel with no editor restart, `source_synced: true` and `persisted: true`.
 
-The proof is where the bodies stopped: the crate fell from y=9 to **y=0.993** and the ball from
-y=13 to **y=1.09** — each exactly its half-extent above the floor's top face — both reporting
-`sleeping=true`, and the `Area3D` reporting `overlaps=1`.
-
-(The 6 project errors in that run are the probe script calling `get_colliding_bodies()` without
-`contact_monitor` enabled. The tool's own calls produced none.)
+The clean proof is where the bodies stopped: the crate fell from y=8 to **y=0.99** and the ball
+from y=12 to **y=1.09** — each exactly its half-extent above the floor's top face. Both report
+`sleeping=true`, the `Area3D` reports three overlaps, and the session reports **0 project
+errors, 0 warnings and 0 fatals**.
 
 ## phase-3-tools
 
@@ -224,3 +224,22 @@ in v6 clothing walked straight through until the mapped form was unwrapped prope
 
 Measured: Khronos `Box.glb` fetched and imported in **991 ms**, `loadable: true`, `source_url`
 recorded in the result, included in the export, and instanced into the scene straight after.
+
+`proxy-hardening.txt` records the follow-up hardening: the connection is pinned to the exact
+public IP that passed validation, redirects are re-resolved and re-pinned, and the 5 MiB limit
+is enforced while streaming rather than after buffering.
+
+## submission-validation
+
+A fresh agent-driven 3D run across the complete submission path. It created a project, added
+physics, imported and instanced a public GLB, generated six loadable WAV files, hot-compiled
+project telemetry, launched and observed the real playtest, captured a recording, survived a
+page reload with automatic project restoration, and exported a 14-file ZIP with provenance.
+
+The final timed-input check waits through key release and returns fresh runtime telemetry in
+the same call: ArrowUp moved the player from z=52.0 to z=45.4 before the response, then to
+z=42.7 in the following sample. The complete automated suite passes 268/268 with catalog
+parity across all 57 tools.
+
+`findings.json` is the compact result and `flow_submission_validation_3d.zip` is the exported
+project. The final session was healthy with 0 project errors, 0 warnings and 0 fatals.

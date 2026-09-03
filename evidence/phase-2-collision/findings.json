@@ -1,0 +1,58 @@
+{
+  "captured_at": "2026-09-03T22:40:00Z",
+  "project": "flow_submission_validation_3d",
+  "project_creation": {
+    "template": "orbital_garden",
+    "success": true,
+    "persisted": true,
+    "main_scene": "res://orbital_sanctuary.tscn"
+  },
+  "bodies": [
+    {
+      "name": "ValidationFloor",
+      "type": "StaticBody3D",
+      "shape": "BoxShape3D",
+      "editor_restarted": false,
+      "source_synced": true,
+      "persisted": true
+    },
+    {
+      "name": "ValidationCrate",
+      "type": "RigidBody3D",
+      "shape": "BoxShape3D",
+      "start_y": 8.0,
+      "rest_y": 0.99,
+      "sleeping": true,
+      "editor_restarted": false,
+      "source_synced": true,
+      "persisted": true
+    },
+    {
+      "name": "ValidationBall",
+      "type": "RigidBody3D",
+      "shape": "SphereShape3D",
+      "start_y": 12.0,
+      "rest_y": 1.09,
+      "sleeping": true,
+      "editor_restarted": false,
+      "source_synced": true,
+      "persisted": true
+    },
+    {
+      "name": "ValidationTrigger",
+      "type": "Area3D",
+      "shape": "CylinderShape3D",
+      "overlapping_bodies": 3,
+      "editor_restarted": false,
+      "source_synced": true,
+      "persisted": true
+    }
+  ],
+  "runtime": {
+    "status": "running",
+    "structured_telemetry_received": true,
+    "project_errors": 0,
+    "warnings": 0,
+    "fatal_errors": []
+  }
+}
