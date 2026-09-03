@@ -157,3 +157,19 @@ The two refusals matter as much:
   the undo history.
 - A scene with a dangling `SubResource` was **refused**: *"Godot wrote res://broken.tscn but
   could not load it."* The hash matched; the load is what caught it.
+
+## phase-5-deploy-policy
+
+One serving policy for all three targets, replacing three hand-written copies that had already
+drifted apart.
+
+`served-headers.txt` is `curl -I` against the running Node server after the change.
+
+The drift was real, and local development was the worst-served of the three: the Node server
+sent **no** cache-control or content-type rules at all, so a stale `mcp_bridge.js` against a
+fresh page was possible locally and not in production. Vercel never sent
+`Access-Control-Allow-Methods` or `-Headers`. Both are fixed by construction now — the config
+files are generated, and `npm test` fails if the checked-in ones stop matching.
+
+Verified in the page afterwards: `crossOriginIsolated: true`, SharedArrayBuffer available,
+55 tools on `/api/mcp/tools`, editor healthy with 0 project errors.

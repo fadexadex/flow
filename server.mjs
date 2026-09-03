@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { MCP_TOOL_CATALOG } from './netlify/functions/tools.mjs';
+import { headersForPath } from './deploy/policy.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,13 +15,10 @@ const wss = new WebSocketServer({ server, path: '/mcp' });
 
 const PORT = process.env.PORT || 8060;
 
-// Middleware for COOP, COEP, and CORS (Critical for SharedArrayBuffer & WebAssembly Multi-threading)
+// One policy for all three deployment targets, in deploy/policy.mjs. Serving different
+// headers locally than in production is how a caching bug reaches a user first.
 app.use((req, res, next) => {
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  for (const [key, value] of Object.entries(headersForPath(req.path))) res.setHeader(key, value);
   next();
 });
 

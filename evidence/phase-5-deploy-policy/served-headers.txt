@@ -1,0 +1,22 @@
+# Deploy policy, verified against the running Node server
+
+$ curl -sI http://localhost:8071/
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, OPTIONS
+Access-Control-Allow-Headers: *
+Cache-Control: no-store, max-age=0
+
+$ curl -sI http://localhost:8071/mcp_bridge.js
+Cache-Control: no-cache, must-revalidate
+
+$ curl -sI http://localhost:8071/godot.editor.wasm
+Content-Type: application/wasm
+Cache-Control: public, max-age=31536000, immutable
+
+In the page, after the change:
+  crossOriginIsolated: true
+  SharedArrayBuffer:   available
+  /api/mcp/tools:      55 tools
+  editor:              healthy, plugin attached, 0 project errors

@@ -184,7 +184,12 @@ The server provides:
 | `/api/mcp/rpc`   | JSON-RPC `tools/list` only                  |
 
 
-The server sets Cross-Origin Opener Policy and Cross-Origin Embedder Policy headers. The Godot Web build needs these headers for SharedArrayBuffer and threading support.
+The server sets Cross-Origin Opener Policy and Cross-Origin Embedder Policy headers. The Godot
+Web build needs these headers for SharedArrayBuffer and threading support.
+
+All three deployment targets serve one policy, `deploy/policy.mjs`: the Node server applies it
+directly, and `node scripts/generate_deploy_config.mjs` writes `netlify.toml` and `vercel.json`
+from it. Edit the policy, not the generated files.
 
 ## Tests
 
@@ -227,8 +232,8 @@ than reporting success.
 - **Runtime property injection is not offered.** The playtest runs in a second engine with its
   own filesystem, and there is no honest channel into it. A project that wants to be steered
   while running should emit and accept its own telemetry, as the worked example does.
-- **Netlify, Vercel, and the Node server use manually synchronized configuration** and tool
-  catalog data. `npm test` fails if the catalogs drift.
+- **The tool catalog is duplicated** between the in-page manifest and the HTTP catalog.
+  `npm test` fails if the two drift.
 
 ## Where this is going
 
@@ -236,10 +241,6 @@ Named here so the gaps above read as a roadmap rather than a list of dead ends.
 
 - Asset import driven from a URL or a drag-and-drop, not only from base64 supplied by an agent.
 - A 2D live mutator alongside the 3D one.
-- Editor camera control that does not depend on a keyboard shortcut, if a future Godot Web
-  build exposes the viewport camera.
-- Generated configuration for the three deployment targets from one source, replacing the
-  manual synchronization.
 
 ## License
 
