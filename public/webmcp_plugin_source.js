@@ -115,6 +115,9 @@ func _on_command(args: Array) -> String:
 		"selection_state": reply = _op_selection_state()
 		"asset_import": reply = _op_asset_import(payload)
 		"asset_state": reply = _op_asset_state(payload)
+		"audio_capability": reply = _op_audio_capability()
+		"viewport_input": reply = _op_viewport_input(payload)
+		"open_scenes": reply = _op_open_scenes()
 		"viewport_tree": reply = _op_viewport_tree()
 		"viewport_api": reply = _op_viewport_api(payload)
 		"node_add": reply = _op_node_add(payload)
@@ -337,12 +340,15 @@ func _dispatch_viewport_shortcut(keycode: int) -> Dictionary:
 		event.pressed = pressed
 		event.echo = false
 		if surface != null:
-			if pressed:
-				surface.grab_focus()
-			surface.emit_signal("gui_input", event)
-			mechanism = "surface.gui_input"
+			# Not emit_signal("gui_input"). Control._gui_input is a virtual the engine calls,
+			# so emitting the signal reaches connected callbacks and never reaches Godot own
+			# shortcut handling - measured: the camera did not move, on a focused page or an
+			# unfocused one. Pushing the event into the viewport routes it the way a real
+			# keypress is routed, and needs no browser focus at all.
+			_push_viewport_event(surface, event)
+			mechanism = "viewport.push_input"
 		else:
-			viewport.push_input(event)
+			viewport.push_input(event, true)
 			mechanism = "subviewport.push_input"
 	return {"ok": true, "mechanism": mechanism}
 
@@ -686,6 +692,141 @@ func _run_asset_import_job(job_id: String, path: String, steps: Dictionary) -> v
 		job["failure"] = "asset_missing"
 		job["error"] = "Godot no longer sees %s after the import pass." % path
 	_script_jobs[job_id] = job
+
+## Read-only probe of what this editor build can actually do with audio.
+##
+## The WAV import path aborts this WebAssembly build, and the first theory was that the
+## importer simply is not compiled in. Reading the shipped wasm says otherwise, so this
+## reports what the running editor itself claims rather than what the binary contains.
+## Every call here is a lookup - nothing touches a file, so it cannot trip the abort.
+## Drive the 3D viewport camera with the mouse events Godot navigates on.
+##
+## The framing shortcut is a keyboard shortcut, and a browser sends no keyboard input to an
+## unfocused document, so agent framing died whenever the human was looking elsewhere.
+## Navigation, unlike the shortcut, is handled on mouse events inside Node3DEditorViewport, and
+## those DO arrive through the surface signal. Middle button only: a right drag can enter
+## freelook and change what every later drag means.
+func _op_viewport_input(payload: Dictionary) -> Dictionary:
+	var surface := _spatial_editor_surface()
+	if surface == null:
+		return {"ok": false, "error": "The 3D viewport surface is not available."}
+	var kind := String(payload.get("kind", "orbit"))
+	var centre: Vector2 = surface.size * 0.5
+	var camera := _viewport_camera()
+	var before := camera.global_transform.origin if camera != null else Vector3.ZERO
+	if kind == "dolly":
+		var notches := int(payload.get("notches", 1))
+		var button := MOUSE_BUTTON_WHEEL_UP if notches > 0 else MOUSE_BUTTON_WHEEL_DOWN
+		for i in range(absi(notches)):
+			for pressed in [true, false]:
+				var wheel := InputEventMouseButton.new()
+				wheel.button_index = button
+				wheel.pressed = pressed
+				wheel.factor = 1.0
+				wheel.position = centre
+				_push_viewport_event(surface, wheel)
+	else:
+		var dx := float(payload.get("dx", 0.0))
+		var dy := float(payload.get("dy", 0.0))
+		var steps := maxi(1, int(payload.get("steps", 4)))
+		var shift := kind == "pan"
+		var down := InputEventMouseButton.new()
+		down.button_index = MOUSE_BUTTON_MIDDLE
+		down.pressed = true
+		down.shift_pressed = shift
+		down.position = centre
+		_push_viewport_event(surface, down)
+		var at := centre
+		for i in range(steps):
+			var step := Vector2(dx / float(steps), dy / float(steps))
+			at += step
+			var move := InputEventMouseMotion.new()
+			move.button_mask = MOUSE_BUTTON_MASK_MIDDLE
+			move.shift_pressed = shift
+			move.position = at
+			move.relative = step
+			_push_viewport_event(surface, move)
+		# Always released, including on the paths above that could return early, or the
+		# viewport is left believing a button is still held.
+		var up := InputEventMouseButton.new()
+		up.button_index = MOUSE_BUTTON_MIDDLE
+		up.pressed = false
+		up.shift_pressed = shift
+		up.position = at
+		_push_viewport_event(surface, up)
+	var after := camera.global_transform.origin if camera != null else Vector3.ZERO
+	return {
+		"ok": true,
+		"kind": kind,
+		"camera_before": [before.x, before.y, before.z],
+		"camera_after_immediate": [after.x, after.y, after.z],
+		"moved_immediately": before.distance_to(after) > 0.0001,
+		"navigation_scheme": _navigation_scheme(),
+	}
+
+## Control._gui_input is a virtual the engine calls, not a signal handler, so emitting the
+## gui_input signal reaches connected callbacks and never reaches Godot own handling - which
+## is why both the key and the mouse route did nothing. Feed the viewport instead, in the
+## coordinate space it expects, and let Godot route the event as it would a real one.
+func _push_viewport_event(surface: Control, event: InputEvent) -> void:
+	var viewport := surface.get_viewport()
+	if viewport == null:
+		return
+	if event is InputEventMouse:
+		var mouse := event as InputEventMouse
+		mouse.position = surface.global_position + mouse.position
+		if mouse is InputEventMouseButton:
+			(mouse as InputEventMouseButton).global_position = mouse.position
+		elif mouse is InputEventMouseMotion:
+			(mouse as InputEventMouseMotion).global_position = mouse.position
+	surface.grab_focus()
+	viewport.push_input(event, true)
+
+func _navigation_scheme() -> int:
+	var settings := EditorInterface.get_editor_settings()
+	if settings == null:
+		return -1
+	return int(settings.get_setting("editors/3d/navigation/navigation_scheme"))
+
+func _op_audio_capability() -> Dictionary:
+	var importer_defaults := {}
+	for key in ["wav", "ogg_vorbis", "mp3", "texture"]:
+		importer_defaults[key] = ProjectSettings.has_setting("importer_defaults/" + key)
+	return {
+		"ok": true,
+		"importer_defaults": importer_defaults,
+		"importer_classes": {
+			"wav": ClassDB.class_exists("ResourceImporterWAV"),
+			"ogg_vorbis": ClassDB.class_exists("ResourceImporterOggVorbis"),
+			"mp3": ClassDB.class_exists("ResourceImporterMP3"),
+		},
+		"runtime_classes": {
+			"AudioStreamWAV": ClassDB.can_instantiate("AudioStreamWAV"),
+			"AudioStreamOggVorbis": ClassDB.can_instantiate("AudioStreamOggVorbis"),
+			"AudioStreamMP3": ClassDB.can_instantiate("AudioStreamMP3"),
+		},
+		"load_from_buffer": {
+			"AudioStreamWAV": ClassDB.class_has_method("AudioStreamWAV", "load_from_buffer"),
+			"AudioStreamOggVorbis": ClassDB.class_has_method("AudioStreamOggVorbis", "load_from_buffer"),
+			"AudioStreamMP3": ClassDB.class_has_method("AudioStreamMP3", "load_from_buffer"),
+		},
+		"preview_generator": ClassDB.class_exists("AudioStreamPreviewGenerator"),
+		"audio_driver": AudioServer.get_driver_name(),
+	}
+
+## Which scenes the editor currently holds open, and which one is on screen. A write to a
+## scene nobody is looking at can be applied live; a write to the open one cannot, because
+## reloading it would discard the live tree and the undo history.
+func _op_open_scenes() -> Dictionary:
+	var open_scenes := []
+	for scene_path in EditorInterface.get_open_scenes():
+		open_scenes.append(String(scene_path))
+	var root := EditorInterface.get_edited_scene_root()
+	return {
+		"ok": true,
+		"open_scenes": open_scenes,
+		"edited_scene": root.scene_file_path if root != null else "",
+	}
 
 func _op_asset_state(payload: Dictionary) -> Dictionary:
 	var path := String(payload.get("path", ""))

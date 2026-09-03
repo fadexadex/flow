@@ -3446,63 +3446,6 @@
   // `dispatched_unconfirmed` on every call. A real KeyboardEvent on the focused canvas fires
   // it, and the camera moves. Returns null when the canvas is not there to be driven, so the
   // caller can fall back to the plugin instead of assuming this worked.
-  // Godot's 3D viewport only answers a keyboard shortcut once it holds the engine's own GUI
-  // focus, and only a pointer event gives it that - DOM focus() and the plugin's grab_focus()
-  // are both insufficient, measured. One synthetic click primes it. The click lands on the
-  // viewport and can change the selection, so callers select AFTER priming, never before.
-  function primeEditorViewportFocus() {
-    if (typeof document === 'undefined') return false;
-    const canvas = document.getElementById('editor-canvas');
-    if (!canvas || typeof canvas.getBoundingClientRect !== 'function') return false;
-    const rect = canvas.getBoundingClientRect();
-    if (!rect.width || !rect.height) return false;
-    const clientX = rect.left + rect.width * 0.5;
-    const clientY = rect.top + rect.height * 0.45;
-    try {
-      // DOM focus first. Without it the very first framing of a page session was dropped -
-      // the click reached a canvas that was not the focused element and Godot never took
-      // viewport focus, so the shortcut afterwards went nowhere.
-      canvas.focus();
-      for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) {
-        const Ctor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
-        const event = new Ctor(type, {
-          clientX, clientY, button: 0, buttons: type.includes('down') ? 1 : 0,
-          bubbles: true, cancelable: true, composed: true,
-          pointerId: 1, pointerType: 'mouse', isPrimary: true
-        });
-        event.__webmcpAgentDispatched = true;
-        canvas.dispatchEvent(event);
-      }
-    } catch (_) {
-      return false;
-    }
-    return true;
-  }
-
-  function dispatchEditorShortcutKey(key, { code = null, keyCode = null } = {}) {
-    if (typeof document === 'undefined') return null;
-    const canvas = document.getElementById('editor-canvas');
-    if (!canvas) return null;
-    const resolvedCode = code || `Key${String(key).toUpperCase()}`;
-    const resolvedKeyCode = keyCode ?? String(key).toUpperCase().charCodeAt(0);
-    try {
-      // Godot reads key events from whichever element holds DOM focus.
-      canvas.focus();
-      for (const type of ['keydown', 'keyup']) {
-        const event = new KeyboardEvent(type, {
-          key, code: resolvedCode, keyCode: resolvedKeyCode, which: resolvedKeyCode,
-          bubbles: true, cancelable: true, composed: true
-        });
-        // Marked so the yield-to-human cooldown can tell this apart from a real keypress.
-        event.__webmcpAgentDispatched = true;
-        canvas.dispatchEvent(event);
-      }
-    } catch (_) {
-      return null;
-    }
-    return { ok: true, mechanism: 'editor_canvas.keyboard_event', key };
-  }
-
   const WORKSPACE_FOLLOW_PREFERENCE_KEY = 'webmcp.workspace-follow';
   const WORKSPACE_FOLLOW_MODE_KEY = 'webmcp.workspace-follow-mode';
 
@@ -8639,6 +8582,13 @@
   const MAX_GUIDANCE_FRAMES = 8;
   // How long to keep watching for Godot's own camera ease before calling it unmoved.
   const GUIDANCE_SETTLE_MILLISECONDS = 1200;
+  // How many pan/dolly corrections to spend before reporting what was actually achieved.
+  const GUIDANCE_MAX_ITERATIONS = 8;
+  // The share of the frame height the target should end up occupying: big enough to read,
+  // small enough to keep its surroundings.
+  const GUIDANCE_TARGET_EXTENT = [0.18, 0.62];
+  // Godot dolly is multiplicative, one notch per wheel click.
+  const GUIDANCE_DOLLY_STEP = 1.08;
   const CAMERA_AUTO_FOLLOW_PREFERENCE_KEY = 'godot-webmcp.auto-follow';
   const AUTO_FOLLOW_DEBOUNCE_MILLISECONDS = 180;
 
@@ -8692,10 +8642,6 @@
       const note = () => { this.lastInteractionAt = Date.now(); this.pending = null; };
       for (const type of ['pointerdown', 'wheel', 'keydown']) {
         document.addEventListener(type, (event) => {
-          // The guidance channel drives Godot's own framing shortcut by dispatching a key
-          // event at the canvas. Counting that as human activity made the tool yield to
-          // itself on every call and report `yielded` instead of framing anything.
-          if (event.__webmcpAgentDispatched) return;
           const target = event.target;
           if (target && (target.id === 'editor-canvas' || target.id === 'game-canvas')) note();
         }, { capture: true, passive: true });
@@ -8775,11 +8721,6 @@
       // over: the priming click can change the selection, so it has to come first, and
       // Node3DEditor handles a selection change on a deferred call, so a shortcut sent in the
       // same frame as the selection frames an empty set.
-      const primed = primeEditorViewportFocus();
-      // Godot processes the click on a later frame; sending the shortcut before then delivered
-      // it to whichever dock still held focus, which is where the `Unknown Shortcut:
-      // filesystem_dock/...` noise came from.
-      if (primed) { await nextFrame(); await nextFrame(); await nextFrame(); }
       const selected = EditorCommandChannel.call('select', { node_path: node.node_path });
       if (!selected.ok) {
         return {
@@ -8794,93 +8735,125 @@
       }
       await nextFrame();
       await nextFrame();
-      const dispatch = dispatchEditorShortcutKey('f') || EditorCommandChannel.call('focus_dispatch');
-      if (!dispatch.ok) {
-        return {
-          ...base,
-          status: 'overlay_only',
-          reason: dispatch.unsupported ? 'command_channel_unavailable' : 'focus_rejected',
-          error: dispatch.error,
-          dispatched: false,
-          camera_moved: false,
-          target_reached: false
-        };
-      }
 
+      // Framing is driven with the mouse, not the F shortcut.
+      //
+      // Godot handles "frame selection" as a keyboard shortcut, and a browser sends no
+      // keyboard input to a document that does not have focus - so agent framing died
+      // whenever the human was looking at another window. Neither route into the engine
+      // helped: emit_signal("gui_input") never reaches Godot own handling because
+      // Control._gui_input is a virtual the engine calls, not a signal handler, and pushing
+      // the key into the viewport still needs GUI key focus. Mouse events do not: the
+      // viewport routes them by position. Measured, on an unfocused page: orbit, pan and
+      // dolly all move the camera; the shortcut does not, by any route.
+      //
+      // So this is a closed loop in screen space. Pan to bring the node to the middle of the
+      // frame, dolly until it fills a comfortable share of it, and read the real camera pose
+      // back between steps rather than assuming the move landed.
+      const surface = resolveGodotCanvas('editor');
+      const rect = surface?.canvas?.getBoundingClientRect?.();
+      if (!rect || !rect.width || !rect.height) {
+        return { ...base, status: 'overlay_only', reason: 'no_editor_surface', dispatched: false, camera_moved: false, target_reached: false };
+      }
+      const dispatch = { ok: true, mechanism: 'viewport.mouse_input' };
       const reduced = typeof window !== 'undefined'
         && window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
-      // Godot eases the editor camera over roughly half a second, so a fixed frame count is
-      // the wrong unit: at 8 frames it gave up after ~100 ms on a fast page and reported
-      // `camera_moved: false` for a move that was already under way. Watch for the move, and
-      // stop as soon as it is seen or the window closes.
-      const frames = reduced ? 1 : MAX_GUIDANCE_FRAMES;
+      const settle = async () => {
+        // Godot eases the camera. Measure only once two reads agree, or the loop chases its
+        // own inertia and overshoots.
+        let previous = this.readPose();
+        const until = nowMs() + GUIDANCE_SETTLE_MILLISECONDS;
+        for (;;) {
+          await nextFrame();
+          const current = this.readPose();
+          if (!current) return previous;
+          if (previous && this.poseDelta(previous, current) <= 0.001) return current;
+          previous = current;
+          if (nowMs() > until) return current;
+        }
+      };
+      const step = (payload) => EditorCommandChannel.call('viewport_input', payload);
+
       let framesPresented = 0;
       let moved = false;
       let after = before;
-      let stale = null;
-      let yielded = null;
-      // The first framing of a page session regularly misses: the viewport has never held the
-      // engine's GUI focus, and the priming click only takes effect on a later frame. One
-      // retry turns that into a hit, and two misses is genuine evidence rather than a race.
-      for (let attempt = 0; attempt < 2 && !moved && !stale && !yielded; attempt += 1) {
-        if (attempt > 0) {
-          primeEditorViewportFocus();
-          await nextFrame();
-          await nextFrame();
-          await nextFrame();
-          EditorCommandChannel.call('select', { node_path: node.node_path });
-          await nextFrame();
-          await nextFrame();
-          dispatchEditorShortcutKey('f');
-        }
-        const watchUntil = nowMs() + (reduced ? 0 : GUIDANCE_SETTLE_MILLISECONDS);
-        for (let frame = 0; frame < frames || (!moved && nowMs() < watchUntil); frame += 1) {
-          await nextFrame();
-          if (EditorCommandChannel.generation !== generation) {
-            stale = { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
+      let iterations = 0;
+      // Distinguishes "the target was already framed, so nothing moved" from "the camera was
+      // driven and refused to move". Both leave the pose unchanged; only one is a problem.
+      let satisfied = false;
+      const iterationLimit = reduced ? 1 : GUIDANCE_MAX_ITERATIONS;
+      for (; iterations < iterationLimit; iterations += 1) {
+        const pose = this.readPose();
+        if (!pose) break;
+        const projection = projectWorldPoint(node.world_position, { transform: { basis: pose.basis, origin: pose.position }, fov: pose.fov }, rect);
+        if (!projection) break;
+        // The true projected extent as a fraction of frame height. Not projectedRadius(),
+        // which clamps for the overlay and would make the loop chase a floor value.
+        const halfExtents = node.aabb?.half_extents;
+        const worldRadius = Array.isArray(halfExtents) ? Math.hypot(halfExtents[0], halfExtents[1], halfExtents[2]) : null;
+        const extent = worldRadius && projection.depth > 0.001
+          ? (worldRadius / projection.depth) / projection.halfFovTangent
+          : null;
+        const offsetX = projection.x - (rect.left + rect.width / 2);
+        const offsetY = projection.y - (rect.top + rect.height / 2);
+        const centred = !projection.behind && Math.hypot(offsetX, offsetY) < rect.height * 0.06;
+        // A node behind the camera has no usable screen offset; swing round to it first.
+        if (projection.behind) {
+          step({ kind: 'orbit', dx: rect.width * 0.35, dy: 0, steps: 8 });
+        } else if (!centred) {
+          // Pan moves the view with the drag, so the correction is the offset itself.
+          step({ kind: 'pan', dx: offsetX, dy: offsetY, steps: 8 });
+        } else {
+          // Centred, and nothing measurable to size against - a light, or an instanced scene
+          // whose bounds the scene text does not carry. Centred is the honest stopping point.
+          if (extent === null) { after = pose; satisfied = true; moved = moved || this.poseDelta(before, pose) > 0.001; break; }
+          if (extent >= GUIDANCE_TARGET_EXTENT[0] && extent <= GUIDANCE_TARGET_EXTENT[1]) {
+            moved = moved || this.poseDelta(before, pose) > 0.001;
+            after = pose;
+            satisfied = true;
             break;
           }
-          if (this.withinCooldown()) { yielded = this.yieldedToUser(); break; }
-          AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
-          framesPresented += 1;
-          after = this.readPose() || after;
-          if (this.poseDelta(before, after) > 0.001) moved = true;
+          const desired = (GUIDANCE_TARGET_EXTENT[0] + GUIDANCE_TARGET_EXTENT[1]) / 2;
+          const notches = Math.max(-6, Math.min(6, Math.round(Math.log(desired / extent) / Math.log(GUIDANCE_DOLLY_STEP))));
+          if (notches === 0) { after = pose; satisfied = true; moved = moved || this.poseDelta(before, pose) > 0.001; break; }
+          step({ kind: 'dolly', notches });
         }
+        after = await settle();
+        framesPresented += 1;
+        if (EditorCommandChannel.generation !== generation) {
+          return { ...base, status: 'stale', reason: 'editor_restarted', dispatched: true, camera_moved: moved, target_reached: false, frames_presented: framesPresented };
+        }
+        if (this.withinCooldown()) return this.yieldedToUser();
+        AgentFocusOverlay.focus(node.name, node.world_position, node.type, 'Framing');
+        if (this.poseDelta(before, after) > 0.001) moved = true;
       }
-      if (stale) return stale;
-      if (yielded) return yielded;
-
-      const framed = moved ? this.targetFramed(findSceneNode(activeFilesDict, nodeName)) : null;
-      if (!moved) {
+      const framed = (moved || satisfied) ? this.targetFramed(findSceneNode(activeFilesDict, nodeName)) : null;
+      if (!moved && !satisfied) {
         // The shortcut went out and the editor did not move the camera. Say exactly that.
-        // An unfocused document cannot receive keyboard input at all, and Godot's framing is a
-        // keyboard shortcut. That is the whole explanation when it applies, and it is
-        // actionable in a way that "the pose did not change" is not.
-        const documentFocused = typeof document === 'undefined' || document.hasFocus?.() !== false;
         return {
           ...base,
           status: 'dispatched_unconfirmed',
-          reason: documentFocused ? 'camera_pose_unchanged' : 'document_not_focused',
-          document_focused: documentFocused,
-          viewport_focus_primed: primed,
-          mechanism: dispatch.mechanism || 'spatial_editor/focus_selection',
+          reason: 'camera_pose_unchanged',
+          mechanism: dispatch.mechanism,
           dispatched: true,
           camera_moved: false,
           target_reached: false,
           frames_presented: framesPresented,
-          selection_count: dispatch.selection_count ?? null,
-          note: documentFocused
-            ? 'The framing shortcut was delivered and the node is selected, but the viewport camera pose did not change. Godot only advances its camera interpolation while the editor is rendering, so a backgrounded or throttled tab will report this.'
-            : 'The browser document does not have focus, so no keyboard event reaches Godot and the framing shortcut cannot fire. The node is selected and the overlay is placed. Click the editor once to give the page focus, then ask again.'
+          iterations,
+          note: 'The camera was driven and its pose did not change. Godot only advances the viewport while the editor is rendering, so a hidden or throttled tab reports this. The node is selected and the overlay is placed.'
         };
       }
       return {
         ...base,
         status: 'framed',
         reason,
-        mechanism: dispatch.mechanism || 'spatial_editor/focus_selection',
+        mechanism: dispatch.mechanism,
         dispatched: true,
-        camera_moved: true,
+        camera_moved: moved,
+        // The loop stopped because the target already sits where it should. Said out loud,
+        // because "framed" with camera_moved false otherwise reads as a contradiction.
+        already_framed: satisfied && !moved,
+        iterations,
         // null when the projection could not be evaluated — never silently true.
         target_reached: framed === true,
         target_framing_verified: framed !== null,

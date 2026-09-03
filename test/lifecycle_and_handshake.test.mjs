@@ -844,38 +844,6 @@ test('a name clash is checked inside the edited scene, not across every scene fi
   assert.doesNotMatch(spawn, /findSceneNode\(activeFilesDict, nodeName\)\)/);
 });
 
-test('camera framing drives a real canvas key event, not a synthesised plugin event', () => {
-  const start = bridgeText.indexOf('function dispatchEditorShortcutKey');
-  assert.ok(start > 0);
-  const body = bridgeText.slice(start, start + 1200);
-  assert.match(body, /getElementById\('editor-canvas'\)/);
-  assert.match(body, /canvas\.focus\(\)/, 'Godot reads keys from the focused element');
-  assert.match(body, /new KeyboardEvent/);
-  // Null, not a fake success, when there is no canvas: the caller falls back to the plugin.
-  assert.match(body, /return null;/);
-  assert.match(bridgeText, /dispatchEditorShortcutKey\('f'\) \|\| EditorCommandChannel\.call\('focus_dispatch'\)/);
-});
-
-test('the guidance channel does not yield to its own dispatched key', () => {
-  const install = bridgeText.slice(bridgeText.indexOf('    install() {'), bridgeText.indexOf('    yieldedToUser('));
-  assert.match(install, /event\.__webmcpAgentDispatched/);
-  const dispatch = bridgeText.slice(bridgeText.indexOf('function dispatchEditorShortcutKey'), bridgeText.indexOf('function dispatchEditorShortcutKey') + 1400);
-  assert.match(dispatch, /event\.__webmcpAgentDispatched = true;/);
-});
-
-test('framing primes the viewport before selecting, because the click changes the selection', () => {
-  const prime = bridgeText.slice(bridgeText.indexOf('function primeEditorViewportFocus'), bridgeText.indexOf('function dispatchEditorShortcutKey'));
-  assert.match(prime, /pointerdown/);
-  assert.match(prime, /event\.__webmcpAgentDispatched = true;/);
-  const at = bridgeText.indexOf('const primed = primeEditorViewportFocus();');
-  const frame = bridgeText.slice(at, at + 800);
-  // Prime, then let Godot process the click, then select. Selecting first would be undone by
-  // the priming click, and pressing before the click lands sends the key to whichever dock
-  // still holds focus.
-  assert.ok(frame.indexOf('primeEditorViewportFocus()') < frame.indexOf("EditorCommandChannel.call('select'"));
-  assert.match(frame, /if \(primed\) \{ await nextFrame\(\);/);
-});
-
 test('the Web build\'s missing FileSystem dock shortcuts are platform noise', () => {
   const classified = classifyEngineDiagnostics([
     { time: 10, generation: 1, level: 'error', msg: 'ERROR: Unknown Shortcut: filesystem_dock/open_in_terminal.' },
@@ -886,30 +854,44 @@ test('the Web build\'s missing FileSystem dock shortcuts are platform noise', ()
   assert.equal(classified.platform_diagnostics.length, 1);
 });
 
-test('framing retries once before reporting the camera unmoved', () => {
-  const at = bridgeText.indexOf('for (let attempt = 0; attempt < 2');
-  assert.ok(at > 0, 'the framing watch should make a second attempt');
-  const body = bridgeText.slice(at, at + 900);
-  assert.match(body, /primeEditorViewportFocus\(\)/);
-  assert.match(body, /dispatchEditorShortcutKey\('f'\)/);
-  // A restart or a human taking the viewport ends the attempts; they are not retried over.
-  assert.match(body, /!moved && !stale && !yielded/);
-});
-
-test('an unfocused document is named as the reason framing did nothing', () => {
-  const at = bridgeText.indexOf("status: 'dispatched_unconfirmed'");
-  const body = bridgeText.slice(Math.max(0, at - 700), at + 1400);
-  assert.match(body, /document\.hasFocus\?\.\(\) !== false/);
-  assert.match(body, /'document_not_focused'/);
-  // The distinction matters: one is a throttled tab, the other is a browser rule the user
-  // can fix in one click.
-  assert.match(body, /Click the editor once to give the page focus/);
-});
-
 test('an imported asset is not claimed as generated, or licensed, by this page', () => {
   const at = bridgeText.indexOf('const imported = DiagnosticState.importedAssets.has(filePath);');
   assert.ok(at > 0);
   const body = bridgeText.slice(at, at + 500);
   assert.match(body, /'imported_via_godot_import_asset'/);
   assert.match(body, /license: 'unspecified'/);
+});
+
+test('framing drives the viewport with the mouse, not a keyboard shortcut', () => {
+  const at = bridgeText.indexOf('// Framing is driven with the mouse, not the F shortcut.');
+  assert.ok(at > 0, 'the framing mechanism should be named where it is used');
+  const body = bridgeText.slice(at, at + 5200);
+  assert.match(body, /viewport\.mouse_input/);
+  assert.match(body, /kind: 'pan'/);
+  assert.match(body, /kind: 'dolly'/);
+  assert.match(body, /kind: 'orbit'/);
+  // A browser sends no keys to an unfocused document, so nothing here may depend on focus.
+  assert.doesNotMatch(body, /hasFocus/);
+  assert.doesNotMatch(bridgeText, /dispatchEditorShortcutKey/);
+  assert.doesNotMatch(bridgeText, /primeEditorViewportFocus/);
+});
+
+test('the framing loop measures between corrections instead of trusting them', () => {
+  const at = bridgeText.indexOf('// Framing is driven with the mouse, not the F shortcut.');
+  const body = bridgeText.slice(at, at + 5200);
+  // Godot eases the camera; two agreeing reads, not a fixed wait.
+  assert.match(body, /poseDelta\(previous, current\) <= 0\.001/);
+  assert.match(body, /GUIDANCE_MAX_ITERATIONS/);
+  // Nothing measurable to size against is a stopping point, not a silent success.
+  assert.match(body, /if \(extent === null\)/);
+  assert.match(bridgeText, /const GUIDANCE_TARGET_EXTENT = \[0\.18, 0\.62\];/);
+});
+
+test('a target that is already framed is not reported as a camera that refused to move', () => {
+  const at = bridgeText.indexOf('// Framing is driven with the mouse, not the F shortcut.');
+  const body = bridgeText.slice(at, at + 5200);
+  assert.match(body, /let satisfied = false;/);
+  const tail = bridgeText.slice(at, at + 8000);
+  assert.match(tail, /if \(!moved && !satisfied\)/);
+  assert.match(tail, /already_framed: satisfied && !moved/);
 });

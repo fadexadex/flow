@@ -1,0 +1,80 @@
+{
+  "captured_at": "2026-09-03T18:26:15.583Z",
+  "document_focused": false,
+  "audio_capability": {
+    "audio_driver": "Dummy",
+    "channel_version": "1.0.0",
+    "generation": 1,
+    "importer_classes": {
+      "mp3": true,
+      "ogg_vorbis": true,
+      "wav": true
+    },
+    "importer_defaults": {
+      "mp3": false,
+      "ogg_vorbis": false,
+      "texture": false,
+      "wav": false
+    },
+    "load_from_buffer": {
+      "AudioStreamMP3": true,
+      "AudioStreamOggVorbis": true,
+      "AudioStreamWAV": true
+    },
+    "ok": true,
+    "preview_generator": true,
+    "runtime_classes": {
+      "AudioStreamMP3": true,
+      "AudioStreamOggVorbis": true,
+      "AudioStreamWAV": true
+    }
+  },
+  "open_scenes": {
+    "channel_version": "1.0.0",
+    "edited_scene": "res://orbital_sanctuary.tscn",
+    "generation": 1,
+    "ok": true,
+    "open_scenes": [
+      "res://orbital_sanctuary.tscn"
+    ]
+  },
+  "camera": {
+    "mouse_via_viewport_push_input": {
+      "before": [
+        2.696,
+        0.394,
+        -13.43
+      ],
+      "after_orbit": [
+        11.731,
+        -4.878,
+        -5.137
+      ],
+      "after_dolly": [
+        29.518,
+        -12.274,
+        -12.925
+      ],
+      "moved": true
+    },
+    "key_shortcut_via_viewport_push_input": {
+      "mechanism": "viewport.push_input",
+      "before": [
+        29.539,
+        -12.283,
+        -12.935
+      ],
+      "after": [
+        29.539,
+        -12.283,
+        -12.935
+      ],
+      "moved": false
+    }
+  },
+  "session": {
+    "health": "healthy",
+    "project_errors": 0,
+    "fatal_errors": []
+  }
+}
